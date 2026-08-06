@@ -8,6 +8,23 @@ edition = "2024"
 
 [workspace.dependencies]
 common = { path = "crates/common" }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+directories = "6.0.0"
+eframe = { version = "0.36.0", default-features = false, features = ["default_fonts", "glow"] }
+global-hotkey = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "tiff"] }
+imageproc = { version = "0.27.0", default-features = false, features = ["text"] }
+ab_glyph = "0.2.32"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+single-instance = "0.3.3"
+thiserror = "2.0.17"
+tray-icon = { version = "0.24.2", default-features = false }
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+xcap = "0.9.8"
 
 [profile.release]
 lto = true
