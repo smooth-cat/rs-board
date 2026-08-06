@@ -1,0 +1,25 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+*.rlib
+*.rmeta
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.d
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.DocumentRevisions-V100
+*.swp
+*~
