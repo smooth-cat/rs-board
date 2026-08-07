@@ -38,7 +38,21 @@ use crate::{
   tray::{TrayAction, TrayController},
 };
 
-const LIBRARY_SIZE: egui::Vec2 = egui::vec2(1120.0, 760.0);
+const LIBRARY_PANEL_MARGIN: f32 = 16.0;
+const LIBRARY_GRID_GAP: f32 = 14.0;
+const LIBRARY_SCROLLBAR_RESERVE: f32 = 14.0;
+const LIBRARY_CARD_WIDTH: f32 = 350.0;
+const LIBRARY_CARD_INNER_MARGIN: f32 = 8.0;
+const LIBRARY_CARD_CONTENT_GAP: f32 = 7.0;
+const LIBRARY_CARD_ACTION_WIDTH: f32 = 40.0;
+const LIBRARY_PREVIEW_SIZE: egui::Vec2 = egui::vec2(144.0, 81.0);
+const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
+  2.0 * LIBRARY_CARD_WIDTH
+    + LIBRARY_GRID_GAP
+    + 2.0 * LIBRARY_PANEL_MARGIN
+    + LIBRARY_SCROLLBAR_RESERVE,
+  760.0,
+);
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +155,12 @@ enum WindowSurface {
   Editor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorWindowTarget {
+  DisplayBounds([i32; 4]),
+  Cursor([i32; 2]),
+}
+
 pub struct RsBoardApp {
   store: LocalStore,
   settings_path: PathBuf,
@@ -151,6 +171,7 @@ pub struct RsBoardApp {
   hotkey: Option<GlobalF1Hotkey>,
   tray: Option<TrayController>,
   surface: WindowSurface,
+  editor_window_target: Option<EditorWindowTarget>,
   phase: Phase,
   session: Option<WorkingSession>,
   recent: RecentDocuments,
@@ -229,6 +250,7 @@ impl RsBoardApp {
       hotkey,
       tray,
       surface: WindowSurface::Hidden,
+      editor_window_target: None,
       phase: Phase::Idle,
       session: None,
       recent,
@@ -831,31 +853,39 @@ impl RsBoardApp {
 
   fn show_editor_window(&mut self, context: &egui::Context, display_bounds: Option<[i32; 4]>) {
     self.surface = WindowSurface::Editor;
-    context.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-    if let Some(bounds) = display_bounds {
-      context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
-        bounds[0] as f32,
-        bounds[1] as f32,
-      )));
-      context.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
-        bounds[2].max(1) as f32,
-        bounds[3].max(1) as f32,
-      )));
-    } else if let Some([x, y]) = global_cursor_position() {
-      context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+    self.editor_window_target = display_bounds
+      .map(EditorWindowTarget::DisplayBounds)
+      .or_else(|| global_cursor_position().map(EditorWindowTarget::Cursor));
+    send_platform_fullscreen_command(context, false);
+    #[cfg(not(target_os = "macos"))]
+    match self.editor_window_target {
+      Some(EditorWindowTarget::DisplayBounds(bounds)) => {
+        context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
+          bounds[0] as f32,
+          bounds[1] as f32,
+        )));
+        context.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
+          bounds[2].max(1) as f32,
+          bounds[3].max(1) as f32,
+        )));
+      }
+      Some(EditorWindowTarget::Cursor([x, y])) => {
+        context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+      }
+      None => {}
     }
     context.send_viewport_cmd(ViewportCommand::Decorations(false));
     context.send_viewport_cmd(ViewportCommand::Resizable(false));
-    context.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
+    send_platform_window_level_command(context, WindowLevel::AlwaysOnTop);
     context.send_viewport_cmd(ViewportCommand::Visible(true));
-    context.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+    send_platform_fullscreen_command(context, true);
     context.send_viewport_cmd(ViewportCommand::Focus);
   }
 
   fn show_library_window(&mut self, context: &egui::Context) {
     self.surface = WindowSurface::Library;
-    context.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-    context.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
+    send_platform_fullscreen_command(context, false);
+    send_platform_window_level_command(context, WindowLevel::Normal);
     context.send_viewport_cmd(ViewportCommand::Decorations(true));
     context.send_viewport_cmd(ViewportCommand::Resizable(true));
     context.send_viewport_cmd(ViewportCommand::InnerSize(LIBRARY_SIZE));
@@ -865,8 +895,8 @@ impl RsBoardApp {
 
   fn hide_window(&mut self, context: &egui::Context) {
     self.surface = WindowSurface::Hidden;
-    context.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-    context.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
+    send_platform_fullscreen_command(context, false);
+    send_platform_window_level_command(context, WindowLevel::Normal);
     context.send_viewport_cmd(ViewportCommand::Decorations(true));
     context.send_viewport_cmd(ViewportCommand::Resizable(true));
     context.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -1039,7 +1069,8 @@ impl RsBoardApp {
     egui::Panel::top("library-header")
       .frame(egui::Frame::new().fill(Color32::from_rgb(29, 29, 31)).inner_margin(16.0))
       .show(root_ui, |ui| {
-        ui.horizontal(|ui| {
+        let row_height = library_header_row_height(ui);
+        fixed_height_centered_row(ui, row_height, |ui| {
           ui.heading("RS Board");
           ui.separator();
           if self.phase.has_active_session() && ui.button("返回编辑器").clicked() {
@@ -1072,157 +1103,192 @@ impl RsBoardApp {
               self.settings_draft = self.settings.clone();
               self.show_settings = true;
             }
-            ui.add_sized(
-              [260.0, 30.0],
-              egui::TextEdit::singleline(&mut self.recent.query).hint_text("搜索标题"),
-            );
+            ui.add_sized([260.0, 30.0], library_search_field(&mut self.recent.query));
           });
         });
       });
 
-    egui::CentralPanel::default().show(root_ui, |ui| {
-      if let Some(error) = self.library_error.clone() {
-        egui::Frame::new().fill(Color32::from_rgb(82, 31, 29)).inner_margin(10.0).show(ui, |ui| {
-          ui.horizontal(|ui| {
-            ui.label(error);
-            if ui.button("关闭").clicked() {
-              self.library_error = None;
-            }
-            if self.draft_available && self.phase == Phase::Idle && ui.button("删除草稿").clicked()
-            {
-              self.delete_draft_dialog = true;
-            }
-          });
-        });
-        ui.add_space(10.0);
-      }
-
-      match self.phase {
-        Phase::Capturing { .. } => busy_line(ui, "正在捕获屏幕"),
-        Phase::Opening { .. } => busy_line(ui, "正在打开讲义"),
-        Phase::Restoring { .. } => busy_line(ui, "正在恢复草稿"),
-        _ => {}
-      }
-
-      if self.phase.has_active_session() {
-        egui::Frame::new().fill(Color32::from_rgb(45, 42, 34)).inner_margin(10.0).show(ui, |ui| {
-          ui.label("当前编辑会话仍保留在内存中；打开讲义和恢复草稿已暂时禁用。");
-        });
-        ui.add_space(10.0);
-      }
-
-      if documents.is_empty() {
-        ui.centered_and_justified(|ui| {
-          ui.label(if self.recent.query.trim().is_empty() {
-            "暂无讲义"
-          } else {
-            "没有匹配的讲义"
-          });
-        });
-        return;
-      }
-
-      egui::ScrollArea::vertical().show(ui, |ui| {
-        let card_width = 252.0;
-        let gap = 14.0;
-        let columns = ((ui.available_width() + gap) / (card_width + gap)).floor().max(1.0) as usize;
-        egui::Grid::new("recent-grid").num_columns(columns).spacing([gap, gap]).show(ui, |ui| {
-          for (index, document) in documents.iter().enumerate() {
-            let preview = self.preview_texture(document, context);
-            let highlighted = self.recent.highlighted == Some(document.document_id);
-            let frame = egui::Frame::new()
-              .fill(if highlighted {
-                Color32::from_rgb(58, 42, 41)
-              } else {
-                Color32::from_rgb(38, 38, 40)
-              })
-              .stroke(egui::Stroke::new(
-                1.0,
-                if highlighted { Color32::from_rgb(230, 76, 70) } else { Color32::from_gray(64) },
-              ))
-              .corner_radius(6.0)
-              .inner_margin(8.0);
-            let response = frame.show(ui, |ui| {
-              ui.set_width(card_width - 16.0);
-              let (preview_rect, preview_response) = ui.allocate_exact_size(
-                egui::vec2(card_width - 16.0, (card_width - 16.0) * 9.0 / 16.0),
-                egui::Sense::click(),
-              );
-              ui.painter().rect_filled(preview_rect, 3.0, Color32::BLACK);
-              if let Some(texture) = preview {
-                ui.painter().image(
-                  texture.id(),
-                  fit_image_rect(texture.size_vec2(), preview_rect),
-                  egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                  Color32::WHITE,
-                );
-              } else {
-                ui.painter().text(
-                  preview_rect.center(),
-                  egui::Align2::CENTER_CENTER,
-                  "预览生成中",
-                  egui::FontId::proportional(13.0),
-                  Color32::from_gray(130),
-                );
-              }
-              ui.add_space(7.0);
+    egui::CentralPanel::default()
+      .frame(
+        egui::Frame::NONE.fill(Color32::from_rgb(24, 24, 25)).inner_margin(LIBRARY_PANEL_MARGIN),
+      )
+      .show(root_ui, |ui| {
+        if let Some(error) = self.library_error.clone() {
+          egui::Frame::new().fill(Color32::from_rgb(82, 31, 29)).inner_margin(10.0).show(
+            ui,
+            |ui| {
               ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                  ui.set_width(card_width - 56.0);
-                  ui.label(egui::RichText::new(&document.title).strong());
-                  ui.label(
-                    egui::RichText::new(
-                      document
-                        .updated_at
-                        .with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M")
-                        .to_string(),
-                    )
-                    .small()
-                    .color(Color32::from_gray(150)),
-                  );
-                });
-                ui.menu_button("⋯", |ui| {
-                  if ui.button("重命名").clicked() {
-                    action = Some(LibraryAction::Rename(document.document_id));
-                    ui.close();
-                  }
-                  if ui.button("复制图片").clicked() {
-                    action = Some(LibraryAction::CopyImage(document.document_id));
-                    ui.close();
-                  }
-                  if ui.button("导出 PNG").clicked() {
-                    action = Some(LibraryAction::ExportPng(document.document_id));
-                    ui.close();
-                  }
-                  if ui.button("导出讲义").clicked() {
-                    action = Some(LibraryAction::ExportBundle(document.document_id));
-                    ui.close();
-                  }
-                  ui.separator();
-                  if ui
-                    .button(egui::RichText::new("删除").color(Color32::from_rgb(255, 100, 95)))
-                    .clicked()
-                  {
-                    action = Some(LibraryAction::Delete(document.document_id));
-                    ui.close();
-                  }
-                });
+                ui.label(error);
+                if ui.button("关闭").clicked() {
+                  self.library_error = None;
+                }
+                if self.draft_available
+                  && self.phase == Phase::Idle
+                  && ui.button("删除草稿").clicked()
+                {
+                  self.delete_draft_dialog = true;
+                }
               });
-              preview_response
+            },
+          );
+          ui.add_space(10.0);
+        }
+
+        match self.phase {
+          Phase::Capturing { .. } => busy_line(ui, "正在捕获屏幕"),
+          Phase::Opening { .. } => busy_line(ui, "正在打开讲义"),
+          Phase::Restoring { .. } => busy_line(ui, "正在恢复草稿"),
+          _ => {}
+        }
+
+        if self.phase.has_active_session() {
+          egui::Frame::new().fill(Color32::from_rgb(45, 42, 34)).inner_margin(10.0).show(
+            ui,
+            |ui| {
+              ui.label("当前编辑会话仍保留在内存中；打开讲义和恢复草稿已暂时禁用。");
+            },
+          );
+          ui.add_space(10.0);
+        }
+
+        if documents.is_empty() {
+          ui.centered_and_justified(|ui| {
+            ui.label(if self.recent.query.trim().is_empty() {
+              "暂无讲义"
+            } else {
+              "没有匹配的讲义"
             });
-            if (response.inner.double_clicked() || response.response.double_clicked())
-              && self.phase == Phase::Idle
-            {
-              action = Some(LibraryAction::Open(document.document_id));
-            }
-            if (index + 1) % columns == 0 {
-              ui.end_row();
-            }
-          }
+          });
+          return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+          let card_width = library_document_card_width();
+          egui::Grid::new("recent-grid")
+            .num_columns(2)
+            .spacing([LIBRARY_GRID_GAP, LIBRARY_GRID_GAP])
+            .show(ui, |ui| {
+              for (index, document) in documents.iter().enumerate() {
+                let preview = self.preview_texture(document, context);
+                let highlighted = self.recent.highlighted == Some(document.document_id);
+                let frame = egui::Frame::new()
+                  .fill(if highlighted {
+                    Color32::from_rgb(58, 42, 41)
+                  } else {
+                    Color32::from_rgb(38, 38, 40)
+                  })
+                  .stroke(egui::Stroke::new(
+                    1.0,
+                    if highlighted {
+                      Color32::from_rgb(230, 76, 70)
+                    } else {
+                      Color32::from_gray(64)
+                    },
+                  ))
+                  .corner_radius(6.0)
+                  .inner_margin(LIBRARY_CARD_INNER_MARGIN);
+                let response = frame.show(ui, |ui| {
+                  ui.set_width(card_width - 2.0 * LIBRARY_CARD_INNER_MARGIN);
+                  let preview_size = LIBRARY_PREVIEW_SIZE;
+                  fixed_height_centered_row(ui, preview_size.y, |ui| {
+                    let (preview_rect, preview_response) =
+                      ui.allocate_exact_size(preview_size, egui::Sense::click());
+                    ui.painter().rect_filled(preview_rect, 3.0, Color32::BLACK);
+                    if let Some(texture) = preview {
+                      ui.painter().image(
+                        texture.id(),
+                        fit_image_rect(texture.size_vec2(), preview_rect),
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                      );
+                    } else {
+                      ui.painter().text(
+                        preview_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "预览生成中",
+                        egui::FontId::proportional(13.0),
+                        Color32::from_gray(130),
+                      );
+                    }
+                    ui.add_space(LIBRARY_CARD_CONTENT_GAP);
+                    let description_width = library_document_description_width(ui);
+                    let description_height = library_document_description_height(ui);
+                    centered_vertical_slot(
+                      ui,
+                      egui::vec2(description_width, preview_size.y),
+                      description_height,
+                      |ui| {
+                        ui.add(
+                          egui::Label::new(egui::RichText::new(&document.title).strong())
+                            .truncate(),
+                        )
+                        .on_hover_text(&document.title);
+                        ui.label(
+                          egui::RichText::new(
+                            document
+                              .updated_at
+                              .with_timezone(&chrono::Local)
+                              .format("%Y-%m-%d %H:%M")
+                              .to_string(),
+                          )
+                          .small()
+                          .color(Color32::from_gray(150)),
+                        );
+                      },
+                    );
+                    let action_height = ui.text_style_height(&egui::TextStyle::Button)
+                      + 2.0 * ui.spacing().button_padding.y;
+                    centered_vertical_slot(
+                      ui,
+                      egui::vec2(LIBRARY_CARD_ACTION_WIDTH, preview_size.y),
+                      action_height,
+                      |ui| {
+                        ui.menu_button("⋯", |ui| {
+                          if ui.button("重命名").clicked() {
+                            action = Some(LibraryAction::Rename(document.document_id));
+                            ui.close();
+                          }
+                          if ui.button("复制图片").clicked() {
+                            action = Some(LibraryAction::CopyImage(document.document_id));
+                            ui.close();
+                          }
+                          if ui.button("导出 PNG").clicked() {
+                            action = Some(LibraryAction::ExportPng(document.document_id));
+                            ui.close();
+                          }
+                          if ui.button("导出讲义").clicked() {
+                            action = Some(LibraryAction::ExportBundle(document.document_id));
+                            ui.close();
+                          }
+                          ui.separator();
+                          if ui
+                            .button(
+                              egui::RichText::new("删除").color(Color32::from_rgb(255, 100, 95)),
+                            )
+                            .clicked()
+                          {
+                            action = Some(LibraryAction::Delete(document.document_id));
+                            ui.close();
+                          }
+                        });
+                      },
+                    );
+                    preview_response
+                  })
+                  .inner
+                });
+                if (response.inner.double_clicked() || response.response.double_clicked())
+                  && self.phase == Phase::Idle
+                {
+                  action = Some(LibraryAction::Open(document.document_id));
+                }
+                if (index + 1) % 2 == 0 {
+                  ui.end_row();
+                }
+              }
+            });
         });
       });
-    });
 
     if let Some(action) = action {
       self.handle_library_action(action, context);
@@ -1662,7 +1728,7 @@ impl eframe::App for RsBoardApp {
     self.poll_external_events(context);
   }
 
-  fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+  fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
     let context = ui.ctx().clone();
 
     if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
@@ -1687,6 +1753,7 @@ impl eframe::App for RsBoardApp {
     }
     self.show_dialogs(&context);
     self.show_toast(&context);
+    sync_native_window_style(frame, self.surface, self.editor_window_target);
   }
 }
 
@@ -1720,6 +1787,231 @@ fn load_rgba_texture(
     ),
     TextureOptions::LINEAR,
   ))
+}
+
+fn fixed_height_centered_row<R>(
+  ui: &mut egui::Ui,
+  height: f32,
+  add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+  ui.allocate_ui_with_layout(
+    egui::vec2(ui.available_width(), height),
+    egui::Layout::left_to_right(egui::Align::Center),
+    add_contents,
+  )
+}
+
+fn centered_vertical_slot<R>(
+  ui: &mut egui::Ui,
+  slot_size: egui::Vec2,
+  content_height: f32,
+  add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> (R, egui::Rect) {
+  let (slot_rect, _) = ui.allocate_exact_size(slot_size, egui::Sense::hover());
+  let content_rect = egui::Rect::from_center_size(
+    slot_rect.center(),
+    egui::vec2(slot_size.x, content_height.min(slot_size.y)),
+  );
+  let mut content_ui = ui.new_child(
+    egui::UiBuilder::new().max_rect(content_rect).layout(egui::Layout::top_down(egui::Align::Min)),
+  );
+  let inner = add_contents(&mut content_ui);
+  (inner, content_ui.min_rect())
+}
+
+fn library_header_row_height(ui: &egui::Ui) -> f32 {
+  let button_height =
+    ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+  button_height.max(ui.text_style_height(&egui::TextStyle::Heading)).max(30.0)
+}
+
+fn library_document_card_width() -> f32 {
+  LIBRARY_CARD_WIDTH
+}
+
+fn library_document_description_width(ui: &egui::Ui) -> f32 {
+  LIBRARY_CARD_WIDTH
+    - 2.0 * LIBRARY_CARD_INNER_MARGIN
+    - LIBRARY_PREVIEW_SIZE.x
+    - LIBRARY_CARD_CONTENT_GAP
+    - 2.0 * ui.spacing().item_spacing.x
+    - LIBRARY_CARD_ACTION_WIDTH
+}
+
+fn library_search_field(query: &mut String) -> egui::TextEdit<'_> {
+  egui::TextEdit::singleline(query)
+    .hint_text("搜索标题")
+    .margin(egui::Margin::symmetric(10, 2))
+    .vertical_align(egui::Align::Center)
+}
+
+fn library_document_description_height(ui: &egui::Ui) -> f32 {
+  ui.text_style_height(&egui::TextStyle::Body)
+    + ui.spacing().item_spacing.y
+    + ui.text_style_height(&egui::TextStyle::Small)
+}
+
+fn uses_screen_overlay(surface: WindowSurface) -> bool {
+  surface == WindowSurface::Editor
+}
+
+fn editor_window_target_point(target: EditorWindowTarget) -> [f64; 2] {
+  match target {
+    EditorWindowTarget::DisplayBounds([x, y, width, height]) => {
+      [x as f64 + width as f64 / 2.0, y as f64 + height as f64 / 2.0]
+    }
+    EditorWindowTarget::Cursor([x, y]) => [x as f64, y as f64],
+  }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn send_platform_fullscreen_command(context: &egui::Context, fullscreen: bool) {
+  context.send_viewport_cmd(ViewportCommand::Fullscreen(fullscreen));
+}
+
+#[cfg(target_os = "macos")]
+fn send_platform_fullscreen_command(_context: &egui::Context, _fullscreen: bool) {}
+
+#[cfg(not(target_os = "macos"))]
+fn send_platform_window_level_command(context: &egui::Context, level: WindowLevel) {
+  context.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+}
+
+#[cfg(target_os = "macos")]
+fn send_platform_window_level_command(_context: &egui::Context, _level: WindowLevel) {}
+
+#[cfg(target_os = "macos")]
+fn sync_native_window_style(
+  frame: &eframe::Frame,
+  surface: WindowSurface,
+  target: Option<EditorWindowTarget>,
+) {
+  use winit::platform::macos::WindowExtMacOS;
+
+  let Some(window) = frame.winit_window() else {
+    return;
+  };
+  let screen_overlay = uses_screen_overlay(surface);
+  if screen_overlay {
+    activate_macos_application();
+    if !window.simple_fullscreen() {
+      if let Some(target) = target {
+        let target_point = editor_window_target_point(target);
+        if let Some(monitor) = window
+          .available_monitors()
+          .find(|monitor| monitor_contains_logical_point(monitor, target_point))
+        {
+          window.set_outer_position(monitor.position());
+        }
+      }
+      if !window.is_borderless_game() {
+        window.set_borderless_game(true);
+      }
+      if window.has_shadow() {
+        window.set_has_shadow(false);
+      }
+      window.set_simple_fullscreen(true);
+    }
+    if window.simple_fullscreen() {
+      enforce_macos_screen_overlay_presentation();
+    }
+    set_macos_window_level(window, true);
+  } else {
+    if window.simple_fullscreen() {
+      window.set_simple_fullscreen(false);
+    }
+    set_macos_window_level(window, false);
+    if window.is_borderless_game() {
+      window.set_borderless_game(false);
+    }
+    if !window.has_shadow() {
+      window.set_has_shadow(true);
+    }
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_macos_application() {
+  use objc2::MainThreadMarker;
+  use objc2_app_kit::NSApplication;
+
+  let Some(mtm) = MainThreadMarker::new() else {
+    return;
+  };
+  let application = NSApplication::sharedApplication(mtm);
+  if !application.isActive() {
+    #[allow(deprecated)]
+    application.activateIgnoringOtherApps(true);
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn enforce_macos_screen_overlay_presentation() {
+  use objc2::MainThreadMarker;
+  use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions};
+
+  let Some(mtm) = MainThreadMarker::new() else {
+    return;
+  };
+  let application = NSApplication::sharedApplication(mtm);
+  let presentation =
+    NSApplicationPresentationOptions::HideDock | NSApplicationPresentationOptions::HideMenuBar;
+  if application.presentationOptions() != presentation {
+    application.setPresentationOptions(presentation);
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_window_level(window: &winit::window::Window, screen_overlay: bool) {
+  use objc2::{MainThreadMarker, rc::Retained};
+  use objc2_app_kit::{NSNormalWindowLevel, NSScreenSaverWindowLevel, NSView};
+  use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+  if MainThreadMarker::new().is_none() {
+    return;
+  }
+  let Ok(handle) = window.window_handle() else {
+    return;
+  };
+  let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+    return;
+  };
+  // SAFETY: the live AppKit window handle contains a valid NSView pointer and this runs on main.
+  let Some(view) = (unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) }) else {
+    return;
+  };
+  let Some(window) = view.window() else {
+    return;
+  };
+  let level = if screen_overlay { NSScreenSaverWindowLevel } else { NSNormalWindowLevel };
+  if window.level() != level {
+    window.setLevel(level);
+  }
+}
+
+#[cfg(target_os = "macos")]
+fn monitor_contains_logical_point(
+  monitor: &winit::monitor::MonitorHandle,
+  point: [f64; 2],
+) -> bool {
+  let scale_factor = monitor.scale_factor();
+  if !scale_factor.is_finite() || scale_factor <= 0.0 {
+    return false;
+  }
+  let position = monitor.position().to_logical::<f64>(scale_factor);
+  let size = monitor.size().to_logical::<f64>(scale_factor);
+  point[0] >= position.x
+    && point[0] < position.x + size.width
+    && point[1] >= position.y
+    && point[1] < position.y + size.height
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_native_window_style(
+  _frame: &eframe::Frame,
+  _surface: WindowSurface,
+  _target: Option<EditorWindowTarget>,
+) {
 }
 
 fn configure_egui(context: &egui::Context) {
@@ -1784,4 +2076,132 @@ fn sanitized_file_stem(title: &str) -> String {
   }
   let output = output.trim_matches([' ', '.']).to_owned();
   if output.is_empty() { "未命名讲义".to_owned() } else { output }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::cell::Cell;
+
+  use super::*;
+
+  #[test]
+  fn library_header_and_document_row_center_contents_vertically() {
+    let context = egui::Context::default();
+    configure_egui(&context);
+    let header_centers = Cell::new([0.0; 5]);
+    let document_centers = Cell::new([0.0; 3]);
+    let document_card_rects = Cell::new([egui::Rect::NOTHING; 2]);
+    let mut query = String::new();
+
+    context
+      .run_ui(
+        egui::RawInput {
+          screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+          ..Default::default()
+        },
+        |ui| {
+          let header_height = library_header_row_height(ui);
+          fixed_height_centered_row(ui, header_height, |ui| {
+            let title = ui.heading("RS Board");
+            let separator = ui.separator();
+            let capture = ui.button("新截图");
+            let (settings_center, search_center) = ui
+              .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let settings = ui.button("设置");
+                let search = ui.add_sized([260.0, 30.0], library_search_field(&mut query));
+                (settings.rect.center().y, search.rect.center().y)
+              })
+              .inner;
+            header_centers.set([
+              title.rect.center().y,
+              separator.rect.center().y,
+              capture.rect.center().y,
+              settings_center,
+              search_center,
+            ]);
+          });
+
+          ui.set_width(LIBRARY_SIZE.x - 2.0 * LIBRARY_PANEL_MARGIN - LIBRARY_SCROLLBAR_RESERVE);
+          egui::Grid::new("library-layout-test-grid")
+            .num_columns(2)
+            .spacing([LIBRARY_GRID_GAP, LIBRARY_GRID_GAP])
+            .show(ui, |ui| {
+              let mut card_rects = [egui::Rect::NOTHING; 2];
+              for card_rect in &mut card_rects {
+                let card =
+                  egui::Frame::new().inner_margin(LIBRARY_CARD_INNER_MARGIN).show(ui, |ui| {
+                    ui.set_width(LIBRARY_CARD_WIDTH - 2.0 * LIBRARY_CARD_INNER_MARGIN);
+                    fixed_height_centered_row(ui, LIBRARY_PREVIEW_SIZE.y, |ui| {
+                      let (_, preview) =
+                        ui.allocate_exact_size(LIBRARY_PREVIEW_SIZE, egui::Sense::hover());
+                      ui.add_space(LIBRARY_CARD_CONTENT_GAP);
+                      let description_height = library_document_description_height(ui);
+                      let (_, description_rect) = centered_vertical_slot(
+                        ui,
+                        egui::vec2(library_document_description_width(ui), LIBRARY_PREVIEW_SIZE.y),
+                        description_height,
+                        |ui| {
+                          ui.add(
+                            egui::Label::new(
+                              egui::RichText::new("截图 2026-08-07 13:12:08").strong(),
+                            )
+                            .truncate(),
+                          );
+                          ui.label(egui::RichText::new("2026-08-07 13:21").small());
+                        },
+                      );
+                      let action_height = ui.text_style_height(&egui::TextStyle::Button)
+                        + 2.0 * ui.spacing().button_padding.y;
+                      let (_, action_rect) = centered_vertical_slot(
+                        ui,
+                        egui::vec2(LIBRARY_CARD_ACTION_WIDTH, LIBRARY_PREVIEW_SIZE.y),
+                        action_height,
+                        |ui| ui.menu_button("⋯", |_| {}).response.rect,
+                      );
+                      document_centers.set([
+                        preview.rect.center().y,
+                        description_rect.center().y,
+                        action_rect.center().y,
+                      ]);
+                    });
+                  });
+                *card_rect = card.response.rect;
+              }
+              document_card_rects.set(card_rects);
+            });
+        },
+      )
+      .drop_without_applying_deltas();
+
+    assert_same_center(header_centers.get());
+    assert_same_center(document_centers.get());
+    let [first_card, second_card] = document_card_rects.get();
+    assert!((first_card.width() - LIBRARY_CARD_WIDTH).abs() < 0.1);
+    assert!((second_card.width() - LIBRARY_CARD_WIDTH).abs() < 0.1);
+    assert!((second_card.left() - first_card.right() - LIBRARY_GRID_GAP).abs() < 0.1);
+    assert!(
+      second_card.right() <= LIBRARY_SIZE.x - LIBRARY_PANEL_MARGIN - LIBRARY_SCROLLBAR_RESERVE
+    );
+  }
+
+  #[test]
+  fn only_editor_surface_uses_the_borderless_screen_overlay() {
+    assert!(!uses_screen_overlay(WindowSurface::Hidden));
+    assert!(!uses_screen_overlay(WindowSurface::Library));
+    assert!(uses_screen_overlay(WindowSurface::Editor));
+    assert_eq!(
+      editor_window_target_point(EditorWindowTarget::DisplayBounds([-1728, 0, 1728, 1117])),
+      [-864.0, 558.5]
+    );
+    assert_eq!(
+      editor_window_target_point(EditorWindowTarget::Cursor([2056, 640])),
+      [2056.0, 640.0]
+    );
+  }
+
+  fn assert_same_center<const N: usize>(centers: [f32; N]) {
+    for pair in centers.windows(2) {
+      assert!((pair[0] - pair[1]).abs() < 0.1, "centers: {centers:?}");
+    }
+  }
 }

@@ -14,6 +14,11 @@ use crate::renderer::{paint_document, paint_element, paint_raw_polyline};
 
 const DEFAULT_RECTANGLE_LABEL: &str = "标题";
 const DEFAULT_TEXT_BOX_WIDTH_PX: f32 = 420.0;
+const COLOR_SWATCH_FONT_SIZE_PT: f32 = 20.0;
+const FLOATING_CONTROL_HEIGHT_PT: f32 = 32.0;
+const FLOATING_MENU_MAX_HEIGHT_PT: f32 = f32::INFINITY;
+const FLOATING_PANEL_ORDER: egui::Order = egui::Order::Middle;
+const FLOATING_PANEL_MARGIN_PT: i8 = 4;
 const HANDLE_VISUAL_RADIUS_PT: f32 = 4.5;
 const HANDLE_HIT_RADIUS_PT: f32 = 11.0;
 const HIT_TOLERANCE_PT: f32 = 7.0;
@@ -949,10 +954,11 @@ impl EditorController {
     actions: &mut Vec<EditorAction>,
   ) {
     egui::Area::new(Id::new("rs-board-toolbar"))
-      .order(egui::Order::Foreground)
+      .order(FLOATING_PANEL_ORDER)
       .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
       .show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
+        floating_panel_frame(ui.style()).show(ui, |ui| {
+          set_floating_control_style(ui);
           ui.horizontal(|ui| {
             for tool in EditorTool::ALL {
               if ui
@@ -1004,11 +1010,14 @@ impl EditorController {
     let displayed = self.displayed_style(document);
     let color = color32(displayed.color_rgba);
     egui::ComboBox::from_id_salt("rs-board-color")
-      .selected_text(egui::RichText::new("●").color(color).size(20.0))
+      .selected_text(egui::RichText::new("●").color(color).size(COLOR_SWATCH_FONT_SIZE_PT))
       .width(38.0)
+      .height(FLOATING_MENU_MAX_HEIGHT_PT)
       .show_ui(ui, |ui| {
+        set_floating_control_style(ui);
         for choice in mvp_colors() {
-          let text = egui::RichText::new("●").color(color32(choice)).size(20.0);
+          let text =
+            egui::RichText::new("●").color(color32(choice)).size(COLOR_SWATCH_FONT_SIZE_PT);
           if ui.selectable_label(displayed.color_rgba == choice, text).clicked() {
             self.apply_style_change(
               document,
@@ -1024,7 +1033,9 @@ impl EditorController {
     egui::ComboBox::from_id_salt("rs-board-width")
       .selected_text(format!("{} px", displayed.width_px as i32))
       .width(62.0)
+      .height(FLOATING_MENU_MAX_HEIGHT_PT)
       .show_ui(ui, |ui| {
+        set_floating_control_style(ui);
         for width_px in PRESET_STROKE_WIDTHS_PX {
           if ui
             .selectable_label(displayed.width_px == width_px, format!("{} px", width_px as i32))
@@ -1044,7 +1055,9 @@ impl EditorController {
     egui::ComboBox::from_id_salt("rs-board-font-size")
       .selected_text(format!("{} pt", displayed.font_size_px as i32))
       .width(62.0)
+      .height(FLOATING_MENU_MAX_HEIGHT_PT)
       .show_ui(ui, |ui| {
+        set_floating_control_style(ui);
         for font_size_px in PRESET_FONT_SIZES_PX {
           if ui
             .selectable_label(
@@ -1084,11 +1097,12 @@ impl EditorController {
       return;
     };
     egui::Area::new(Id::new("rs-board-option-panel"))
-      .order(egui::Order::Foreground)
+      .order(FLOATING_PANEL_ORDER)
       .fixed_pos(anchor + egui::vec2(14.0, 14.0))
       .constrain_to(ctx.content_rect())
       .show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
+        floating_panel_frame(ui.style()).show(ui, |ui| {
+          set_floating_control_style(ui);
           ui.horizontal(|ui| self.style_controls(ui, document, actions));
           if let Some(element_id) = self.selected_element_id {
             ui.separator();
@@ -1529,8 +1543,23 @@ fn mvp_colors() -> [ColorRgba; 6] {
   ]
 }
 
+fn floating_panel_frame(style: &egui::Style) -> egui::Frame {
+  egui::Frame::popup(style).inner_margin(egui::Margin::same(FLOATING_PANEL_MARGIN_PT))
+}
+
+fn set_floating_control_style(ui: &mut egui::Ui) {
+  let swatch_height =
+    ui.ctx().fonts_mut(|fonts| fonts.row_height(&FontId::proportional(COLOR_SWATCH_FONT_SIZE_PT)));
+  let vertical_padding = ((FLOATING_CONTROL_HEIGHT_PT - swatch_height) / 2.0).max(0.0);
+  let spacing = ui.spacing_mut();
+  spacing.button_padding.y = spacing.button_padding.y.min(vertical_padding);
+  spacing.interact_size.y = FLOATING_CONTROL_HEIGHT_PT;
+}
+
 #[cfg(test)]
 mod tests {
+  use std::cell::Cell;
+
   use chrono::{TimeZone, Utc};
   use common::{CapturedDisplay, DocumentId, GlobalBoundsPx};
   use uuid::Uuid;
@@ -1591,6 +1620,136 @@ mod tests {
     assert!((round_trip.x_px - point.x_px).abs() < 0.001);
     assert!((round_trip.y_px - point.y_px).abs() < 0.001);
     assert!(transform.egui_to_document(egui::pos2(150.0, 20.0)).is_none());
+  }
+
+  #[test]
+  fn fit_transform_fills_a_viewport_with_the_capture_aspect_ratio() {
+    let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1728.0, 1117.0));
+    let transform = CanvasTransform::fit(SizePx::new(3456, 2234), viewport).unwrap();
+
+    assert_eq!(transform.canvas_rect(), viewport);
+  }
+
+  #[test]
+  fn toolbar_and_option_controls_share_the_same_vertical_center() {
+    let context = egui::Context::default();
+    context.all_styles_mut(|style| style.spacing.button_padding = egui::vec2(12.0, 7.0));
+    let measurements = Cell::new([(0.0, 0.0); 5]);
+    let panel_height = Cell::new(0.0);
+    let panel_stroke_width = Cell::new(0.0);
+
+    context
+      .run_ui(
+        egui::RawInput {
+          screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 200.0))),
+          ..Default::default()
+        },
+        |ui| {
+          let frame = floating_panel_frame(ui.style());
+          panel_stroke_width.set(frame.stroke.width);
+          let panel = frame.show(ui, |ui| {
+            set_floating_control_style(ui);
+            ui.horizontal(|ui| {
+              let tool = ui.selectable_label(true, "方框");
+              let color = egui::ComboBox::from_id_salt("toolbar-layout-test-color")
+                .selected_text(
+                  egui::RichText::new("●").color(Color32::RED).size(COLOR_SWATCH_FONT_SIZE_PT),
+                )
+                .show_ui(ui, |_| {})
+                .response;
+              let width = egui::ComboBox::from_id_salt("toolbar-layout-test-width")
+                .selected_text("8 px")
+                .show_ui(ui, |_| {})
+                .response;
+              let font_size = egui::ComboBox::from_id_salt("toolbar-layout-test-font-size")
+                .selected_text("24 pt")
+                .show_ui(ui, |_| {})
+                .response;
+              let save = ui.button("保存");
+              measurements.set([
+                (tool.rect.center().y, tool.rect.height()),
+                (color.rect.center().y, color.rect.height()),
+                (width.rect.center().y, width.rect.height()),
+                (font_size.rect.center().y, font_size.rect.height()),
+                (save.rect.center().y, save.rect.height()),
+              ]);
+            });
+          });
+          panel_height.set(panel.response.rect.height());
+        },
+      )
+      .drop_without_applying_deltas();
+
+    let measurements = measurements.get();
+    for (_, height) in measurements {
+      assert!((height - FLOATING_CONTROL_HEIGHT_PT).abs() < 0.1, "controls: {measurements:?}");
+    }
+    for pair in measurements.windows(2) {
+      assert!((pair[0].0 - pair[1].0).abs() < 0.1, "controls: {measurements:?}");
+    }
+    let expected_panel_height = FLOATING_CONTROL_HEIGHT_PT
+      + 2.0 * FLOATING_PANEL_MARGIN_PT as f32
+      + 2.0 * panel_stroke_width.get();
+    assert!(
+      (panel_height.get() - expected_panel_height).abs() < 0.1,
+      "panel={}, expected={expected_panel_height}",
+      panel_height.get()
+    );
+  }
+
+  #[test]
+  fn floating_menus_are_compact_complete_and_above_panels() {
+    let context = egui::Context::default();
+    context.all_styles_mut(|style| style.spacing.button_padding = egui::vec2(12.0, 7.0));
+    let heights = Cell::new([0.0; 2]);
+    let overflows = Cell::new([0.0; 2]);
+
+    context
+      .run_ui(
+        egui::RawInput {
+          screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+          ..Default::default()
+        },
+        |ui| {
+          egui::containers::menu::menu_style(ui.style_mut());
+          set_floating_control_style(ui);
+          let colors =
+            egui::ScrollArea::vertical().max_height(FLOATING_MENU_MAX_HEIGHT_PT).show(ui, |ui| {
+              let mut first_height: f32 = 0.0;
+              for (index, color) in mvp_colors().into_iter().enumerate() {
+                let response = ui.selectable_label(
+                  index == 0,
+                  egui::RichText::new("●").color(color32(color)).size(COLOR_SWATCH_FONT_SIZE_PT),
+                );
+                first_height = first_height.max(response.rect.height());
+              }
+              first_height
+            });
+          let font_sizes =
+            egui::ScrollArea::vertical().max_height(FLOATING_MENU_MAX_HEIGHT_PT).show(ui, |ui| {
+              let mut first_height: f32 = 0.0;
+              for font_size in PRESET_FONT_SIZES_PX {
+                let response = ui.selectable_label(font_size == 24.0, format!("{font_size} pt"));
+                first_height = first_height.max(response.rect.height());
+              }
+              first_height
+            });
+          heights.set([colors.inner, font_sizes.inner]);
+          overflows.set([
+            colors.content_size.y - colors.inner_rect.height().ceil(),
+            font_sizes.content_size.y - font_sizes.inner_rect.height().ceil(),
+          ]);
+        },
+      )
+      .drop_without_applying_deltas();
+
+    for height in heights.get() {
+      assert!((height - FLOATING_CONTROL_HEIGHT_PT).abs() < 0.1);
+    }
+    for overflow in overflows.get() {
+      assert!(overflow <= 0.0, "menu overflow={overflow}");
+    }
+    assert!(FLOATING_PANEL_ORDER < egui::PopupKind::Menu.order());
   }
 
   #[test]
