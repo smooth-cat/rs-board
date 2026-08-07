@@ -2,6 +2,7 @@
 /target
 /dist/
 /.release-tmp/
+/perf-logs/
 **/*.rs.bk
 *.pdb
 *.rlib

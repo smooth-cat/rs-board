@@ -35,7 +35,8 @@ cargo test --workspace
 性能埋点默认关闭。使用 release 构建采样时，通过环境变量把非阻塞 JSONL 日志写入指定文件，并为本轮固定语料和路径分类：
 
 ```bash
-RS_BOARD_PERF_LOG=/tmp/rs-board-perf-ui-hot.jsonl \
+mkdir -p perf-logs
+RS_BOARD_PERF_LOG=perf-logs/ui-hot.jsonl \
 RS_BOARD_PERF_CORPUS=ui \
 RS_BOARD_PERF_RUN_KIND=hot \
 cargo run -p app --release -- --show
@@ -46,9 +47,9 @@ cargo run -p app --release -- --show
 冷路径还必须设置 `RS_BOARD_PERF_COLD_SOURCE=startup|wake|display_change`，三种来源和三类语料分别至少采样 10 次。每个进程/run 只执行一次对应的启动、唤醒或显示器变化，再采集一次首次 `F1`；完成后正常退出并用新进程进行下一次，多个 run 可追加到同一个、只用于该实验的日志文件。汇总器要求至少 10 个独立 run 且每个 run 只有一个同组冷样本。4K 冷路径以 `max_us` 和 `within_limit` 检查 500ms 单次上限，不以 p95 代替。汇总单个阶段或全部阶段：
 
 ```bash
-scripts/summarize-capture-performance.sh /tmp/rs-board-perf-ui-hot.jsonl \
+scripts/summarize-capture-performance.sh perf-logs/ui-hot.jsonl \
   capture.editor_frame_submitted
-scripts/summarize-capture-performance.sh /tmp/rs-board-perf-ui-hot.jsonl
+scripts/summarize-capture-performance.sh perf-logs/ui-hot.jsonl
 ```
 
 汇总器拒绝 debug、非法或缺失标签、任何非成功测量、缺少唯一且位于末尾的 clean `run_complete`，以及包含 dropped event 的数据；只有 `complete=yes` 的行可作为基线。确认验收行的 `resolution` 是原生 `3840x2160` 或 `7680x4320`；没有尺寸字段的内部阶段显示 `-`，不能单独用于跨分辨率验收。截图呈现看 `capture.editor_frame_submitted`，暂存/保存的当前 UI 完成边界看 `persistence.request_to_ui_complete` 并区分 `workflow`，可靠存储提交看 `persistence.store.total`。
