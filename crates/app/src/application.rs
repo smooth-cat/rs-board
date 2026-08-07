@@ -2545,7 +2545,6 @@ impl eframe::App for RsBoardApp {
     self.handle_draft_results(context);
     self.handle_post_save_results();
     self.handle_worker_events(context);
-    self.poll_external_events(context);
     if self.capture_surfaces.should_refresh() {
       match self.capture_surfaces.refresh_available_displays() {
         Ok(DisplayRefreshOutcome::ActiveDisplayRemoved(_)) => {
@@ -2560,6 +2559,7 @@ impl eframe::App for RsBoardApp {
         Err(error) => eprintln!("capture_surface_refresh_failed error={error:?}"),
       }
     }
+    self.poll_external_events(context);
   }
 
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

@@ -1,6 +1,6 @@
 use std::{
   collections::{HashMap, HashSet},
-  time::{Duration, Instant},
+  time::{Duration, Instant, SystemTime},
 };
 
 use eframe::egui::{self, ViewportBuilder, ViewportId, WindowLevel};
@@ -11,6 +11,7 @@ use xcap::Monitor;
 use crate::capture::NativeCaptureImage;
 
 const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const COLD_REFRESH_WALL_CLOCK_GAP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplaySnapshot {
@@ -191,6 +192,7 @@ pub struct CaptureSurfaceCoordinator {
   surfaces: HashMap<u32, DisplayCaptureSurface>,
   active_display_id: Option<u32>,
   last_refresh: Instant,
+  last_refresh_wall_clock: SystemTime,
   focus_restore: FocusRestore,
 }
 
@@ -201,6 +203,7 @@ impl CaptureSurfaceCoordinator {
       surfaces: HashMap::new(),
       active_display_id: None,
       last_refresh: Instant::now(),
+      last_refresh_wall_clock: SystemTime::now(),
       focus_restore: FocusRestore::default(),
     };
     coordinator.refresh(displays);
@@ -209,13 +212,42 @@ impl CaptureSurfaceCoordinator {
 
   pub fn should_refresh(&self) -> bool {
     self.last_refresh.elapsed() >= DISPLAY_REFRESH_INTERVAL
+      || SystemTime::now()
+        .duration_since(self.last_refresh_wall_clock)
+        .is_ok_and(|elapsed| elapsed >= COLD_REFRESH_WALL_CLOCK_GAP)
   }
 
   pub fn refresh_available_displays(
     &mut self,
   ) -> Result<DisplayRefreshOutcome, CaptureSurfaceError> {
     self.last_refresh = Instant::now();
-    Ok(self.refresh(available_displays()?))
+    Ok(self.refresh_after_wall_clock_gap(available_displays()?, SystemTime::now()))
+  }
+
+  fn refresh_after_wall_clock_gap(
+    &mut self,
+    displays: Vec<DisplaySnapshot>,
+    now: SystemTime,
+  ) -> DisplayRefreshOutcome {
+    let cold_refresh = now
+      .duration_since(self.last_refresh_wall_clock)
+      .is_ok_and(|elapsed| elapsed >= COLD_REFRESH_WALL_CLOCK_GAP);
+    self.last_refresh_wall_clock = now;
+    let outcome = self.refresh(displays);
+    if !cold_refresh {
+      return outcome;
+    }
+    for surface in self.surfaces.values_mut() {
+      if surface.lifecycle == SurfaceLifecycle::Hidden {
+        *surface = DisplayCaptureSurface::new(surface.display);
+      }
+    }
+    match outcome {
+      DisplayRefreshOutcome::ActiveDisplayRemoved(_) => outcome,
+      DisplayRefreshOutcome::Unchanged | DisplayRefreshOutcome::DisplaysChanged => {
+        DisplayRefreshOutcome::DisplaysChanged
+      }
+    }
   }
 
   pub fn refresh(&mut self, displays: Vec<DisplaySnapshot>) -> DisplayRefreshOutcome {
@@ -356,6 +388,7 @@ impl Default for CaptureSurfaceCoordinator {
       surfaces: HashMap::new(),
       active_display_id: None,
       last_refresh: Instant::now(),
+      last_refresh_wall_clock: SystemTime::now(),
       focus_restore: FocusRestore::default(),
     }
   }
@@ -582,6 +615,10 @@ mod tests {
     assert_eq!(coordinator.refresh(Vec::new()), DisplayRefreshOutcome::ActiveDisplayRemoved(4));
     assert_eq!(coordinator.active_display_id(), Some(4));
     assert_eq!(coordinator.viewport_specs().len(), 1);
+
+    coordinator.hide_active();
+    assert_eq!(coordinator.refresh(Vec::new()), DisplayRefreshOutcome::DisplaysChanged);
+    assert!(coordinator.viewport_specs().is_empty());
   }
 
   #[test]
@@ -590,5 +627,27 @@ mod tests {
     coordinator.refresh(vec![display(1, [-1920, 0, 1920, 1080]), display(2, [0, 0, 1728, 1117])]);
     assert_eq!(coordinator.display_for_point([-10, 20]), Some(1));
     assert_eq!(coordinator.display_for_point([100, 20]), Some(2));
+  }
+
+  #[test]
+  fn long_wall_clock_gap_forces_a_cold_refresh_without_replacing_active_snapshot() {
+    let mut coordinator = CaptureSurfaceCoordinator::default();
+    let before_sleep = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+    coordinator.last_refresh_wall_clock = before_sleep;
+    coordinator.refresh(vec![display(7, [0, 0, 100, 80]), display(9, [100, 0, 100, 80])]);
+    coordinator.present(7, Uuid::new_v4()).unwrap();
+
+    let outcome = coordinator.refresh_after_wall_clock_gap(
+      vec![display(7, [10, 20, 200, 160]), display(9, [100, 0, 100, 80])],
+      before_sleep + COLD_REFRESH_WALL_CLOCK_GAP,
+    );
+
+    assert_eq!(outcome, DisplayRefreshOutcome::DisplaysChanged);
+    let active = coordinator
+      .viewport_specs()
+      .into_iter()
+      .find(|viewport| viewport.display.display_id == 7)
+      .unwrap();
+    assert_eq!(active.display.bounds_global, [0, 0, 100, 80]);
   }
 }

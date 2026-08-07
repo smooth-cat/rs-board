@@ -887,6 +887,100 @@ mod tests {
     assert!(String::from_utf8_lossy(&output.stderr).contains("terminal completion"));
   }
 
+  #[test]
+  fn summary_applies_every_planned_hot_path_limit() {
+    let Some(_) = jq_available() else {
+      return;
+    };
+    let cases = [
+      ("capture.editor_frame_submitted", None, 3_840, 2_160, 50_000),
+      ("persistence.request_to_ui_complete", Some("stash"), 3_840, 2_160, 50_000),
+      ("persistence.request_to_ui_complete", Some("stash"), 7_680, 4_320, 50_000),
+      ("persistence.request_to_ui_complete", Some("save"), 3_840, 2_160, 1_000_000),
+      ("persistence.request_to_ui_complete", Some("save"), 7_680, 4_320, 6_000_000),
+      ("stash.request.total", Some("stash"), 7_680, 4_320, 6_000_000),
+    ];
+
+    for (stage, workflow, width_px, height_px, limit_us) in cases {
+      let events: Vec<_> = (0..105)
+        .map(|sample| {
+          serde_json::json!({
+            "schema": SCHEMA,
+            "outcome": "ok",
+            "build_profile": "release",
+            "corpus": "ui",
+            "run_kind": "hot",
+            "run_id": format!("{stage}-{workflow:?}"),
+            "process_id": 1,
+            "event_sequence": sample + 1,
+            "stage": stage,
+            "workflow": workflow,
+            "trigger": "hotkey",
+            "width_px": width_px,
+            "height_px": height_px,
+            "duration_us": limit_us
+          })
+        })
+        .collect();
+      let output = run_summary_stage(&events, true, stage);
+      assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+      let stdout = String::from_utf8(output.stdout).unwrap();
+      let row: Vec<_> = stdout.lines().nth(1).unwrap().split('\t').collect();
+      assert_eq!(row[15], limit_us.to_string());
+      assert_eq!(row[16], "yes");
+      assert_eq!(row[17], "yes");
+
+      let mut failing = events;
+      for event in &mut failing {
+        event["duration_us"] = serde_json::Value::from(limit_us + 1);
+      }
+      let output = run_summary_stage(&failing, true, stage);
+      assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+      let stdout = String::from_utf8(output.stdout).unwrap();
+      let row: Vec<_> = stdout.lines().nth(1).unwrap().split('\t').collect();
+      assert_eq!(row[17], "no");
+    }
+  }
+
+  #[test]
+  fn verifier_fails_incomplete_or_over_limit_measurements() {
+    let Some(_) = jq_available() else {
+      return;
+    };
+    let passing: Vec<_> = (0..105)
+      .map(|sample| summary_event("verify-pass", "hot", None, sample + 1, 50_000))
+      .collect();
+    let output = run_performance_tool(
+      &passing,
+      true,
+      "capture.editor_frame_submitted",
+      "verify-capture-performance.sh",
+    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let failing: Vec<_> = (0..105)
+      .map(|sample| summary_event("verify-fail", "hot", None, sample + 1, 50_001))
+      .collect();
+    let output = run_performance_tool(
+      &failing,
+      true,
+      "capture.editor_frame_submitted",
+      "verify-capture-performance.sh",
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("performance limit exceeded"));
+
+    let incomplete = [summary_event("verify-incomplete", "hot", None, 1, 1)];
+    let output = run_performance_tool(
+      &incomplete,
+      true,
+      "capture.editor_frame_submitted",
+      "verify-capture-performance.sh",
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("incomplete performance group"));
+  }
+
   fn jq_available() -> Option<()> {
     Command::new("jq").arg("--version").output().ok().filter(|output| output.status.success())?;
     Some(())
@@ -922,6 +1016,19 @@ mod tests {
   }
 
   fn run_summary_inner(events: &[serde_json::Value], add_completions: bool) -> Output {
+    run_summary_stage(events, add_completions, "capture.editor_frame_submitted")
+  }
+
+  fn run_summary_stage(events: &[serde_json::Value], add_completions: bool, stage: &str) -> Output {
+    run_performance_tool(events, add_completions, stage, "summarize-capture-performance.sh")
+  }
+
+  fn run_performance_tool(
+    events: &[serde_json::Value],
+    add_completions: bool,
+    stage: &str,
+    script_name: &str,
+  ) -> Output {
     let path =
       std::env::temp_dir().join(format!("rs-board-performance-summary-{}.jsonl", Uuid::new_v4()));
     let mut file = File::create(&path).unwrap();
@@ -959,10 +1066,8 @@ mod tests {
       }
     }
     drop(file);
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("../../scripts/summarize-capture-performance.sh");
-    let output =
-      Command::new(script).arg(&path).arg("capture.editor_frame_submitted").output().unwrap();
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts").join(script_name);
+    let output = Command::new(script).arg(&path).arg(stage).output().unwrap();
     std::fs::remove_file(path).unwrap();
     output
   }

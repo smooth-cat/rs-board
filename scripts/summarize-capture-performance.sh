@@ -6,9 +6,9 @@ usage() {
 Usage: scripts/summarize-capture-performance.sh LOG.jsonl [STAGE]
 
 Summarizes successful rs-board.performance.v1 release events. Each hot run
-discards its own first five samples and must then contain 100 samples. Cold
-samples are grouped by startup/wake/display_change source and report their max.
-P95 uses the nearest-rank definition from plans/capture-performance.md.
+discards its own first five samples and must then contain 100 samples. Hot
+limits use p95; cold capture limits use max. P95 uses the nearest-rank
+definition from plans/capture-performance.md.
 EOF
 }
 
@@ -54,6 +54,36 @@ jq -s -r --arg selected_stage "$RS_BOARD_STAGE" '
           and $first.width_px == 3840
           and $first.height_px == 2160
         then 500000
+        elif $first.run_kind == "hot"
+          and ($first.stage == "capture.editor_frame_submitted"
+            or $first.stage == "capture.request.total")
+          and $first.width_px == 3840
+          and $first.height_px == 2160
+        then 50000
+        elif $first.run_kind == "hot"
+          and $first.stage == "persistence.request_to_ui_complete"
+          and $first.workflow == "stash"
+          and (($first.width_px == 3840 and $first.height_px == 2160)
+            or ($first.width_px == 7680 and $first.height_px == 4320))
+        then 50000
+        elif $first.run_kind == "hot"
+          and $first.stage == "persistence.request_to_ui_complete"
+          and $first.workflow == "save"
+          and $first.width_px == 3840
+          and $first.height_px == 2160
+        then 1000000
+        elif $first.run_kind == "hot"
+          and $first.stage == "persistence.request_to_ui_complete"
+          and $first.workflow == "save"
+          and $first.width_px == 7680
+          and $first.height_px == 4320
+        then 6000000
+        elif $first.run_kind == "hot"
+          and $first.stage == "stash.request.total"
+          and $first.workflow == "stash"
+          and $first.width_px == 7680
+          and $first.height_px == 4320
+        then 6000000
         else null
         end
       ) as $limit_us
@@ -102,7 +132,9 @@ jq -s -r --arg selected_stage "$RS_BOARD_STAGE" '
         within_limit: (
           if .limit_us == null or .max_us == null
           then "-"
-          elif .max_us <= .limit_us
+          elif .run_kind == "cold" and .max_us <= .limit_us
+          then "yes"
+          elif .run_kind == "hot" and .p95_us <= .limit_us
           then "yes"
           else "no"
           end
@@ -178,7 +210,8 @@ jq -s -r --arg selected_stage "$RS_BOARD_STAGE" '
       (.stage == "capture.editor_frame_submitted"
         or .stage == "capture.request.total"
         or .stage == "persistence.request_to_ui_complete"
-        or .stage == "persistence.store.total")
+        or .stage == "persistence.store.total"
+        or .stage == "stash.request.total")
       and ((.width_px // 0) <= 0 or (.height_px // 0) <= 0))
     then error("acceptance-stage events must include native pixel dimensions")
     else $events

@@ -475,6 +475,37 @@ mod tests {
   }
 
   #[test]
+  fn queues_are_bounded_and_report_eviction_without_blocking_commits() {
+    let mut state = CoordinatorState::default();
+    let mut saw_render_eviction = false;
+    for _ in 0..MAX_PENDING_CLIPBOARD_WRITES {
+      let outcome = state.enqueue(job(DocumentId::new(), 1, true));
+      saw_render_eviction |= outcome.render_evicted;
+      assert!(!outcome.clipboard_dropped);
+    }
+    let overflow = state.enqueue(job(DocumentId::new(), 1, true));
+
+    assert!(saw_render_eviction);
+    assert!(overflow.render_evicted);
+    assert!(overflow.clipboard_dropped);
+    assert_eq!(state.latest_render_by_document.len(), MAX_PENDING_RENDERS);
+    assert_eq!(state.clipboard_queue.len(), MAX_PENDING_CLIPBOARD_WRITES);
+  }
+
+  #[test]
+  fn superseded_render_releases_its_snapshot_reference() {
+    let document_id = DocumentId::new();
+    let first = job(document_id, 1, false);
+    let first_snapshot = Arc::downgrade(&first.snapshot);
+    let mut state = CoordinatorState::default();
+    state.enqueue(first);
+    state.enqueue(job(document_id, 2, false));
+
+    assert!(first_snapshot.upgrade().is_none());
+    assert_eq!(state.latest_render_by_document[&document_id].revision, 2);
+  }
+
+  #[test]
   fn enqueue_does_not_wait_for_a_busy_worker() {
     let (_temporary, store) = test_store();
     let blocked = Arc::new((Mutex::new(false), Condvar::new()));

@@ -59,6 +59,22 @@ impl PreparedBackground {
     Self::pending(capture_sequence, pixel_size)
   }
 
+  #[cfg(test)]
+  pub(crate) fn failed_for_test(
+    capture_sequence: u64,
+    pixel_size: [u32; 2],
+    error: impl Into<Arc<str>>,
+  ) -> Self {
+    Self {
+      capture_sequence,
+      pixel_size,
+      shared: Arc::new(PreparedShared {
+        state: Mutex::new(PreparedState::Failed(error.into())),
+        changed: Condvar::new(),
+      }),
+    }
+  }
+
   pub fn ready(
     capture_sequence: u64,
     background: BackgroundData,
@@ -412,5 +428,19 @@ mod tests {
     let background = retried.wait().unwrap();
     let (_, _, pixels) = background.decode_rgba8().unwrap();
     assert_eq!(&*pixels, &[10, 20, 30, 255]);
+  }
+
+  #[test]
+  fn prepared_background_releases_pixels_after_the_last_consumer() {
+    let pixels: Arc<[u8]> = Arc::from([10, 20, 30, 255]);
+    let pixels_weak = Arc::downgrade(&pixels);
+    let background = BackgroundData::rgba8(1, 1, Arc::clone(&pixels)).unwrap();
+    let prepared = PreparedBackground::ready(1, background).unwrap();
+    let consumer = prepared.wait().unwrap();
+    drop(pixels);
+    drop(prepared);
+    assert!(pixels_weak.upgrade().is_some());
+    drop(consumer);
+    assert!(pixels_weak.upgrade().is_none());
   }
 }

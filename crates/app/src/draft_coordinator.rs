@@ -14,6 +14,8 @@ use crate::{
   storage::{GenerationId, LatestDraft, LocalStore, PersistenceContext, StashRequest},
 };
 
+type CommitHook = Option<Arc<dyn Fn() + Send + Sync>>;
+
 #[derive(Clone)]
 pub struct StashJob {
   pub context: PersistenceContext,
@@ -109,6 +111,23 @@ impl DraftCoordinator {
     store: LocalStore,
     wake: impl Fn() + Send + Sync + 'static,
   ) -> Result<Self, DraftCoordinatorError> {
+    Self::start(store, wake, None)
+  }
+
+  #[cfg(test)]
+  fn with_commit_hook(
+    store: LocalStore,
+    wake: impl Fn() + Send + Sync + 'static,
+    before_commit: Arc<dyn Fn() + Send + Sync>,
+  ) -> Result<Self, DraftCoordinatorError> {
+    Self::start(store, wake, Some(before_commit))
+  }
+
+  fn start(
+    store: LocalStore,
+    wake: impl Fn() + Send + Sync + 'static,
+    before_commit: CommitHook,
+  ) -> Result<Self, DraftCoordinatorError> {
     let shared =
       Arc::new(Shared { state: Mutex::new(CoordinatorState::default()), changed: Condvar::new() });
     let (result_sender, results) = mpsc::channel();
@@ -118,7 +137,7 @@ impl DraftCoordinator {
     let worker = thread::Builder::new()
       .name("draft-coordinator".into())
       .spawn(move || {
-        run_worker(worker_shared, store, result_sender, wake);
+        run_worker(worker_shared, store, result_sender, wake, before_commit);
         let _ = done_sender.try_send(());
       })
       .map_err(DraftCoordinatorError::Spawn)?;
@@ -254,6 +273,7 @@ fn run_worker(
   store: LocalStore,
   results: mpsc::Sender<DraftResult>,
   wake: Arc<dyn Fn() + Send + Sync>,
+  before_commit: CommitHook,
 ) {
   loop {
     let command = {
@@ -271,7 +291,7 @@ fn run_worker(
     };
 
     let result = match command {
-      DraftCommand::Commit(job) => process_commit(&shared, &store, *job),
+      DraftCommand::Commit(job) => process_commit(&shared, &store, *job, &before_commit),
       DraftCommand::DeleteIfGeneration(generation_id) => DraftResult::DeleteIfGeneration {
         generation_id,
         result: store.delete_latest_if_generation(generation_id).map_err(|error| error.to_string()),
@@ -297,7 +317,12 @@ fn run_worker(
   }
 }
 
-fn process_commit(shared: &Shared, store: &LocalStore, job: StashJob) -> DraftResult {
+fn process_commit(
+  shared: &Shared,
+  store: &LocalStore,
+  job: StashJob,
+  before_commit: &CommitHook,
+) -> DraftResult {
   let capture_sequence = job.capture_sequence();
   let stash_sequence = job.stash_sequence();
   let context = job.context;
@@ -364,6 +389,8 @@ fn process_commit(shared: &Shared, store: &LocalStore, job: StashJob) -> DraftRe
       Err("draft job was superseded before atomic commit".into()),
     );
   }
+
+  invoke_commit_hook(before_commit);
 
   let timer = PerformanceTimer::started_at(
     "stash.request.total",
@@ -432,6 +459,12 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn wait_unpoisoned<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
   condvar.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn invoke_commit_hook(hook: &CommitHook) {
+  if let Some(hook) = hook {
+    hook();
+  }
 }
 
 #[cfg(test)]
@@ -554,5 +587,53 @@ mod tests {
     assert!(started_at.elapsed() < Duration::from_millis(250));
     pending.supersede();
     thread::sleep(Duration::from_millis(20));
+  }
+
+  #[test]
+  fn stale_success_followed_by_current_failure_preserves_the_healthy_draft() {
+    let (_root, store) = store("stale-success-current-failure");
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let hook = {
+      let release = Arc::clone(&release);
+      Arc::new(move || {
+        let _ = entered_sender.try_send(());
+        let (lock, changed) = &*release;
+        let mut released = lock_unpoisoned(lock);
+        while !*released {
+          released = wait_unpoisoned(changed, released);
+        }
+      }) as Arc<dyn Fn() + Send + Sync>
+    };
+    let mut coordinator = DraftCoordinator::with_commit_hook(store.clone(), || {}, hook).unwrap();
+    let healthy_generation = GenerationId::new();
+    coordinator.publish_capture(1);
+    coordinator.enqueue_commit(job(1, 1, healthy_generation)).unwrap();
+    entered_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let failed_generation = GenerationId::new();
+    let mut failed = job(2, 2, failed_generation);
+    failed.prepared_background =
+      PreparedBackground::failed_for_test(2, [2, 2], "injected current encoding failure");
+    coordinator.publish_capture(2);
+    coordinator.enqueue_commit(failed).unwrap();
+    let (lock, changed) = &*release;
+    *lock_unpoisoned(lock) = true;
+    changed.notify_all();
+
+    let first = wait_result(&coordinator);
+    assert!(matches!(
+      first,
+      DraftResult::Commit { generation_id, is_latest: false, result, .. }
+        if generation_id == healthy_generation && result.is_ok()
+    ));
+    let second = wait_result(&coordinator);
+    assert!(matches!(
+      second,
+      DraftResult::Commit { generation_id, is_latest: true, result, .. }
+        if generation_id == failed_generation && result.is_err()
+    ));
+    assert_eq!(store.load_latest_draft().unwrap().unwrap().generation_id, healthy_generation);
+    assert!(coordinator.shutdown(Duration::from_secs(2)));
   }
 }

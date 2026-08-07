@@ -50,9 +50,10 @@ cargo run -p app --release -- --show
 scripts/summarize-capture-performance.sh perf-logs/ui-hot.jsonl \
   capture.editor_frame_submitted
 scripts/summarize-capture-performance.sh perf-logs/ui-hot.jsonl
+scripts/verify-capture-performance.sh perf-logs/ui-hot.jsonl
 ```
 
-汇总器拒绝 debug、非法或缺失标签、任何非成功测量、缺少唯一且位于末尾的 clean `run_complete`，以及包含 dropped event 的数据；只有 `complete=yes` 的行可作为基线。确认验收行的 `resolution` 是原生 `3840x2160` 或 `7680x4320`；没有尺寸字段的内部阶段显示 `-`，不能单独用于跨分辨率验收。截图呈现看 `capture.editor_frame_submitted`，暂存/保存的当前 UI 完成边界看 `persistence.request_to_ui_complete` 并区分 `workflow`，可靠存储提交看 `persistence.store.total`。
+汇总器拒绝 debug、非法或缺失标签、任何非成功测量、缺少唯一且位于末尾的 clean `run_complete`，以及包含 dropped event 的数据；只有 `complete=yes` 的行可作为基线。`within_limit` 对热路径比较 p95，对冷截图比较 max；验证器会在样本不完整、没有计划内指标或任一阈值失败时返回非零。确认验收行的 `resolution` 是原生 `3840x2160` 或 `7680x4320`；没有尺寸字段的内部阶段显示 `-`，不能单独用于跨分辨率验收。截图呈现看 `capture.editor_frame_submitted`，暂存/保存的当前 UI 完成边界看 `persistence.request_to_ui_complete` 并区分 `workflow`，8K 后台暂存完成看 `stash.request.total`，可靠存储内部耗时看 `persistence.store.total`。
 
 `capture.editor_frame_submitted` 表示首个编辑器 UI pass 和窗口命令已提交，是当前 eframe 链路的代理终点，不等同于系统 compositor 已显示；原生双层窗口接入后再补充精确的合成完成事件。日志只包含关联 ID、尺寸、字节数、阶段、耗时和脱敏错误码，不记录错误文本、图像、文字、标题或完整路径。
 

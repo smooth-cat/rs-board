@@ -1063,6 +1063,7 @@ mod tests {
   use common::{CapturedDisplay, GlobalBoundsPx, SizePx};
 
   use super::*;
+  use crate::storage::atomic::with_injected_fault;
 
   struct TestDirectory(PathBuf);
 
@@ -1129,6 +1130,59 @@ mod tests {
       generation_id: GenerationId::new(),
       snapshot: document.snapshot(document.revision).unwrap(),
       background: background(red),
+    }
+  }
+
+  #[test]
+  fn draft_commit_faults_never_destroy_the_last_recoverable_generation() {
+    let fault_points = [
+      ("persistence.file.write", "background"),
+      ("persistence.file.sync", "background"),
+      ("persistence.file.write", "manifest"),
+      ("persistence.file.write", "slot"),
+      ("persistence.file.write", "commit_marker"),
+      ("persistence.directory.sync", "staging_directory"),
+      (
+        if cfg!(target_os = "macos") {
+          "persistence.directory.swap"
+        } else {
+          "persistence.directory.rename"
+        },
+        "latest_draft",
+      ),
+      ("persistence.directory.sync", "parent_directory"),
+    ];
+
+    for (stage, resource) in fault_points {
+      let (_root, store) = store(&format!("draft-fault-{}-{resource}", stage.replace('.', "-")));
+      let healthy = document(DocumentId::new());
+      let healthy_request = stash_request(&healthy, 10);
+      let healthy_generation = healthy_request.generation_id;
+      store.replace_latest_draft(healthy_request).unwrap();
+
+      let replacement = document(DocumentId::new());
+      let replacement_request = stash_request(&replacement, 90);
+      let replacement_generation = replacement_request.generation_id;
+      let result =
+        with_injected_fault(stage, resource, || store.replace_latest_draft(replacement_request));
+      assert!(result.is_err(), "fault at {stage}/{resource} did not fire");
+
+      let recovered = store.load_latest_draft().unwrap().expect("a healthy draft must remain");
+      assert!(
+        recovered.generation_id == healthy_generation
+          || (stage == "persistence.directory.sync"
+            && resource == "parent_directory"
+            && recovered.generation_id == replacement_generation),
+        "unexpected generation after {stage}/{resource}: {}",
+        recovered.generation_id
+      );
+      assert!(recovered.loaded.background.decode_rgba8().is_ok());
+      let staging_count = std::fs::read_dir(store.paths().draft_root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-draft-"))
+        .count();
+      assert_eq!(staging_count, 0, "staging leaked after {stage}/{resource}");
     }
   }
 

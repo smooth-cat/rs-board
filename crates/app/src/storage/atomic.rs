@@ -7,6 +7,9 @@ use std::{
 
 use uuid::Uuid;
 
+#[cfg(test)]
+use std::cell::RefCell;
+
 use super::{StorageError, StorageResult};
 use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 
@@ -235,6 +238,15 @@ fn measured<T>(
   details: Option<PerformanceDetails>,
   operation: impl FnOnce() -> StorageResult<T>,
 ) -> StorageResult<T> {
+  #[cfg(test)]
+  if let Some(trace) = trace
+    && injected_fault_matches(stage, trace.resource)
+  {
+    return Err(StorageError::IncompleteCommit(format!(
+      "injected storage fault at {stage} for {}",
+      trace.resource
+    )));
+  }
   let timer =
     trace.map(|trace| PerformanceTimer::start(stage, *trace.context, details.unwrap_or_default()));
   let result = operation();
@@ -245,6 +257,46 @@ fn measured<T>(
     }
   }
   result
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct InjectedFault {
+  stage: &'static str,
+  resource: &'static str,
+}
+
+#[cfg(test)]
+thread_local! {
+  static INJECTED_FAULT: RefCell<Option<InjectedFault>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct FaultReset(Option<InjectedFault>);
+
+#[cfg(test)]
+impl Drop for FaultReset {
+  fn drop(&mut self) {
+    INJECTED_FAULT.with(|slot| *slot.borrow_mut() = self.0);
+  }
+}
+
+#[cfg(test)]
+pub(crate) fn with_injected_fault<T>(
+  stage: &'static str,
+  resource: &'static str,
+  operation: impl FnOnce() -> T,
+) -> T {
+  let previous = INJECTED_FAULT.with(|slot| slot.replace(Some(InjectedFault { stage, resource })));
+  let _reset = FaultReset(previous);
+  operation()
+}
+
+#[cfg(test)]
+fn injected_fault_matches(stage: &'static str, resource: &'static str) -> bool {
+  INJECTED_FAULT.with(|slot| {
+    slot.borrow().is_some_and(|fault| fault.stage == stage && fault.resource == resource)
+  })
 }
 
 pub(crate) fn remove_path_if_exists(path: &Path) -> StorageResult<()> {

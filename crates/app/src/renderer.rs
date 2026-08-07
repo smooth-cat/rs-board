@@ -777,10 +777,10 @@ mod tests {
     let four_k_rendered = render_document_to_image(&four_k, &four_k_background);
     assert_eq!(four_k_rendered.dimensions(), (3_840, 2_160));
 
-    let eight_k = document_with_size(8_192, 64);
-    let eight_k_background = RgbaImage::from_pixel(8_192, 64, Rgba([4, 5, 6, 255]));
+    let eight_k = document_with_size(7_680, 4_320);
+    let eight_k_background = RgbaImage::from_pixel(7_680, 4_320, Rgba([4, 5, 6, 255]));
     let eight_k_rendered = render_document_to_image(&eight_k, &eight_k_background);
-    assert_eq!(eight_k_rendered.dimensions(), (8_192, 64));
+    assert_eq!(eight_k_rendered.dimensions(), (7_680, 4_320));
   }
 
   #[test]
