@@ -19,6 +19,8 @@ const FLOATING_CONTROL_HEIGHT_PT: f32 = 32.0;
 const FLOATING_MENU_MAX_HEIGHT_PT: f32 = f32::INFINITY;
 const FLOATING_PANEL_ORDER: egui::Order = egui::Order::Middle;
 const FLOATING_PANEL_MARGIN_PT: i8 = 4;
+const TOOLBAR_DRAG_HANDLE_WIDTH_PT: f32 = 18.0;
+const TOOLBAR_DRAG_HANDLE_DOT_RADIUS_PT: f32 = 1.5;
 const HANDLE_VISUAL_RADIUS_PT: f32 = 4.5;
 const HANDLE_HIT_RADIUS_PT: f32 = 11.0;
 const HIT_TOLERANCE_PT: f32 = 7.0;
@@ -243,6 +245,8 @@ pub struct EditorController {
   text_editing: Option<TextEditing>,
   last_pointer_document: Option<PointPx>,
   option_panel_anchor: Option<Pos2>,
+  toolbar_screen_rect: Option<Rect>,
+  toolbar_was_moved: bool,
 }
 
 impl Default for EditorController {
@@ -261,6 +265,8 @@ impl EditorController {
       text_editing: None,
       last_pointer_document: None,
       option_panel_anchor: None,
+      toolbar_screen_rect: None,
+      toolbar_was_moved: false,
     }
   }
 
@@ -953,52 +959,60 @@ impl EditorController {
     history: &CommandHistory,
     actions: &mut Vec<EditorAction>,
   ) {
-    egui::Area::new(Id::new("rs-board-toolbar"))
-      .order(FLOATING_PANEL_ORDER)
-      .anchor(Align2::CENTER_TOP, egui::vec2(0.0, 10.0))
-      .show(ctx, |ui| {
-        floating_panel_frame(ui.style()).show(ui, |ui| {
-          set_floating_control_style(ui);
-          ui.horizontal(|ui| {
-            for tool in EditorTool::ALL {
-              if ui
-                .selectable_label(self.tool == tool, tool.label())
-                .on_hover_text(tool.tooltip())
-                .clicked()
-              {
-                if self.text_editing.is_some() {
-                  self.commit_text(document, actions);
-                }
-                self.tool = tool;
-                self.interaction = None;
-              }
-            }
-            ui.separator();
-            self.style_controls(ui, document, actions);
-            ui.separator();
+    let screen = ctx.content_rect();
+    let recenter = self.should_recenter_toolbar(screen);
+    let area = toolbar_area(screen, recenter).show(ctx, |ui| {
+      floating_panel_frame(ui.style()).show(ui, |ui| {
+        set_floating_control_style(ui);
+        ui.horizontal(|ui| {
+          toolbar_drag_handle(ui);
+          for tool in EditorTool::ALL {
             if ui
-              .add_enabled(history.can_undo(), egui::Button::new("↶"))
-              .on_hover_text("撤销 (Cmd+Z)")
+              .selectable_label(self.tool == tool, tool.label())
+              .on_hover_text(tool.tooltip())
               .clicked()
             {
-              actions.push(EditorAction::Undo);
-            }
-            if ui
-              .add_enabled(history.can_redo(), egui::Button::new("↷"))
-              .on_hover_text("重做 (Cmd+Shift+Z)")
-              .clicked()
-            {
-              actions.push(EditorAction::Redo);
-            }
-            if ui.button("保存").on_hover_text("保存 (Cmd+S)").clicked() {
               if self.text_editing.is_some() {
                 self.commit_text(document, actions);
               }
-              actions.push(EditorAction::Save);
+              self.tool = tool;
+              self.interaction = None;
             }
-          });
+          }
+          ui.separator();
+          self.style_controls(ui, document, actions);
+          ui.separator();
+          if ui
+            .add_enabled(history.can_undo(), egui::Button::new("↶"))
+            .on_hover_text("撤销 (Cmd+Z)")
+            .clicked()
+          {
+            actions.push(EditorAction::Undo);
+          }
+          if ui
+            .add_enabled(history.can_redo(), egui::Button::new("↷"))
+            .on_hover_text("重做 (Cmd+Shift+Z)")
+            .clicked()
+          {
+            actions.push(EditorAction::Redo);
+          }
+          if ui.button("保存").on_hover_text("保存 (Cmd+S)").clicked() {
+            if self.text_editing.is_some() {
+              self.commit_text(document, actions);
+            }
+            actions.push(EditorAction::Save);
+          }
+          toolbar_drag_handle(ui);
         });
       });
+    });
+    self.toolbar_was_moved |= area.response.dragged();
+  }
+
+  fn should_recenter_toolbar(&mut self, screen: Rect) -> bool {
+    let screen_changed = self.toolbar_screen_rect != Some(screen);
+    self.toolbar_screen_rect = Some(screen);
+    screen_changed && !self.toolbar_was_moved
   }
 
   fn style_controls(
@@ -1547,6 +1561,36 @@ fn floating_panel_frame(style: &egui::Style) -> egui::Frame {
   egui::Frame::popup(style).inner_margin(egui::Margin::same(FLOATING_PANEL_MARGIN_PT))
 }
 
+fn toolbar_area(screen: Rect, recenter: bool) -> egui::Area {
+  let area = egui::Area::new(Id::new("rs-board-toolbar"))
+    .order(FLOATING_PANEL_ORDER)
+    .pivot(Align2::CENTER_BOTTOM)
+    .default_pos(screen.center_bottom())
+    .movable(true)
+    .constrain_to(screen);
+  if recenter { area.current_pos(screen.center_bottom()) } else { area }
+}
+
+fn toolbar_drag_handle(ui: &mut egui::Ui) -> Rect {
+  let (rect, response) = ui.allocate_exact_size(
+    egui::vec2(TOOLBAR_DRAG_HANDLE_WIDTH_PT, FLOATING_CONTROL_HEIGHT_PT),
+    Sense::hover(),
+  );
+  let response = response.on_hover_cursor(CursorIcon::Grab).on_hover_text("拖动工具栏");
+  let color = ui.style().interact(&response).fg_stroke.color;
+  let center = rect.center();
+  for x in [-3.0, 3.0] {
+    for y in [-6.0, 0.0, 6.0] {
+      ui.painter().circle_filled(
+        center + egui::vec2(x, y),
+        TOOLBAR_DRAG_HANDLE_DOT_RADIUS_PT,
+        color,
+      );
+    }
+  }
+  rect
+}
+
 fn set_floating_control_style(ui: &mut egui::Ui) {
   let swatch_height =
     ui.ctx().fonts_mut(|fonts| fonts.row_height(&FontId::proportional(COLOR_SWATCH_FONT_SIZE_PT)));
@@ -1634,7 +1678,7 @@ mod tests {
   fn toolbar_and_option_controls_share_the_same_vertical_center() {
     let context = egui::Context::default();
     context.all_styles_mut(|style| style.spacing.button_padding = egui::vec2(12.0, 7.0));
-    let measurements = Cell::new([(0.0, 0.0); 5]);
+    let measurements = Cell::new([(0.0, 0.0); 7]);
     let panel_height = Cell::new(0.0);
     let panel_stroke_width = Cell::new(0.0);
 
@@ -1650,6 +1694,7 @@ mod tests {
           let panel = frame.show(ui, |ui| {
             set_floating_control_style(ui);
             ui.horizontal(|ui| {
+              let left_handle = toolbar_drag_handle(ui);
               let tool = ui.selectable_label(true, "方框");
               let color = egui::ComboBox::from_id_salt("toolbar-layout-test-color")
                 .selected_text(
@@ -1666,12 +1711,15 @@ mod tests {
                 .show_ui(ui, |_| {})
                 .response;
               let save = ui.button("保存");
+              let right_handle = toolbar_drag_handle(ui);
               measurements.set([
+                (left_handle.center().y, left_handle.height()),
                 (tool.rect.center().y, tool.rect.height()),
                 (color.rect.center().y, color.rect.height()),
                 (width.rect.center().y, width.rect.height()),
                 (font_size.rect.center().y, font_size.rect.height()),
                 (save.rect.center().y, save.rect.height()),
+                (right_handle.center().y, right_handle.height()),
               ]);
             });
           });
@@ -1695,6 +1743,75 @@ mod tests {
       "panel={}, expected={expected_panel_height}",
       panel_height.get()
     );
+  }
+
+  #[test]
+  fn toolbar_recenters_after_fullscreen_resize_and_drag_stays_within_screen() {
+    let context = egui::Context::default();
+    let startup_screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 300.0));
+    let fullscreen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 700.0));
+    let toolbar_rect = Cell::new(Rect::NOTHING);
+    let left_handle_rect = Cell::new(Rect::NOTHING);
+    let dragged = Cell::new(false);
+    let mut controller = EditorController::default();
+    let mut run_frame = |screen, events| {
+      let recenter = controller.should_recenter_toolbar(screen);
+      context
+        .run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| {
+          let area = toolbar_area(screen, recenter).show(ui.ctx(), |ui| {
+            floating_panel_frame(ui.style()).show(ui, |ui| {
+              set_floating_control_style(ui);
+              ui.horizontal(|ui| {
+                left_handle_rect.set(toolbar_drag_handle(ui));
+                ui.label("toolbar");
+                toolbar_drag_handle(ui);
+              });
+            });
+          });
+          toolbar_rect.set(area.response.rect);
+          dragged.set(area.response.dragged());
+        })
+        .drop_without_applying_deltas();
+      controller.toolbar_was_moved |= dragged.get();
+    };
+
+    run_frame(startup_screen, Vec::new());
+    run_frame(fullscreen, Vec::new());
+    let initial_rect = toolbar_rect.get();
+    assert!(
+      (initial_rect.center().x - fullscreen.center().x).abs() <= 0.5,
+      "toolbar={initial_rect:?}, screen={fullscreen:?}"
+    );
+    assert!(
+      (initial_rect.bottom() - fullscreen.bottom()).abs() < 0.1,
+      "toolbar={initial_rect:?}, screen={fullscreen:?}"
+    );
+    let handle_center = left_handle_rect.get().center();
+    run_frame(
+      fullscreen,
+      vec![
+        Event::PointerMoved(handle_center),
+        Event::PointerButton {
+          pos: handle_center,
+          button: egui::PointerButton::Primary,
+          pressed: true,
+          modifiers: Modifiers::default(),
+        },
+      ],
+    );
+    run_frame(fullscreen, vec![Event::PointerMoved(egui::pos2(-100.0, -100.0))]);
+
+    let dragged_rect = toolbar_rect.get();
+    assert!(dragged_rect.center().distance(initial_rect.center()) > 1.0);
+    assert!(
+      fullscreen.contains_rect(dragged_rect),
+      "toolbar={dragged_rect:?}, screen={fullscreen:?}"
+    );
+
+    let expanded_screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1400.0, 800.0));
+    run_frame(expanded_screen, Vec::new());
+    let rect_after_resize = toolbar_rect.get();
+    assert!(rect_after_resize.min.distance(dragged_rect.min) <= 0.5);
   }
 
   #[test]
