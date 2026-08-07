@@ -1,189 +1,75 @@
 use std::{
-  slice,
+  ptr::NonNull,
   sync::{
-    Arc, Mutex, MutexGuard,
+    Mutex, MutexGuard, OnceLock,
     atomic::{AtomicBool, Ordering},
-    mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+    mpsc::{Receiver, RecvTimeoutError, sync_channel},
   },
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use block2::RcBlock;
-use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
-use image::RgbaImage;
 use objc2::{
-  AllocAnyThread, DefinedClass, define_class, msg_send,
+  AnyThread,
   rc::{Retained, autoreleasepool},
-  runtime::ProtocolObject,
+  runtime::AnyClass,
 };
-use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
-use objc2_core_graphics::kCGColorSpaceSRGB;
-use objc2_core_media::CMSampleBuffer;
-use objc2_core_video::{
-  CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-  CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
-  CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-  CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::{
+  CGImage, CGWindowImageOption, CGWindowListOption, kCGColorSpaceSRGB, kCGNullWindowID,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
-  SCContentFilter, SCDisplay, SCFrameStatus, SCRunningApplication, SCShareableContent, SCStream,
-  SCStreamConfiguration, SCStreamErrorCode, SCStreamErrorDomain, SCStreamFrameInfoStatus,
-  SCStreamOutput, SCStreamOutputType, SCWindow,
+  SCContentFilter, SCDisplay, SCRunningApplication, SCScreenshotManager, SCShareableContent,
+  SCStreamConfiguration, SCStreamErrorCode, SCStreamErrorDomain, SCWindow,
 };
 
-use super::{CaptureError, validate_pixel_dimensions};
-use crate::performance::{
-  PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
-};
+use super::{CaptureError, NativeCaptureImage};
+use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 
-const CONTENT_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-const STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const SAMPLE_QUEUE_LABEL: &str = "com.linjiajian.rs-board.screen-capture";
-const CLEANUP_QUEUE_LABEL: &str = "com.linjiajian.rs-board.screen-capture.cleanup";
-const MAX_STOP_ATTEMPTS: u8 = 3;
-
-struct ShareableContentSnapshot(Retained<SCShareableContent>);
-
-// SAFETY: SCShareableContent is an immutable snapshot whose retained ownership
-// is transferred exactly once from the framework completion callback to the
-// capture worker. The worker is the only code that reads the snapshot.
-unsafe impl Send for ShareableContentSnapshot {}
-
-#[derive(Debug)]
-struct ScreenCaptureOutputIvars {
-  sender: SyncSender<Result<RgbaImage, CaptureError>>,
-  completed: AtomicBool,
-  performance: PerformanceContext,
-  details: PerformanceDetails,
-}
-
-impl ScreenCaptureOutputIvars {
-  fn claim(&self) -> bool {
-    self.completed.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
-  }
-
-  fn send_claimed(&self, result: Result<RgbaImage, CaptureError>) {
-    let _ = self.sender.try_send(result);
-  }
-}
-
-define_class!(
-  // SAFETY: NSObject has no extra subclassing requirements. The callback
-  // state is thread-safe because ScreenCaptureKit invokes it off the UI thread.
-  #[unsafe(super(NSObject))]
-  #[name = "RSBoardScreenCaptureOutput"]
-  #[ivars = ScreenCaptureOutputIvars]
-  struct ScreenCaptureOutput;
-
-  // SAFETY: The implementation only reads the supplied sample buffer during
-  // the callback and sends an owned RGBA image through a synchronized channel.
-  unsafe impl SCStreamOutput for ScreenCaptureOutput {
-    #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
-    unsafe fn did_output_sample_buffer(
-      &self,
-      _stream: &SCStream,
-      sample_buffer: &CMSampleBuffer,
-      output_type: SCStreamOutputType,
-    ) {
-      if output_type != SCStreamOutputType::Screen || !is_complete_frame(sample_buffer) {
-        return;
-      }
-      if self.ivars().claim() {
-        record(
-          "capture.frame.complete_received",
-          self.ivars().performance,
-          self.ivars().details,
-          PerformanceOutcome::Ok,
-        );
-        let timer = PerformanceTimer::start(
-          "capture.pixel_convert",
-          self.ivars().performance,
-          self.ivars().details,
-        );
-        let result = sample_buffer_to_rgba(sample_buffer);
-        match &result {
-          Ok(_) => timer.finish_ok(),
-          Err(error) => timer.finish_error(error),
-        }
-        self.ivars().send_claimed(result);
-      }
-    }
-  }
-
-  // SAFETY: NSObjectProtocol has no additional implementation requirements.
-  unsafe impl NSObjectProtocol for ScreenCaptureOutput {}
-);
-
-impl ScreenCaptureOutput {
-  fn new(
-    sender: SyncSender<Result<RgbaImage, CaptureError>>,
-    performance: PerformanceContext,
-    details: PerformanceDetails,
-  ) -> Retained<Self> {
-    assert_send_sync::<Self>();
-    let this = Self::alloc().set_ivars(ScreenCaptureOutputIvars {
-      sender,
-      completed: AtomicBool::new(false),
-      performance,
-      details,
-    });
-    unsafe { msg_send![super(this), init] }
-  }
-}
+static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SHAREABLE_CONTENT: OnceLock<Mutex<Option<ShareableContentSnapshot>>> = OnceLock::new();
 
 #[derive(Clone)]
-struct CaptureSession {
-  stream: Retained<SCStream>,
-  output: Retained<ScreenCaptureOutput>,
-  sample_queue: DispatchRetained<DispatchQueue>,
-  cleanup_queue: DispatchRetained<DispatchQueue>,
-}
+struct ShareableContentSnapshot(Retained<SCShareableContent>);
 
-// SAFETY: ScreenCaptureKit stream control is asynchronous and has no caller
-// thread affinity, while the output's ivars are Send + Sync. Control operations
-// run on cleanup_queue, and final release is serialized behind frame callbacks.
-unsafe impl Send for CaptureSession {}
+// SAFETY: SCShareableContent is an immutable framework snapshot. Access to the
+// cached retained reference is serialized and consumers only read it.
+unsafe impl Send for ShareableContentSnapshot {}
+unsafe impl Sync for ShareableContentSnapshot {}
 
-impl CaptureSession {
-  fn remove_output(&self) -> Result<(), CaptureError> {
-    let stream_output: &ProtocolObject<dyn SCStreamOutput> =
-      ProtocolObject::from_ref(&*self.output);
-    unsafe { self.stream.removeStreamOutput_type_error(stream_output, SCStreamOutputType::Screen) }
-      .map_err(|error| capture_error_from_ns_error(&error, "removing stream output"))
+struct CaptureGate;
+
+impl CaptureGate {
+  fn claim() -> Result<Self, CaptureError> {
+    CAPTURE_ACTIVE
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .map(|_| Self)
+      .map_err(|_| CaptureError::CaptureFailed("another capture request is already active".into()))
   }
 }
 
-struct StartState {
-  session: Option<CaptureSession>,
-  completion_seen: bool,
-  cancelled: bool,
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-  match mutex.lock() {
-    Ok(guard) => guard,
-    Err(poisoned) => poisoned.into_inner(),
+impl Drop for CaptureGate {
+  fn drop(&mut self) {
+    CAPTURE_ACTIVE.store(false, Ordering::Release);
   }
 }
 
-fn assert_send_sync<T: Send + Sync>() {}
-
-fn error_completion_block<F>(callback: F) -> RcBlock<dyn Fn(*mut NSError)>
-where
-  F: Fn(*mut NSError) + Send + Sync + 'static,
-{
-  RcBlock::new(callback)
+pub(super) fn prewarm() {
+  if lock_unpoisoned(content_cache()).is_some() {
+    return;
+  }
+  let _ = std::thread::Builder::new().name("capture-prewarm".into()).spawn(|| {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    if let Ok(content) = fetch_shareable_content(deadline) {
+      *lock_unpoisoned(content_cache()) = Some(content);
+    }
+  });
 }
 
-fn content_completion_block<F>(
-  callback: F,
-) -> RcBlock<dyn Fn(*mut SCShareableContent, *mut NSError)>
-where
-  F: Fn(*mut SCShareableContent, *mut NSError) + Send + Sync + 'static,
-{
-  RcBlock::new(callback)
+pub(super) fn invalidate_cached_content() {
+  *lock_unpoisoned(content_cache()) = None;
+  prewarm();
 }
 
 pub(super) fn capture_display(
@@ -191,12 +77,38 @@ pub(super) fn capture_display(
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
   performance: PerformanceContext,
-) -> Result<RgbaImage, CaptureError> {
+  deadline: Instant,
+) -> Result<NativeCaptureImage, CaptureError> {
+  let _gate = CaptureGate::claim()?;
+  ensure_time_remaining(deadline, "starting capture")?;
   let details =
     PerformanceDetails::default().display_id(display_id).pixel_size(expected_pixel_size);
   let timer = PerformanceTimer::start("capture.macos_backend.total", performance, details);
   let result = autoreleasepool(|_| {
-    capture_display_inner(display_id, expected_pixel_size, include_cursor, performance, details)
+    let image = if screenshot_manager_available() {
+      capture_with_screenshot_manager(
+        display_id,
+        expected_pixel_size,
+        include_cursor,
+        performance,
+        details,
+        deadline,
+      )
+    } else {
+      capture_with_core_graphics(display_id, expected_pixel_size, include_cursor, deadline)
+    }?;
+    ensure_time_remaining(deadline, "validating capture result")?;
+    let image = NativeCaptureImage::from_cg_image(image)?;
+    if image.pixel_size() != expected_pixel_size {
+      return Err(CaptureError::CaptureFailed(format!(
+        "capture returned {}x{} pixels; expected {}x{}",
+        image.pixel_size()[0],
+        image.pixel_size()[1],
+        expected_pixel_size[0],
+        expected_pixel_size[1]
+      )));
+    }
+    Ok(image)
   });
   match &result {
     Ok(_) => timer.finish_ok(),
@@ -205,105 +117,171 @@ pub(super) fn capture_display(
   result
 }
 
-fn capture_display_inner(
+fn screenshot_manager_available() -> bool {
+  AnyClass::get(c"SCScreenshotManager").is_some()
+}
+
+fn capture_with_screenshot_manager(
   display_id: u32,
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
   performance: PerformanceContext,
   details: PerformanceDetails,
-) -> Result<RgbaImage, CaptureError> {
+  deadline: Instant,
+) -> Result<CFRetained<CGImage>, CaptureError> {
   let content_timer = PerformanceTimer::start("capture.shareable_content", performance, details);
-  let content_result = shareable_content();
+  let content_result = cached_shareable_content(deadline);
   match &content_result {
     Ok(_) => content_timer.finish_ok(),
     Err(error) => content_timer.finish_error(error),
   }
   let content = content_result?;
 
-  let setup_timer = PerformanceTimer::start("capture.stream.setup", performance, details);
+  let setup_timer = PerformanceTimer::start("capture.screenshot.setup", performance, details);
   let setup_result = (|| {
-    let display = find_display(&content, display_id)?;
-    let filter = content_filter(&content, &display)?;
-    let configuration = stream_configuration(expected_pixel_size, include_cursor);
-
-    let (frame_sender, frame_receiver) = sync_channel(1);
-    let output = ScreenCaptureOutput::new(frame_sender, performance, details);
-    let sample_queue = DispatchQueue::new(SAMPLE_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
-    let cleanup_queue = DispatchQueue::new(CLEANUP_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
-    let stream = unsafe {
-      SCStream::initWithFilter_configuration_delegate(
-        SCStream::alloc(),
-        &filter,
-        &configuration,
-        None,
-      )
-    };
-    let stream_output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
-    unsafe {
-      stream.addStreamOutput_type_sampleHandlerQueue_error(
-        stream_output,
-        SCStreamOutputType::Screen,
-        Some(&sample_queue),
-      )
-    }
-    .map_err(|error| capture_error_from_ns_error(&error, "adding stream output"))?;
-    Ok::<_, CaptureError>((
-      CaptureSession { stream, output, sample_queue, cleanup_queue },
-      frame_receiver,
-    ))
+    let display = find_display(&content.0, display_id)?;
+    let filter = content_filter(&content.0, &display)?;
+    let configuration = screenshot_configuration(expected_pixel_size, include_cursor);
+    Ok::<_, CaptureError>((filter, configuration))
   })();
   match &setup_result {
     Ok(_) => setup_timer.finish_ok(),
     Err(error) => setup_timer.finish_error(error),
   }
-  let (session, frame_receiver) = setup_result?;
+  let (filter, configuration) = setup_result?;
 
-  let start_timer = PerformanceTimer::start("capture.stream.start", performance, details);
-  let start_result = start_stream(session);
-  match &start_result {
-    Ok(_) => start_timer.finish_ok(),
-    Err(error) => start_timer.finish_error(error),
+  let (sender, receiver) = sync_channel(1);
+  let completion = RcBlock::new(move |image: *mut CGImage, error: *mut NSError| {
+    let result = NonNull::new(image)
+      .map(|image| unsafe { CFRetained::retain(image) })
+      .ok_or_else(|| capture_error_from_optional_ns_error(error, "capturing image"));
+    let _ = sender.try_send(result);
+  });
+  let capture_timer = PerformanceTimer::start("capture.screenshot.wait", performance, details);
+  unsafe {
+    SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+      &filter,
+      &configuration,
+      Some(&completion),
+    );
   }
-  let session = start_result?;
-  let frame_timer = PerformanceTimer::start("capture.frame.wait", performance, details);
-  let frame_result = receive_result(frame_receiver, FRAME_TIMEOUT, "waiting for a complete frame");
-  match &frame_result {
-    Ok(_) => frame_timer.finish_ok(),
-    Err(error) => frame_timer.finish_error(error),
+  let result = receive_until(receiver, deadline, "capturing image");
+  match &result {
+    Ok(_) => capture_timer.finish_ok(),
+    Err(error) => capture_timer.finish_error(error),
   }
-  let stop_timer = PerformanceTimer::start("capture.stream.stop", performance, details);
-  let stop_result = stop_stream(session);
-  match &stop_result {
-    Ok(_) => stop_timer.finish_ok(),
-    Err(error) => stop_timer.finish_error(error),
-  }
-  let image = match (frame_result, stop_result) {
-    (Err(error), _) => return Err(error),
-    (Ok(_), Err(error)) => return Err(error),
-    (Ok(image), Ok(())) => image,
-  };
+  result
+}
 
-  let actual_pixel_size = [image.width(), image.height()];
-  if actual_pixel_size != expected_pixel_size {
-    return Err(CaptureError::CaptureFailed(format!(
-      "ScreenCaptureKit returned {}x{} pixels; expected {}x{}",
-      actual_pixel_size[0], actual_pixel_size[1], expected_pixel_size[0], expected_pixel_size[1]
-    )));
-  }
+#[allow(deprecated)]
+fn capture_with_core_graphics(
+  display_id: u32,
+  expected_pixel_size: [u32; 2],
+  include_cursor: bool,
+  deadline: Instant,
+) -> Result<CFRetained<CGImage>, CaptureError> {
+  use objc2_core_graphics::{CGDisplayBounds, CGWindowListCreateImage};
+
+  ensure_time_remaining(deadline, "starting CoreGraphics capture")?;
+  let bounds = CGDisplayBounds(display_id);
+  #[allow(deprecated)]
+  let image = CGWindowListCreateImage(
+    bounds,
+    CGWindowListOption::OptionOnScreenOnly,
+    kCGNullWindowID,
+    CGWindowImageOption::BestResolution | CGWindowImageOption::ShouldBeOpaque,
+  )
+  .ok_or_else(|| CaptureError::CaptureFailed("CoreGraphics returned no image".into()))?;
+  let image =
+    if include_cursor { composite_cursor(image, bounds, expected_pixel_size)? } else { image };
+  ensure_time_remaining(deadline, "finishing CoreGraphics capture")?;
   Ok(image)
 }
 
-fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
+#[allow(deprecated)]
+fn composite_cursor(
+  base_image: CFRetained<CGImage>,
+  display_bounds: objc2_core_foundation::CGRect,
+  [width_px, height_px]: [u32; 2],
+) -> Result<CFRetained<CGImage>, CaptureError> {
+  use std::ptr;
+
+  use objc2_app_kit::NSCursor;
+  use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+  use objc2_core_graphics::{
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGContext, CGEvent,
+    CGImageAlphaInfo, CGImageByteOrderInfo,
+  };
+
+  let cursor = NSCursor::currentSystemCursor()
+    .ok_or_else(|| CaptureError::CaptureFailed("current system cursor is unavailable".into()))?;
+  let cursor_image =
+    unsafe { cursor.image().CGImageForProposedRect_context_hints(ptr::null_mut(), None, None) }
+      .ok_or_else(|| {
+        CaptureError::CaptureFailed("current cursor has no CoreGraphics image".into())
+      })?;
+  let pointer = CGEvent::new(None)
+    .map(|event| CGEvent::location(Some(&event)))
+    .ok_or_else(|| CaptureError::CaptureFailed("current cursor position is unavailable".into()))?;
+
+  let color_space = CGColorSpace::new_device_rgb().ok_or_else(|| {
+    CaptureError::CaptureFailed("creating cursor composite color space failed".into())
+  })?;
+  let bytes_per_row = (width_px as usize)
+    .checked_mul(4)
+    .ok_or_else(|| CaptureError::CaptureFailed("cursor composite row is too large".into()))?;
+  let bitmap_info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
+  let bitmap = unsafe {
+    CGBitmapContextCreate(
+      ptr::null_mut(),
+      width_px as usize,
+      height_px as usize,
+      8,
+      bytes_per_row,
+      Some(&color_space),
+      bitmap_info,
+    )
+  }
+  .ok_or_else(|| CaptureError::CaptureFailed("creating cursor composite context failed".into()))?;
+
+  let image_bounds = CGRect::new(CGPoint::ZERO, CGSize::new(width_px as f64, height_px as f64));
+  CGContext::draw_image(Some(&bitmap), image_bounds, Some(&base_image));
+
+  let scale_x = width_px as f64 / display_bounds.size.width;
+  let scale_y = height_px as f64 / display_bounds.size.height;
+  let hotspot = cursor.hotSpot();
+  let cursor_width = CGImage::width(Some(&cursor_image)) as f64;
+  let cursor_height = CGImage::height(Some(&cursor_image)) as f64;
+  let cursor_x = (pointer.x - display_bounds.origin.x - hotspot.x) * scale_x;
+  let cursor_top = (pointer.y - display_bounds.origin.y - hotspot.y) * scale_y;
+  let cursor_y = height_px as f64 - cursor_top - cursor_height;
+  let cursor_bounds =
+    CGRect::new(CGPoint::new(cursor_x, cursor_y), CGSize::new(cursor_width, cursor_height));
+  CGContext::draw_image(Some(&bitmap), cursor_bounds, Some(&cursor_image));
+
+  CGBitmapContextCreateImage(Some(&bitmap))
+    .ok_or_else(|| CaptureError::CaptureFailed("finalizing cursor composite failed".into()))
+}
+
+fn cached_shareable_content(deadline: Instant) -> Result<ShareableContentSnapshot, CaptureError> {
+  if let Some(content) = lock_unpoisoned(content_cache()).clone() {
+    return Ok(content);
+  }
+  let content = fetch_shareable_content(deadline)?;
+  *lock_unpoisoned(content_cache()) = Some(content.clone());
+  Ok(content)
+}
+
+fn fetch_shareable_content(deadline: Instant) -> Result<ShareableContentSnapshot, CaptureError> {
   let (sender, receiver) = sync_channel(1);
-  let completion = content_completion_block(move |content, error| {
+  let completion = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
     let result = unsafe { Retained::retain(content) }
       .map(ShareableContentSnapshot)
       .ok_or_else(|| capture_error_from_optional_ns_error(error, "enumerating shareable content"));
     let _ = sender.try_send(result);
   });
   unsafe { SCShareableContent::getShareableContentWithCompletionHandler(&completion) };
-  receive_result(receiver, CONTENT_TIMEOUT, "enumerating shareable content")
-    .map(|snapshot| snapshot.0)
+  receive_until(receiver, deadline, "enumerating shareable content")
 }
 
 fn find_display(
@@ -340,7 +318,7 @@ fn content_filter(
   })
 }
 
-fn stream_configuration(
+fn screenshot_configuration(
   [width_px, height_px]: [u32; 2],
   include_cursor: bool,
 ) -> Retained<SCStreamConfiguration> {
@@ -348,134 +326,48 @@ fn stream_configuration(
   unsafe {
     configuration.setWidth(width_px as usize);
     configuration.setHeight(height_px as usize);
-    configuration.setPixelFormat(kCVPixelFormatType_32BGRA);
     configuration.setColorSpaceName(kCGColorSpaceSRGB);
     configuration.setShowsCursor(include_cursor);
-    configuration.setQueueDepth(1);
   }
   configuration
 }
 
-fn start_stream(session: CaptureSession) -> Result<CaptureSession, CaptureError> {
-  let (sender, receiver) = sync_channel(1);
-  let stream = session.stream.clone();
-  let state = Arc::new(Mutex::new(StartState {
-    session: Some(session),
-    completion_seen: false,
-    cancelled: false,
-  }));
-  let callback_state = Arc::clone(&state);
-  let completion = error_completion_block(move |error| {
-    let result = completion_result(error, "starting stream");
-    let failed = result.is_err();
-    let session_to_stop = {
-      let mut state = lock_unpoisoned(&callback_state);
-      state.completion_seen = true;
-      if state.cancelled || failed { state.session.take() } else { None }
-    };
-    if let Some(session) = session_to_stop {
-      let _ = request_stop(session);
-    }
-    let _ = sender.try_send(result);
-  });
-  unsafe { stream.startCaptureWithCompletionHandler(Some(&completion)) };
+fn content_cache() -> &'static Mutex<Option<ShareableContentSnapshot>> {
+  SHAREABLE_CONTENT.get_or_init(|| Mutex::new(None))
+}
 
-  match receiver.recv_timeout(CONTENT_TIMEOUT) {
-    Ok(Ok(())) => lock_unpoisoned(&state).session.take().ok_or_else(|| {
-      CaptureError::CaptureFailed(
-        "ScreenCaptureKit start completed without an owned capture session".to_owned(),
-      )
-    }),
-    Ok(Err(error)) => Err(error),
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+  match mutex.lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => poisoned.into_inner(),
+  }
+}
+
+fn ensure_time_remaining(
+  deadline: Instant,
+  operation: &'static str,
+) -> Result<Duration, CaptureError> {
+  deadline
+    .checked_duration_since(Instant::now())
+    .filter(|remaining| !remaining.is_zero())
+    .ok_or_else(|| {
+      CaptureError::CaptureFailed(format!("screen capture timed out while {operation}"))
+    })
+}
+
+fn receive_until<T>(
+  receiver: Receiver<Result<T, CaptureError>>,
+  deadline: Instant,
+  operation: &'static str,
+) -> Result<T, CaptureError> {
+  match receiver.recv_timeout(ensure_time_remaining(deadline, operation)?) {
+    Ok(result) => result,
     Err(RecvTimeoutError::Timeout) => {
-      let session_to_stop = {
-        let mut state = lock_unpoisoned(&state);
-        state.cancelled = true;
-        if state.completion_seen { state.session.take() } else { state.session.clone() }
-      };
-      if let Some(session) = session_to_stop {
-        let _ = request_stop(session);
-      }
-      Err(CaptureError::CaptureFailed(
-        "ScreenCaptureKit timed out while starting stream".to_owned(),
-      ))
+      Err(CaptureError::CaptureFailed(format!("screen capture timed out while {operation}")))
     }
-    Err(RecvTimeoutError::Disconnected) => {
-      if let Some(session) = lock_unpoisoned(&state).session.take() {
-        let _ = request_stop(session);
-      }
-      Err(CaptureError::CaptureFailed(
-        "ScreenCaptureKit callback disconnected while starting stream".to_owned(),
-      ))
-    }
-  }
-}
-
-fn stop_stream(session: CaptureSession) -> Result<(), CaptureError> {
-  receive_result(request_stop(session), STOP_TIMEOUT, "stopping stream")
-}
-
-fn request_stop(session: CaptureSession) -> Receiver<Result<(), CaptureError>> {
-  let (sender, receiver) = sync_channel(1);
-  let cleanup_queue = session.cleanup_queue.clone();
-  cleanup_queue.exec_async(move || issue_stop(session, sender, 0));
-  receiver
-}
-
-fn issue_stop(session: CaptureSession, sender: SyncSender<Result<(), CaptureError>>, attempt: u8) {
-  let stream = session.stream.clone();
-  let pending_session = Arc::new(Mutex::new(Some(session)));
-  let callback_session = Arc::clone(&pending_session);
-  let completion = error_completion_block(move |error| {
-    let stop_result = completion_result(error, "stopping stream");
-    let session = lock_unpoisoned(&callback_session).take();
-    let Some(session) = session else {
-      return;
-    };
-
-    let cleanup_queue = session.cleanup_queue.clone();
-    let cleanup_sender = sender.clone();
-    cleanup_queue.exec_async(move || {
-      finish_stop_attempt(session, stop_result, cleanup_sender, attempt);
-    });
-  });
-  unsafe { stream.stopCaptureWithCompletionHandler(Some(&completion)) };
-}
-
-fn finish_stop_attempt(
-  session: CaptureSession,
-  stop_result: Result<(), CaptureError>,
-  sender: SyncSender<Result<(), CaptureError>>,
-  attempt: u8,
-) {
-  let remove_result = session.remove_output();
-  let can_release = stop_result.is_ok() || remove_result.is_ok();
-  let result = match (stop_result, remove_result) {
-    (Err(error), _) | (Ok(()), Err(error)) => Err(error),
-    (Ok(()), Ok(())) => Ok(()),
-  };
-
-  if can_release {
-    let sample_queue = session.sample_queue.clone();
-    sample_queue.exec_async(move || {
-      let _ = sender.try_send(result);
-      drop(session);
-    });
-  } else if attempt + 1 < MAX_STOP_ATTEMPTS {
-    let cleanup_queue = session.cleanup_queue.clone();
-    cleanup_queue.exec_async(move || issue_stop(session, sender, attempt + 1));
-  } else {
-    let _ = sender.try_send(result);
-    // Both stop and output removal failed repeatedly. Keeping the registered
-    // receiver alive is safer than releasing an object the framework may call.
-    std::mem::forget(session);
-  }
-}
-
-fn completion_result(error: *mut NSError, operation: &'static str) -> Result<(), CaptureError> {
-  match unsafe { error.as_ref() } {
-    Some(error) => Err(capture_error_from_ns_error(error, operation)),
-    None => Ok(()),
+    Err(RecvTimeoutError::Disconnected) => Err(CaptureError::CaptureFailed(format!(
+      "ScreenCaptureKit callback disconnected while {operation}"
+    ))),
   }
 }
 
@@ -508,174 +400,24 @@ fn capture_error_from_ns_error(error: &NSError, operation: &'static str) -> Capt
   ))
 }
 
-fn receive_result<T>(
-  receiver: Receiver<Result<T, CaptureError>>,
-  timeout: Duration,
-  operation: &'static str,
-) -> Result<T, CaptureError> {
-  match receiver.recv_timeout(timeout) {
-    Ok(result) => result,
-    Err(RecvTimeoutError::Timeout) => {
-      Err(CaptureError::CaptureFailed(format!("ScreenCaptureKit timed out while {operation}")))
-    }
-    Err(RecvTimeoutError::Disconnected) => Err(CaptureError::CaptureFailed(format!(
-      "ScreenCaptureKit callback disconnected while {operation}"
-    ))),
-  }
-}
-
-fn is_complete_frame(sample_buffer: &CMSampleBuffer) -> bool {
-  if !unsafe { sample_buffer.is_valid() } {
-    return false;
-  }
-  let Some(attachments) = (unsafe { sample_buffer.sample_attachments_array(false) }) else {
-    return false;
-  };
-  let attachments: CFRetained<CFArray<CFDictionary<CFString, CFType>>> =
-    unsafe { CFRetained::cast_unchecked(attachments) };
-  let Some(frame_info) = attachments.get(0) else {
-    return false;
-  };
-  let status_key = unsafe { SCStreamFrameInfoStatus };
-  frame_info
-    .get(status_key.as_ref())
-    .and_then(|status| status.downcast::<CFNumber>().ok())
-    .and_then(|status| status.as_i32())
-    == Some(SCFrameStatus::Complete.0 as i32)
-}
-
-fn sample_buffer_to_rgba(sample_buffer: &CMSampleBuffer) -> Result<RgbaImage, CaptureError> {
-  let pixel_buffer = unsafe { sample_buffer.image_buffer() }.ok_or_else(|| {
-    CaptureError::CaptureFailed("complete frame did not contain a pixel buffer".to_owned())
-  })?;
-  ensure_bgra_pixel_format(CVPixelBufferGetPixelFormatType(&pixel_buffer))?;
-
-  let lock_flags = CVPixelBufferLockFlags::ReadOnly;
-  let lock_result = unsafe { CVPixelBufferLockBaseAddress(&pixel_buffer, lock_flags) };
-  if lock_result != kCVReturnSuccess {
-    return Err(CaptureError::CaptureFailed(format!(
-      "locking ScreenCaptureKit pixel buffer failed with CoreVideo status {lock_result}"
-    )));
-  }
-
-  let result = copy_locked_pixel_buffer(&pixel_buffer);
-  let unlock_result = unsafe { CVPixelBufferUnlockBaseAddress(&pixel_buffer, lock_flags) };
-  match (result, unlock_result) {
-    (Err(error), _) => Err(error),
-    (Ok(_), status) if status != kCVReturnSuccess => Err(CaptureError::CaptureFailed(format!(
-      "unlocking ScreenCaptureKit pixel buffer failed with CoreVideo status {status}"
-    ))),
-    (Ok(image), _) => Ok(image),
-  }
-}
-
-fn ensure_bgra_pixel_format(pixel_format: u32) -> Result<(), CaptureError> {
-  if pixel_format == kCVPixelFormatType_32BGRA {
-    Ok(())
-  } else {
-    Err(CaptureError::CaptureFailed(format!(
-      "ScreenCaptureKit returned unsupported pixel format 0x{pixel_format:08X}"
-    )))
-  }
-}
-
-fn copy_locked_pixel_buffer(pixel_buffer: &CVPixelBuffer) -> Result<RgbaImage, CaptureError> {
-  let width = CVPixelBufferGetWidth(pixel_buffer);
-  let height = CVPixelBufferGetHeight(pixel_buffer);
-  let width_u32 = u32::try_from(width)
-    .map_err(|_| CaptureError::CaptureFailed("captured image width is too large".to_owned()))?;
-  let height_u32 = u32::try_from(height)
-    .map_err(|_| CaptureError::CaptureFailed("captured image height is too large".to_owned()))?;
-  validate_pixel_dimensions([width_u32, height_u32])?;
-
-  let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
-  let required_len = bytes_per_row
-    .checked_mul(height)
-    .ok_or_else(|| CaptureError::CaptureFailed("captured image data is too large".to_owned()))?;
-  let data_size = CVPixelBufferGetDataSize(pixel_buffer);
-  if data_size < required_len {
-    return Err(CaptureError::CaptureFailed(format!(
-      "pixel buffer contains {data_size} bytes; its row stride requires {required_len}"
-    )));
-  }
-  let base_address = CVPixelBufferGetBaseAddress(pixel_buffer);
-  if base_address.is_null() {
-    return Err(CaptureError::CaptureFailed(
-      "ScreenCaptureKit pixel buffer has no base address".to_owned(),
-    ));
-  }
-  let bytes = unsafe { slice::from_raw_parts(base_address.cast::<u8>(), required_len) };
-  bgra_rows_to_rgba(width_u32, height_u32, bytes_per_row, bytes)
-}
-
-fn bgra_rows_to_rgba(
-  width: u32,
-  height: u32,
-  bytes_per_row: usize,
-  bytes: &[u8],
-) -> Result<RgbaImage, CaptureError> {
-  let width = width as usize;
-  let height = height as usize;
-  let packed_row_len = width
-    .checked_mul(4)
-    .ok_or_else(|| CaptureError::CaptureFailed("captured image row is too wide".to_owned()))?;
-  if bytes_per_row < packed_row_len {
-    return Err(CaptureError::CaptureFailed(format!(
-      "pixel buffer row stride {bytes_per_row} is smaller than packed row size {packed_row_len}"
-    )));
-  }
-  let required_len = bytes_per_row
-    .checked_mul(height)
-    .ok_or_else(|| CaptureError::CaptureFailed("captured image data is too large".to_owned()))?;
-  if bytes.len() < required_len {
-    return Err(CaptureError::CaptureFailed(format!(
-      "pixel buffer contains {} bytes; expected at least {required_len}",
-      bytes.len()
-    )));
-  }
-  let output_len = packed_row_len
-    .checked_mul(height)
-    .ok_or_else(|| CaptureError::CaptureFailed("captured image buffer is too large".to_owned()))?;
-  let mut rgba = Vec::with_capacity(output_len);
-  for row in bytes.chunks_exact(bytes_per_row).take(height) {
-    for pixel in row[..packed_row_len].chunks_exact(4) {
-      rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-    }
-  }
-  RgbaImage::from_raw(width as u32, height as u32, rgba).ok_or_else(|| {
-    CaptureError::CaptureFailed("unable to construct RGBA image from pixel buffer".to_owned())
-  })
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use objc2_foundation::ns_string;
 
   #[test]
-  fn converts_bgra_rows_to_rgba_without_copying_padding() {
-    let bytes =
-      [3, 2, 1, 4, 7, 6, 5, 8, 99, 99, 99, 99, 13, 12, 11, 14, 17, 16, 15, 18, 88, 88, 88, 88];
-    let image = bgra_rows_to_rgba(2, 2, 12, &bytes).unwrap();
-    assert_eq!(image.into_raw(), vec![1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18]);
+  fn expired_deadline_is_rejected_before_capture() {
+    let error =
+      ensure_time_remaining(Instant::now() - Duration::from_millis(1), "testing").unwrap_err();
+    assert!(error.to_string().contains("timed out"));
   }
 
   #[test]
-  fn rejects_bgra_row_stride_smaller_than_pixel_width() {
-    let error = bgra_rows_to_rgba(2, 1, 7, &[0; 8]).unwrap_err();
-    assert!(error.to_string().contains("row stride"));
-  }
-
-  #[test]
-  fn rejects_short_bgra_buffer() {
-    let error = bgra_rows_to_rgba(1, 2, 4, &[0; 7]).unwrap_err();
-    assert!(error.to_string().contains("expected at least 8"));
-  }
-
-  #[test]
-  fn rejects_non_bgra_pixel_format() {
-    assert!(ensure_bgra_pixel_format(kCVPixelFormatType_32BGRA).is_ok());
-    assert!(ensure_bgra_pixel_format(0).is_err());
+  fn capture_gate_rejects_a_second_request() {
+    let first = CaptureGate::claim().unwrap();
+    assert!(CaptureGate::claim().is_err());
+    drop(first);
+    assert!(CaptureGate::claim().is_ok());
   }
 
   #[test]

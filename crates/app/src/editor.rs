@@ -296,7 +296,7 @@ impl EditorController {
     root_ui: &mut egui::Ui,
     document: &BoardDocument,
     history: &CommandHistory,
-    background: &TextureHandle,
+    background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     let ctx = root_ui.ctx().clone();
     if self.selected_element_id.is_some_and(|id| document.element(id).is_none()) {
@@ -306,7 +306,8 @@ impl EditorController {
     let mut actions = Vec::new();
 
     let mut transform = None;
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(
+    let background_fill = if background.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
       root_ui,
       |ui| {
         let Some(canvas_transform) = CanvasTransform::fit(document.canvas_size_px, ui.max_rect())
@@ -332,12 +333,14 @@ impl EditorController {
         }
 
         let painter = ui.painter().with_clip_rect(canvas_transform.canvas_rect());
-        painter.image(
-          background.id(),
-          canvas_transform.canvas_rect(),
-          Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
-          Color32::WHITE,
-        );
+        if let Some(background) = background {
+          painter.image(
+            background.id(),
+            canvas_transform.canvas_rect(),
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+          );
+        }
         paint_document(&painter, &canvas_transform, document);
         self.paint_interaction(&painter, canvas_transform, document);
         self.paint_selection(&painter, canvas_transform, document);
@@ -359,9 +362,10 @@ impl EditorController {
     &mut self,
     root_ui: &mut egui::Ui,
     document: &BoardDocument,
-    background: &TextureHandle,
+    background: Option<&TextureHandle>,
   ) {
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(
+    let background_fill = if background.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
       root_ui,
       |ui| {
         let Some(canvas_transform) = CanvasTransform::fit(document.canvas_size_px, ui.max_rect())
@@ -369,12 +373,14 @@ impl EditorController {
           return;
         };
         let painter = ui.painter().with_clip_rect(canvas_transform.canvas_rect());
-        painter.image(
-          background.id(),
-          canvas_transform.canvas_rect(),
-          Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
-          Color32::WHITE,
-        );
+        if let Some(background) = background {
+          painter.image(
+            background.id(),
+            canvas_transform.canvas_rect(),
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+          );
+        }
         paint_document(&painter, &canvas_transform, document);
         self.paint_selection(&painter, canvas_transform, document);
       },
@@ -386,7 +392,7 @@ impl EditorController {
     ui: &mut egui::Ui,
     document: &BoardDocument,
     history: &CommandHistory,
-    background: &TextureHandle,
+    background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     self.show(ui, document, history, background)
   }

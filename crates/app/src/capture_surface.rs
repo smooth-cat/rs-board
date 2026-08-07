@@ -8,6 +8,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use xcap::Monitor;
 
+use crate::capture::NativeCaptureImage;
+
 const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -146,6 +148,22 @@ impl DisplayCaptureSurface {
     }
   }
 
+  fn set_frozen_image(&mut self, image: &NativeCaptureImage) -> Result<(), CaptureSurfaceError> {
+    #[cfg(target_os = "macos")]
+    {
+      let panel = self.frozen_panel.as_ref().ok_or_else(|| {
+        CaptureSurfaceError::Native(format!(
+          "native capture panel for display {} is unavailable",
+          self.display.display_id
+        ))
+      })?;
+      panel.set_image(image);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = image;
+    Ok(())
+  }
+
   fn begin_editing(&mut self, session_id: Uuid) {
     self.lifecycle = SurfaceLifecycle::Editing { session_id };
   }
@@ -165,6 +183,7 @@ impl DisplayCaptureSurface {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayRefreshOutcome {
   Unchanged,
+  DisplaysChanged,
   ActiveDisplayRemoved(u32),
 }
 
@@ -200,6 +219,10 @@ impl CaptureSurfaceCoordinator {
   }
 
   pub fn refresh(&mut self, displays: Vec<DisplaySnapshot>) -> DisplayRefreshOutcome {
+    let changed = displays.len() != self.surfaces.len()
+      || displays.iter().any(|display| {
+        self.surfaces.get(&display.display_id).is_none_or(|surface| surface.display != *display)
+      });
     let available_ids: HashSet<_> = displays.iter().map(|display| display.display_id).collect();
     let removed_active =
       self.active_display_id.filter(|display_id| !available_ids.contains(display_id));
@@ -217,8 +240,13 @@ impl CaptureSurfaceCoordinator {
         || surface.lifecycle != SurfaceLifecycle::Hidden
     });
 
-    removed_active
-      .map_or(DisplayRefreshOutcome::Unchanged, DisplayRefreshOutcome::ActiveDisplayRemoved)
+    if let Some(display_id) = removed_active {
+      DisplayRefreshOutcome::ActiveDisplayRemoved(display_id)
+    } else if changed {
+      DisplayRefreshOutcome::DisplaysChanged
+    } else {
+      DisplayRefreshOutcome::Unchanged
+    }
   }
 
   pub fn remember_frontmost_application(&mut self) {
@@ -238,6 +266,23 @@ impl CaptureSurfaceCoordinator {
     surface.present(request_id);
     self.active_display_id = Some(display_id);
     Ok(())
+  }
+
+  pub fn set_frozen_image(
+    &mut self,
+    display_id: u32,
+    image: &NativeCaptureImage,
+  ) -> Result<(), CaptureSurfaceError> {
+    let surface = self
+      .surfaces
+      .get_mut(&display_id)
+      .ok_or(CaptureSurfaceError::DisplayUnavailable(display_id))?;
+    surface.set_frozen_image(image)
+  }
+
+  pub fn exclude_application_windows(&self) {
+    #[cfg(target_os = "macos")]
+    macos::exclude_application_windows();
   }
 
   pub fn begin_editing(
@@ -387,19 +432,20 @@ impl FocusRestore {
 
 #[cfg(target_os = "macos")]
 mod macos {
-  use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
+  use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
   use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
+    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
     NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
   };
   use objc2_foundation::{NSNumber, NSString};
-  use objc2_quartz_core::CALayer;
+  use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
 
   use super::{CaptureSurfaceError, DisplaySnapshot};
+  use crate::capture::NativeCaptureImage;
 
   pub(super) struct FrozenImagePanel {
     panel: Retained<NSPanel>,
-    _layer: Retained<CALayer>,
+    layer: Retained<CALayer>,
   }
 
   impl FrozenImagePanel {
@@ -441,10 +487,11 @@ mod macos {
         .ok_or_else(|| CaptureSurfaceError::Native("capture panel has no content view".into()))?;
       let layer = CALayer::layer();
       layer.setContentsScale(display.scale_factor as f64);
+      layer.setContentsGravity(unsafe { kCAGravityResize });
       view.setWantsLayer(true);
       view.setLayer(Some(&layer));
       panel.orderOut(None);
-      Ok(Self { panel, _layer: layer })
+      Ok(Self { panel, layer })
     }
 
     pub(super) fn update_display(&mut self, display: DisplaySnapshot) {
@@ -453,8 +500,17 @@ mod macos {
       };
       if let Some(screen) = screen_for_display(mtm, display.display_id) {
         self.panel.setFrame_display(screen.frame(), false);
-        self._layer.setContentsScale(display.scale_factor as f64);
+        self.layer.setContentsScale(display.scale_factor as f64);
       }
+    }
+
+    pub(super) fn set_image(&self, image: &NativeCaptureImage) {
+      let contents = unsafe { &*(image.cg_image() as *const _ as *const AnyObject) };
+      CATransaction::begin();
+      CATransaction::setDisableActions(true);
+      unsafe { self.layer.setContents(Some(contents)) };
+      CATransaction::commit();
+      CATransaction::flush();
     }
 
     pub(super) fn present(&self) {
@@ -463,6 +519,19 @@ mod macos {
 
     pub(super) fn hide(&self) {
       self.panel.orderOut(None);
+      CATransaction::begin();
+      CATransaction::setDisableActions(true);
+      unsafe { self.layer.setContents(None) };
+      CATransaction::commit();
+    }
+  }
+
+  pub(super) fn exclude_application_windows() {
+    let Some(mtm) = MainThreadMarker::new() else {
+      return;
+    };
+    for window in NSApplication::sharedApplication(mtm).windows() {
+      window.setSharingType(NSWindowSharingType::None);
     }
   }
 

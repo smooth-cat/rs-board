@@ -1,6 +1,11 @@
-use std::fmt;
+use std::{
+  fmt,
+  sync::Arc,
+  time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
+#[cfg(not(target_os = "macos"))]
 use image::RgbaImage;
 use thiserror::Error;
 use uuid::Uuid;
@@ -14,17 +19,131 @@ use crate::platform::global_cursor_position;
 mod macos;
 
 pub const MAX_CAPTURE_DIMENSION_PX: u32 = 8_192;
+pub const CAPTURE_DEADLINE: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+pub struct NativeCaptureImage {
+  #[cfg(target_os = "macos")]
+  image: objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>,
+  #[cfg(not(target_os = "macos"))]
+  image: Arc<RgbaImage>,
+}
+
+impl NativeCaptureImage {
+  #[cfg(target_os = "macos")]
+  pub(crate) fn from_cg_image(
+    image: objc2_core_foundation::CFRetained<objc2_core_graphics::CGImage>,
+  ) -> Result<Self, CaptureError> {
+    let pixel_size = [
+      u32::try_from(objc2_core_graphics::CGImage::width(Some(&image)))
+        .map_err(|_| CaptureError::CaptureFailed("captured image width is too large".into()))?,
+      u32::try_from(objc2_core_graphics::CGImage::height(Some(&image)))
+        .map_err(|_| CaptureError::CaptureFailed("captured image height is too large".into()))?,
+    ];
+    validate_pixel_dimensions(pixel_size)?;
+    Ok(Self { image })
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  fn from_rgba(image: RgbaImage) -> Result<Self, CaptureError> {
+    validate_pixel_dimensions([image.width(), image.height()])?;
+    Ok(Self { image: Arc::new(image) })
+  }
+
+  pub fn pixel_size(&self) -> [u32; 2] {
+    #[cfg(target_os = "macos")]
+    {
+      [
+        u32::try_from(objc2_core_graphics::CGImage::width(Some(&self.image))).unwrap_or(u32::MAX),
+        u32::try_from(objc2_core_graphics::CGImage::height(Some(&self.image))).unwrap_or(u32::MAX),
+      ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      [self.image.width(), self.image.height()]
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  pub(crate) fn cg_image(&self) -> &objc2_core_graphics::CGImage {
+    &self.image
+  }
+
+  pub fn to_rgba8(&self) -> Result<Arc<[u8]>, CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+      use objc2_core_graphics::{
+        CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo,
+      };
+
+      let [width_px, height_px] = self.pixel_size();
+      let bytes_per_row = (width_px as usize)
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::CaptureFailed("captured image row is too large".into()))?;
+      let byte_len = bytes_per_row
+        .checked_mul(height_px as usize)
+        .ok_or_else(|| CaptureError::CaptureFailed("captured image buffer is too large".into()))?;
+      let mut pixels = vec![0_u8; byte_len];
+      let color_space = CGColorSpace::new_device_rgb()
+        .ok_or_else(|| CaptureError::CaptureFailed("creating RGB color space failed".into()))?;
+      let bitmap_info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
+      let bitmap = unsafe {
+        CGBitmapContextCreate(
+          pixels.as_mut_ptr().cast(),
+          width_px as usize,
+          height_px as usize,
+          8,
+          bytes_per_row,
+          Some(&color_space),
+          bitmap_info,
+        )
+      }
+      .ok_or_else(|| CaptureError::CaptureFailed("creating RGBA bitmap context failed".into()))?;
+      CGContext::translate_ctm(Some(&bitmap), 0.0, height_px as f64);
+      CGContext::scale_ctm(Some(&bitmap), 1.0, -1.0);
+      CGContext::draw_image(
+        Some(&bitmap),
+        objc2_core_foundation::CGRect::new(
+          objc2_core_foundation::CGPoint::ZERO,
+          objc2_core_foundation::CGSize::new(width_px as f64, height_px as f64),
+        ),
+        Some(&self.image),
+      );
+      drop(bitmap);
+      for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        if alpha != 0 && alpha != u8::MAX {
+          for component in &mut pixel[..3] {
+            *component = ((*component as u32 * u8::MAX as u32 + alpha as u32 / 2) / alpha as u32)
+              .min(u8::MAX as u32) as u8;
+          }
+        }
+      }
+      Ok(Arc::from(pixels))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      Ok(Arc::from(self.image.as_raw().clone()))
+    }
+  }
+}
+
+impl fmt::Debug for NativeCaptureImage {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.debug_struct("NativeCaptureImage").field("pixel_size", &self.pixel_size()).finish()
+  }
+}
 
 /// An unencoded screen capture ready to be handed to the editor.
 ///
 /// `display_bounds_global` is `[x, y, width, height]` in global logical
-/// display coordinates. `pixel_size` describes the physical RGBA buffer.
-#[derive(Clone, PartialEq)]
+/// display coordinates. `pixel_size` describes the retained native image.
+#[derive(Clone)]
 pub struct CaptureFrame {
   pub request_id: Uuid,
   pub capture_sequence: u64,
   pub display_id: u32,
-  pub rgba_pixels: Vec<u8>,
+  pub image: NativeCaptureImage,
   pub pixel_size: [u32; 2],
   pub display_bounds_global: [i32; 4],
   pub scale_factor: f32,
@@ -36,16 +155,15 @@ impl CaptureFrame {
     request_id: Uuid,
     capture_sequence: u64,
     display: DisplaySnapshot,
-    rgba_pixels: Vec<u8>,
-    pixel_size: [u32; 2],
+    image: NativeCaptureImage,
     captured_at: DateTime<Utc>,
   ) -> Result<Self, CaptureError> {
     let frame = Self {
       request_id,
       capture_sequence,
       display_id: display.display_id,
-      rgba_pixels,
-      pixel_size,
+      pixel_size: image.pixel_size(),
+      image,
       display_bounds_global: display.bounds_global,
       scale_factor: display.scale_factor,
       captured_at,
@@ -57,11 +175,11 @@ impl CaptureFrame {
   pub fn validate(&self) -> Result<(), CaptureError> {
     validate_pixel_dimensions(self.pixel_size)?;
 
-    let expected_len = self.pixel_size[0] as usize * self.pixel_size[1] as usize * 4;
-    if self.rgba_pixels.len() != expected_len {
+    if self.image.pixel_size() != self.pixel_size {
       return Err(CaptureError::CaptureFailed(format!(
-        "invalid RGBA buffer length: expected {expected_len}, got {}",
-        self.rgba_pixels.len()
+        "native image dimensions {:?} do not match frame dimensions {:?}",
+        self.image.pixel_size(),
+        self.pixel_size,
       )));
     }
 
@@ -88,7 +206,7 @@ impl fmt::Debug for CaptureFrame {
       .field("request_id", &self.request_id)
       .field("capture_sequence", &self.capture_sequence)
       .field("display_id", &self.display_id)
-      .field("rgba_bytes", &self.rgba_pixels.len())
+      .field("image", &self.image)
       .field("pixel_size", &self.pixel_size)
       .field("display_bounds_global", &self.display_bounds_global)
       .field("scale_factor", &self.scale_factor)
@@ -143,6 +261,16 @@ pub fn request_screen_recording_permission() -> Result<(), CaptureError> {
   ensure_screen_recording_permission()
 }
 
+pub fn prewarm_capture_backend() {
+  #[cfg(target_os = "macos")]
+  macos::prewarm();
+}
+
+pub fn invalidate_capture_backend_cache() {
+  #[cfg(target_os = "macos")]
+  macos::invalidate_cached_content();
+}
+
 pub fn prepare_display_capture_under_cursor(
   options: CaptureOptions,
 ) -> Result<PreparedCapture, CaptureError> {
@@ -153,6 +281,7 @@ pub fn prepare_display_capture_under_cursor_at(
   options: CaptureOptions,
   cursor_position: Option<[i32; 2]>,
 ) -> Result<PreparedCapture, CaptureError> {
+  let deadline = Instant::now() + CAPTURE_DEADLINE;
   ensure_screen_recording_permission()?;
   let monitor = cursor_position
     .and_then(|[x, y]| Monitor::from_point(x, y).ok())
@@ -161,7 +290,7 @@ pub fn prepare_display_capture_under_cursor_at(
 
   let display = DisplaySnapshot::from_monitor(&monitor)
     .map_err(|error| CaptureError::CaptureFailed(error.to_string()))?;
-  Ok(PreparedCapture { monitor, display, options })
+  Ok(PreparedCapture { monitor, display, options, deadline })
 }
 
 pub fn capture_prepared_display(
@@ -197,7 +326,11 @@ pub fn capture_primary_display_with_options(
   let monitor = primary_monitor()?;
   let display = DisplaySnapshot::from_monitor(&monitor)
     .map_err(|error| CaptureError::CaptureFailed(error.to_string()))?;
-  capture_monitor(request_id, capture_sequence, PreparedCapture { monitor, display, options })
+  capture_monitor(
+    request_id,
+    capture_sequence,
+    PreparedCapture { monitor, display, options, deadline: Instant::now() + CAPTURE_DEADLINE },
+  )
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -210,6 +343,7 @@ pub struct PreparedCapture {
   monitor: Monitor,
   display: DisplaySnapshot,
   options: CaptureOptions,
+  deadline: Instant,
 }
 
 impl PreparedCapture {
@@ -277,17 +411,10 @@ fn capture_monitor(
     expected_pixel_size,
     prepared.options.include_cursor,
     performance,
+    prepared.deadline,
   )?;
-  let pixel_size = [image.width(), image.height()];
 
-  CaptureFrame::new(
-    request_id,
-    capture_sequence,
-    prepared.display,
-    image.into_raw(),
-    pixel_size,
-    Utc::now(),
-  )
+  CaptureFrame::new(request_id, capture_sequence, prepared.display, image, Utc::now())
 }
 
 #[cfg(target_os = "macos")]
@@ -296,9 +423,10 @@ fn capture_monitor_image(
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
   performance: PerformanceContext,
-) -> Result<RgbaImage, CaptureError> {
+  deadline: Instant,
+) -> Result<NativeCaptureImage, CaptureError> {
   let display_id = monitor.id().map_err(map_xcap_error)?;
-  macos::capture_display(display_id, expected_pixel_size, include_cursor, performance)
+  macos::capture_display(display_id, expected_pixel_size, include_cursor, performance, deadline)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -307,8 +435,9 @@ fn capture_monitor_image(
   _expected_pixel_size: [u32; 2],
   _include_cursor: bool,
   _performance: PerformanceContext,
-) -> Result<RgbaImage, CaptureError> {
-  monitor.capture_image().map_err(map_xcap_error)
+  _deadline: Instant,
+) -> Result<NativeCaptureImage, CaptureError> {
+  NativeCaptureImage::from_rgba(monitor.capture_image().map_err(map_xcap_error)?)
 }
 
 fn validate_scale_factor(scale_factor: f32) -> Result<(), CaptureError> {
@@ -377,19 +506,6 @@ fn ensure_screen_recording_permission() -> Result<(), CaptureError> {
 mod tests {
   use super::*;
 
-  fn valid_frame(pixel_size: [u32; 2], rgba_pixels: Vec<u8>) -> CaptureFrame {
-    CaptureFrame {
-      request_id: Uuid::nil(),
-      capture_sequence: 1,
-      display_id: 1,
-      rgba_pixels,
-      pixel_size,
-      display_bounds_global: [0, 0, 100, 100],
-      scale_factor: 1.0,
-      captured_at: Utc::now(),
-    }
-  }
-
   #[test]
   fn accepts_dimensions_at_8k_limit() {
     assert!(
@@ -402,22 +518,6 @@ mod tests {
     for pixel_size in [[MAX_CAPTURE_DIMENSION_PX + 1, 1], [1, MAX_CAPTURE_DIMENSION_PX + 1]] {
       assert!(matches!(validate_pixel_dimensions(pixel_size), Err(CaptureError::TooLarge { .. })));
     }
-  }
-
-  #[test]
-  fn rejects_invalid_rgba_buffer_length() {
-    let frame = valid_frame([2, 2], vec![0; 15]);
-    assert!(matches!(
-        frame.validate(),
-        Err(CaptureError::CaptureFailed(message))
-            if message.contains("invalid RGBA buffer length")
-    ));
-  }
-
-  #[test]
-  fn accepts_matching_rgba_buffer_length() {
-    let frame = valid_frame([2, 2], vec![0; 16]);
-    assert!(frame.validate().is_ok());
   }
 
   #[cfg(target_os = "macos")]
@@ -439,5 +539,33 @@ mod tests {
       expected_capture_pixel_size(4_097, 2_160, 2.0),
       Err(CaptureError::TooLarge { .. })
     ));
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn materializes_unpremultiplied_rgba_only_on_demand() {
+    use objc2_core_graphics::{
+      CGBitmapContextCreate, CGBitmapContextCreateImage, CGColorSpace, CGImageAlphaInfo,
+      CGImageByteOrderInfo,
+    };
+
+    let mut premultiplied = [128_u8, 0, 0, 128, 0, 255, 0, 255];
+    let color_space = CGColorSpace::new_device_rgb().unwrap();
+    let bitmap = unsafe {
+      CGBitmapContextCreate(
+        premultiplied.as_mut_ptr().cast(),
+        2,
+        1,
+        8,
+        8,
+        Some(&color_space),
+        CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0,
+      )
+    }
+    .unwrap();
+    let image = CGBitmapContextCreateImage(Some(&bitmap)).unwrap();
+    let native = NativeCaptureImage::from_cg_image(image).unwrap();
+
+    assert_eq!(&*native.to_rgba8().unwrap(), &[255, 0, 0, 128, 0, 255, 0, 255]);
   }
 }

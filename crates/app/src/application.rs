@@ -20,8 +20,9 @@ use uuid::Uuid;
 
 use crate::{
   capture::{
-    CaptureFrame, CaptureOptions, capture_prepared_display,
-    prepare_display_capture_under_cursor_at, request_screen_recording_permission,
+    CaptureFrame, CaptureOptions, NativeCaptureImage, capture_prepared_display,
+    invalidate_capture_backend_cache, prepare_display_capture_under_cursor_at,
+    prewarm_capture_backend, request_screen_recording_permission,
   },
   capture_surface::{CaptureSurfaceCoordinator, DisplayRefreshOutcome, SurfaceLifecycle},
   editor::{EditorAction, EditorController, EditorTool},
@@ -74,15 +75,17 @@ struct WorkingSession {
   history: CommandHistory,
   dirty_baseline: DirtyBaseline,
   element_clipboard: Option<Element>,
-  background: BackgroundData,
-  background_pixels: Arc<[u8]>,
-  background_texture: TextureHandle,
+  background: Option<BackgroundData>,
+  background_pixels: Option<Arc<[u8]>>,
+  native_background: Option<NativeCaptureImage>,
+  background_texture: Option<TextureHandle>,
   editor: EditorController,
 }
 
 struct SessionBackground {
-  data: BackgroundData,
-  pixels: Arc<[u8]>,
+  data: Option<BackgroundData>,
+  pixels: Option<Arc<[u8]>>,
+  native: Option<NativeCaptureImage>,
 }
 
 impl WorkingSession {
@@ -122,11 +125,31 @@ impl WorkingSession {
     }
   }
 
+  fn materialize_background(&mut self) -> Result<BackgroundData, ApplicationError> {
+    if let Some(background) = &self.background {
+      return Ok(background.clone());
+    }
+    let native = self.native_background.as_ref().ok_or(ApplicationError::InvalidTexture)?;
+    let pixels = native.to_rgba8().map_err(ApplicationError::Capture)?;
+    let background = BackgroundData::rgba8(
+      self.document.canvas_size_px.width_px,
+      self.document.canvas_size_px.height_px,
+      Arc::clone(&pixels),
+    )?;
+    self.background_pixels = Some(pixels);
+    self.background = Some(background.clone());
+    Ok(background)
+  }
+
   fn image(&self) -> Option<RgbaImage> {
+    let pixels = self
+      .background_pixels
+      .clone()
+      .or_else(|| self.native_background.as_ref()?.to_rgba8().ok())?;
     RgbaImage::from_raw(
       self.document.canvas_size_px.width_px,
       self.document.canvas_size_px.height_px,
-      self.background_pixels.to_vec(),
+      pixels.to_vec(),
     )
   }
 }
@@ -295,6 +318,9 @@ impl RsBoardApp {
     recent.refresh(&store)?;
     let draft_available = store.paths().latest_draft().exists();
     let startup_permission_error = request_screen_recording_permission().err();
+    if startup_permission_error.is_none() {
+      prewarm_capture_backend();
+    }
     let (worker_sender, worker_receiver) = mpsc::channel();
     let open_file_bridge = OpenFileBridge::install();
     let mut library_error = None;
@@ -439,6 +465,7 @@ impl RsBoardApp {
     let request_id = Uuid::new_v4();
     let capture_sequence = next_sequence(&mut self.next_capture_sequence);
     self.capture_surfaces.remember_frontmost_application();
+    self.capture_surfaces.exclude_application_windows();
     let performance = PerformanceContext::capture(request_id, capture_sequence);
     PerformanceTimer::started_at(
       "capture.request.dispatch",
@@ -569,7 +596,7 @@ impl RsBoardApp {
       return;
     }
     let started_at = Instant::now();
-    let Some(session) = self.session.as_ref() else {
+    let Some(session) = self.session.as_mut() else {
       return;
     };
     let request_id = Uuid::new_v4();
@@ -599,12 +626,22 @@ impl RsBoardApp {
         return;
       }
     };
-    let persistence_context = session.persistence_context(request_id, None);
-    let request = SaveRequest {
-      context: persistence_context,
-      snapshot,
-      background: session.background.clone(),
+    let background = match session.materialize_background() {
+      Ok(background) => background,
+      Err(error) => {
+        PerformanceTimer::started_at(
+          "persistence.request_to_ui_complete",
+          performance,
+          PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
+          started_at,
+        )
+        .finish_error(&error);
+        self.persistent_error = Some(error.to_string());
+        return;
+      }
     };
+    let persistence_context = session.persistence_context(request_id, None);
+    let request = SaveRequest { context: persistence_context, snapshot, background };
     self.phase = Phase::Saving { request_id };
     self.persistence_ui_trace =
       Some(PersistenceUiTrace { performance, started_at, workflow: "save", pixel_size });
@@ -645,7 +682,7 @@ impl RsBoardApp {
     }
     let started_at = Instant::now();
     let stash_sequence = next_sequence(&mut self.next_stash_sequence);
-    let Some(session) = self.session.as_ref() else {
+    let Some(session) = self.session.as_mut() else {
       return;
     };
     if matches!(session.origin, SessionOrigin::ExistingDocument) {
@@ -682,14 +719,24 @@ impl RsBoardApp {
         return;
       }
     };
+    let background = match session.materialize_background() {
+      Ok(background) => background,
+      Err(error) => {
+        PerformanceTimer::started_at(
+          "persistence.request_to_ui_complete",
+          performance,
+          PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
+          started_at,
+        )
+        .finish_error(&error);
+        self.persistent_error = Some(error.to_string());
+        return;
+      }
+    };
     let persistence_context =
       session.persistence_context(request_id, Some(stash_sequence)).with_generation(generation_id);
-    let request = StashRequest {
-      context: persistence_context,
-      generation_id,
-      snapshot,
-      background: session.background.clone(),
-    };
+    let request =
+      StashRequest { context: persistence_context, generation_id, snapshot, background };
     self.phase = Phase::Stashing { request_id, generation_id };
     self.persistence_ui_trace =
       Some(PersistenceUiTrace { performance, started_at, workflow: "stash", pixel_size });
@@ -752,7 +799,7 @@ impl RsBoardApp {
   fn session_from_capture(
     &self,
     frame: CaptureFrame,
-    context: &egui::Context,
+    _context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
     let performance = PerformanceContext::capture(frame.request_id, frame.capture_sequence);
     let [width_px, height_px] = frame.pixel_size;
@@ -772,15 +819,13 @@ impl RsBoardApp {
       },
       frame.captured_at.with_timezone(&chrono::Local),
     )?;
-    let pixels: Arc<[u8]> = Arc::from(frame.rgba_pixels);
-    let background = BackgroundData::rgba8(width_px, height_px, Arc::clone(&pixels))?;
     self.make_session(
       SessionOrigin::NewCapture,
       Some(frame.capture_sequence),
       document,
-      SessionBackground { data: background, pixels },
+      SessionBackground { data: None, pixels: None, native: Some(frame.image) },
       performance,
-      context,
+      _context,
     )
   }
 
@@ -797,7 +842,7 @@ impl RsBoardApp {
       origin,
       capture_sequence,
       loaded.document,
-      SessionBackground { data: loaded.background, pixels },
+      SessionBackground { data: Some(loaded.background), pixels: Some(pixels), native: None },
       performance,
       context,
     )
@@ -813,27 +858,31 @@ impl RsBoardApp {
     context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
     document.validate()?;
-    let texture_timer = PerformanceTimer::start(
-      "capture.background_texture.register",
-      PerformanceContext {
-        document_id: Some(document.document_id.as_uuid()),
-        revision: Some(document.revision),
-        ..performance
-      },
-      PerformanceDetails::default()
-        .pixel_size([document.canvas_size_px.width_px, document.canvas_size_px.height_px]),
-    );
-    let texture_result = load_rgba_texture(
-      context,
-      &format!("background-{}", document.document_id),
-      document.canvas_size_px,
-      &background.pixels,
-    );
-    match &texture_result {
-      Ok(_) => texture_timer.finish_ok(),
-      Err(error) => texture_timer.finish_error(error),
-    }
-    let texture = texture_result?;
+    let texture = if let Some(pixels) = background.pixels.as_deref() {
+      let texture_timer = PerformanceTimer::start(
+        "capture.background_texture.register",
+        PerformanceContext {
+          document_id: Some(document.document_id.as_uuid()),
+          revision: Some(document.revision),
+          ..performance
+        },
+        PerformanceDetails::default()
+          .pixel_size([document.canvas_size_px.width_px, document.canvas_size_px.height_px]),
+      );
+      let texture_result = load_rgba_texture(
+        context,
+        &format!("background-{}", document.document_id),
+        document.canvas_size_px,
+        pixels,
+      );
+      match &texture_result {
+        Ok(_) => texture_timer.finish_ok(),
+        Err(error) => texture_timer.finish_error(error),
+      }
+      Some(texture_result?)
+    } else {
+      None
+    };
     let dirty_baseline = document.dirty_baseline();
     Ok(WorkingSession {
       session_id: Uuid::new_v4(),
@@ -845,6 +894,7 @@ impl RsBoardApp {
       element_clipboard: None,
       background: background.data,
       background_pixels: background.pixels,
+      native_background: background.native,
       background_texture: texture,
       editor: EditorController::new(self.last_tool),
     })
@@ -968,9 +1018,15 @@ impl RsBoardApp {
                 let pixel_size = frame.pixel_size;
                 let display_id = frame.display_id;
                 self
-                  .session_from_capture(frame, context)
-                  .map(|session| (session, display_id, bounds, pixel_size))
+                  .capture_surfaces
+                  .set_frozen_image(display_id, &frame.image)
                   .map_err(|error| error.to_string())
+                  .and_then(|_| {
+                    self
+                      .session_from_capture(frame, context)
+                      .map(|session| (session, display_id, bounds, pixel_size))
+                      .map_err(|error| error.to_string())
+                  })
               };
               match &result {
                 Ok(_) => session_timer.finish_ok(),
@@ -1718,7 +1774,9 @@ impl RsBoardApp {
 
     let actions = if let Some(session) = self.session.as_mut() {
       let mut actions = Vec::new();
-      egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(
+      let background_fill =
+        if session.background_texture.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
+      egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
         root_ui,
         |ui| match self.phase {
           Phase::Editing => {
@@ -1726,14 +1784,22 @@ impl RsBoardApp {
               ui,
               &session.document,
               &session.history,
-              &session.background_texture,
+              session.background_texture.as_ref(),
             );
           }
           Phase::Saving { .. } | Phase::Stashing { .. } | Phase::ConfirmingDiscard => {
-            session.editor.show_read_only(ui, &session.document, &session.background_texture);
+            session.editor.show_read_only(
+              ui,
+              &session.document,
+              session.background_texture.as_ref(),
+            );
           }
           _ => {
-            session.editor.show_read_only(ui, &session.document, &session.background_texture);
+            session.editor.show_read_only(
+              ui,
+              &session.document,
+              session.background_texture.as_ref(),
+            );
           }
         },
       );
@@ -2513,11 +2579,13 @@ impl eframe::App for RsBoardApp {
     if self.capture_surfaces.should_refresh() {
       match self.capture_surfaces.refresh_available_displays() {
         Ok(DisplayRefreshOutcome::ActiveDisplayRemoved(_)) => {
+          invalidate_capture_backend_cache();
           self.capture_surfaces.hide_active();
           if self.phase == Phase::Editing {
             self.close_editor(context);
           }
         }
+        Ok(DisplayRefreshOutcome::DisplaysChanged) => invalidate_capture_backend_cache(),
         Ok(DisplayRefreshOutcome::Unchanged) => {}
         Err(error) => eprintln!("capture_surface_refresh_failed error={error:?}"),
       }
@@ -2562,6 +2630,8 @@ pub enum ApplicationError {
   Settings(#[from] SettingsError),
   #[error(transparent)]
   Storage(#[from] StorageError),
+  #[error(transparent)]
+  Capture(#[from] crate::capture::CaptureError),
   #[error(transparent)]
   Document(#[from] common::DocumentError),
   #[error("背景纹理无效")]
