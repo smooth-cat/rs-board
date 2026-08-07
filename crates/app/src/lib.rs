@@ -8,6 +8,7 @@ pub mod export;
 pub mod instance;
 pub mod performance;
 pub mod platform;
+pub mod post_save;
 pub mod recent;
 pub mod renderer;
 pub mod settings;

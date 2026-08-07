@@ -28,12 +28,13 @@ use crate::{
   capture_surface::{CaptureSurfaceCoordinator, DisplayRefreshOutcome, SurfaceLifecycle},
   draft_coordinator::{DraftCoordinator, DraftCoordinatorError, DraftResult, StashJob},
   editor::{EditorAction, EditorController, EditorTool},
-  export::{copy_image, encode_png, make_preview, write_png_atomically},
+  export::{copy_image, write_png_atomically},
   instance::InstanceBridge,
   performance::{
     PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
   },
   platform::{GlobalF1Hotkey, OpenFileBridge, global_cursor_position, set_launch_at_login},
+  post_save::{PostSaveCoordinator, PostSaveCoordinatorError, PostSaveJob, PostSaveResult},
   recent::RecentDocuments,
   renderer::render_document_to_image,
   settings::{Settings, SettingsError},
@@ -77,7 +78,6 @@ struct WorkingSession {
   dirty_baseline: DirtyBaseline,
   element_clipboard: Option<Element>,
   prepared_background: PreparedBackground,
-  background_pixels: Option<Arc<[u8]>>,
   native_background: Option<NativeCaptureImage>,
   background_texture: Option<TextureHandle>,
   editor: EditorController,
@@ -125,18 +125,6 @@ impl WorkingSession {
       revision: Some(self.document.revision),
     }
   }
-
-  fn image(&self) -> Option<RgbaImage> {
-    let pixels = self
-      .background_pixels
-      .clone()
-      .or_else(|| self.native_background.as_ref()?.to_rgba8().ok())?;
-    RgbaImage::from_raw(
-      self.document.canvas_size_px.width_px,
-      self.document.canvas_size_px.height_px,
-      pixels.to_vec(),
-    )
-  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +165,7 @@ enum WorkerEvent {
     context: PersistenceContext,
     completed_at: Instant,
     result: Result<SavedDocument, String>,
+    post_save_job: Option<PostSaveJob>,
   },
   Import(Result<ImportedDocument, String>),
   LibraryChanged(Result<Option<DocumentId>, String>),
@@ -252,6 +241,7 @@ pub struct RsBoardApp {
   capture_surfaces: CaptureSurfaceCoordinator,
   background_encoder: BackgroundEncodeScheduler,
   draft_coordinator: DraftCoordinator,
+  post_save_coordinator: PostSaveCoordinator,
   phase: Phase,
   next_capture_sequence: u64,
   next_stash_sequence: u64,
@@ -299,6 +289,10 @@ impl RsBoardApp {
     }
     let (worker_sender, worker_receiver) = mpsc::channel();
     let draft_coordinator = DraftCoordinator::new(store.clone(), {
+      let context = creation_context.egui_ctx.clone();
+      move || context.request_repaint()
+    })?;
+    let post_save_coordinator = PostSaveCoordinator::new(store.clone(), {
       let context = creation_context.egui_ctx.clone();
       move || context.request_repaint()
     })?;
@@ -351,6 +345,7 @@ impl RsBoardApp {
       capture_surfaces,
       background_encoder: BackgroundEncodeScheduler::new(),
       draft_coordinator,
+      post_save_coordinator,
       phase: Phase::Idle,
       next_capture_sequence: 0,
       next_stash_sequence: 0,
@@ -619,8 +614,10 @@ impl RsBoardApp {
         performance,
       );
     }
+    let snapshot = Arc::new(snapshot);
     let prepared_background = session.prepared_background.clone();
     let persistence_context = session.persistence_context(request_id, None);
+    let copy_to_clipboard = self.settings.copy_image_after_save;
     self.phase = Phase::Saving { request_id };
     self.persistence_ui_trace =
       Some(PersistenceUiTrace { performance, started_at, workflow: "save", pixel_size });
@@ -635,7 +632,11 @@ impl RsBoardApp {
       );
       let result = match prepared_background.wait() {
         Ok(background) => store
-          .save_document(SaveRequest { context: persistence_context, snapshot, background })
+          .save_document(SaveRequest {
+            context: persistence_context,
+            snapshot: snapshot.as_ref().clone(),
+            background,
+          })
           .map_err(|error| error.to_string()),
         Err(error) => Err(error.to_string()),
       };
@@ -643,11 +644,22 @@ impl RsBoardApp {
         Ok(_) => timer.finish_ok(),
         Err(_) => timer.finish_error_code("persistence.save_failed"),
       }
+      let completed_at = Instant::now();
+      let post_save_job = result.as_ref().ok().map(|saved| PostSaveJob {
+        document_id: saved.document_id,
+        revision: saved.revision,
+        snapshot,
+        prepared_background,
+        copy_to_clipboard,
+        performance,
+        requested_at: completed_at,
+      });
       WorkerEvent::Save {
         request_id,
         context: persistence_context,
-        completed_at: Instant::now(),
+        completed_at,
         result,
+        post_save_job,
       }
     });
     if let Err(error) = spawn_result {
@@ -871,7 +883,6 @@ impl RsBoardApp {
       dirty_baseline,
       element_clipboard: None,
       prepared_background: background.prepared,
-      background_pixels: background.pixels,
       native_background: background.native,
       background_texture: texture,
       editor: EditorController::new(self.last_tool),
@@ -1033,6 +1044,43 @@ impl RsBoardApp {
               "clear_all_failed",
               "内容清理失败",
             );
+          }
+        },
+      }
+    }
+  }
+
+  fn handle_post_save_results(&mut self) {
+    while let Some(event) = self.post_save_coordinator.try_recv() {
+      match event {
+        PostSaveResult::ImageTasks { document_id, revision, preview_installed, warnings } => {
+          if preview_installed {
+            self.preview_textures.remove(&document_id);
+          }
+          if warnings.is_empty() {
+            if self.has_visible_window() {
+              self.set_toast("讲义已保存");
+            }
+          } else {
+            let warning = warnings.join("；");
+            eprintln!(
+              "post_save_image_tasks_failed document_id={document_id} revision={revision} error={warning}"
+            );
+            if self.has_visible_window() {
+              self.set_toast(warning);
+            }
+          }
+        }
+        PostSaveResult::RecentRefresh { performance, result } => match result {
+          Ok(scan) => self.recent.apply_scan(scan),
+          Err(error) => {
+            eprintln!(
+              "post_save_recent_refresh_failed document_id={:?} revision={:?} error={error}",
+              performance.document_id, performance.revision
+            );
+            if self.has_visible_window() {
+              self.set_toast("最近讲义刷新失败");
+            }
           }
         },
       }
@@ -1238,7 +1286,13 @@ impl RsBoardApp {
             }
           }
         }
-        WorkerEvent::Save { request_id, context: expected_context, completed_at, result } => {
+        WorkerEvent::Save {
+          request_id,
+          context: expected_context,
+          completed_at,
+          result,
+          post_save_job,
+        } => {
           if self.phase != (Phase::Saving { request_id }) {
             let performance = self
               .persistence_trace_for(request_id)
@@ -1253,7 +1307,6 @@ impl RsBoardApp {
             self.finish_persistence_trace_stale(request_id);
             continue;
           }
-          let performance = self.persistence_trace_for(request_id).map(|trace| trace.performance);
           if let Some(trace) = self.persistence_trace_for(request_id) {
             PerformanceTimer::started_at(
               "persistence.worker_to_ui",
@@ -1279,8 +1332,50 @@ impl RsBoardApp {
                   None
                 }
               });
-              if let Some(performance) = performance {
-                self.start_post_save_tasks(&saved, performance, context);
+              self.phase = Phase::Idle;
+              self.preview_textures.remove(&saved.document_id);
+              if self.quit_after_persist {
+                self.allow_close = true;
+                context.send_viewport_cmd(ViewportCommand::Close);
+              } else {
+                self.hide_editor_window(context);
+              }
+              self.remember_tool_and_release_session();
+              self.finish_persistence_trace_ok(request_id);
+
+              match post_save_job {
+                Some(job) => match self.post_save_coordinator.enqueue(job) {
+                  Ok(outcome) => {
+                    if outcome.clipboard_dropped {
+                      eprintln!(
+                        "post_save_clipboard_queue_full document_id={} revision={}",
+                        saved.document_id, saved.revision
+                      );
+                      if self.has_visible_window() {
+                        self.set_toast("讲义已保存，但保存后复制队列已满");
+                      }
+                    }
+                    if outcome.render_evicted {
+                      eprintln!(
+                        "post_save_render_queue_evicted document_id={} revision={}",
+                        saved.document_id, saved.revision
+                      );
+                    }
+                  }
+                  Err(error) => {
+                    eprintln!(
+                      "post_save_enqueue_failed document_id={} revision={} error={error}",
+                      saved.document_id, saved.revision
+                    );
+                    if self.has_visible_window() {
+                      self.set_toast("讲义已保存，但保存后任务启动失败");
+                    }
+                  }
+                },
+                None => eprintln!(
+                  "post_save_job_missing document_id={} revision={}",
+                  saved.document_id, saved.revision
+                ),
               }
               if let Some(generation_id) = saved_draft_generation
                 && let Err(error) = self.draft_coordinator.delete_if_generation(generation_id)
@@ -1292,30 +1387,6 @@ impl RsBoardApp {
                   self.set_toast("草稿清理失败");
                 }
               }
-              self.remember_tool_and_release_session();
-              self.phase = Phase::Idle;
-              if let Some(performance) = performance {
-                let recent_timer = PerformanceTimer::start(
-                  "post_save.recent_refresh",
-                  performance,
-                  PerformanceDetails::default().workflow("save"),
-                );
-                let result = self.recent.refresh(&self.store);
-                match &result {
-                  Ok(_) => recent_timer.finish_ok(),
-                  Err(error) => recent_timer.finish_error(error),
-                }
-              } else {
-                let _ = self.recent.refresh(&self.store);
-              }
-              self.preview_textures.remove(&saved.document_id);
-              if self.quit_after_persist {
-                self.allow_close = true;
-                context.send_viewport_cmd(ViewportCommand::Close);
-              } else {
-                self.hide_editor_window(context);
-              }
-              self.finish_persistence_trace_ok(request_id);
             }
             Ok(_) => {
               if let Some(trace) = self.persistence_trace_for(request_id) {
@@ -1392,129 +1463,6 @@ impl RsBoardApp {
         && document_id == session.document.document_id
         && revision == session.document.revision
     })
-  }
-
-  fn start_post_save_tasks(
-    &mut self,
-    saved: &SavedDocument,
-    performance: PerformanceContext,
-    context: &egui::Context,
-  ) {
-    let Some(session) = self.session.as_ref() else {
-      return;
-    };
-    let snapshot_timer = PerformanceTimer::start(
-      "post_save.snapshot",
-      performance,
-      PerformanceDetails::default().workflow("save"),
-    );
-    let snapshot = match session.document.snapshot(saved.revision) {
-      Ok(snapshot) => {
-        snapshot_timer.finish_ok();
-        snapshot
-      }
-      Err(error) => {
-        snapshot_timer.finish_error(&error);
-        return;
-      }
-    };
-    let background_timer = PerformanceTimer::start(
-      "post_save.background_copy",
-      performance,
-      PerformanceDetails::default()
-        .workflow("save")
-        .pixel_size([snapshot.canvas_size_px.width_px, snapshot.canvas_size_px.height_px]),
-    );
-    let background = match session.image() {
-      Some(background) => {
-        background_timer.finish_ok();
-        background
-      }
-      None => {
-        background_timer.finish_error_code("post_save.invalid_background_buffer");
-        return;
-      }
-    };
-    let copy_after_save = self.settings.copy_image_after_save;
-    let store = self.store.clone();
-    let document_id = saved.document_id;
-    let revision = saved.revision;
-    let spawn_result = self.spawn_worker_traced(context, performance, "post_save", move || {
-      let total_timer = PerformanceTimer::start(
-        "post_save.total",
-        performance,
-        PerformanceDetails::default().workflow("save"),
-      );
-      let render_timer = PerformanceTimer::start(
-        "post_save.render",
-        performance,
-        PerformanceDetails::default().workflow("save"),
-      );
-      let image = render_document_to_image(&snapshot, &background);
-      render_timer.finish_ok();
-      let mut warnings = Vec::new();
-      let preview_timer = PerformanceTimer::start(
-        "post_save.preview_resize",
-        performance,
-        PerformanceDetails::default().workflow("save"),
-      );
-      let preview = make_preview(&image, 480);
-      preview_timer.finish_ok();
-      let encode_timer = PerformanceTimer::start(
-        "post_save.preview_encode",
-        performance,
-        PerformanceDetails::default().workflow("save"),
-      );
-      let encoded = encode_png(&preview);
-      match &encoded {
-        Ok(_) => encode_timer.finish_ok(),
-        Err(error) => encode_timer.finish_error(error),
-      }
-      match encoded {
-        Ok(bytes) => {
-          let install_timer = PerformanceTimer::start(
-            "post_save.preview_install",
-            performance,
-            PerformanceDetails::default().workflow("save").byte_count(bytes.len()),
-          );
-          let result = store.install_preview_if_current(document_id, revision, bytes);
-          match &result {
-            Ok(_) => install_timer.finish_ok(),
-            Err(error) => install_timer.finish_error(error),
-          }
-          if let Err(error) = result {
-            warnings.push(format!("预览生成失败: {error}"));
-          }
-        }
-        Err(error) => warnings.push(format!("预览生成失败: {error}")),
-      }
-      if copy_after_save {
-        let clipboard_timer = PerformanceTimer::start(
-          "post_save.clipboard",
-          performance,
-          PerformanceDetails::default().workflow("save"),
-        );
-        let result = copy_image(&image);
-        match &result {
-          Ok(_) => clipboard_timer.finish_ok(),
-          Err(error) => clipboard_timer.finish_error(error),
-        }
-        if let Err(error) = result {
-          warnings.push(format!("剪贴板写入失败: {error}"));
-        }
-      }
-      if warnings.is_empty() {
-        total_timer.finish_ok();
-        WorkerEvent::Auxiliary(Ok("讲义已保存".into()))
-      } else {
-        let warning = warnings.join("；");
-        total_timer.finish_error_code("post_save.task_failed");
-        WorkerEvent::Auxiliary(Err(warning))
-      }
-    });
-    if let Err(error) = spawn_result {
-      self.set_toast(format!("保存后任务启动失败：{error}"));
-    }
   }
 
   fn handle_editor_actions(&mut self, actions: Vec<EditorAction>, context: &egui::Context) {
@@ -2595,6 +2543,7 @@ impl RsBoardApp {
 impl eframe::App for RsBoardApp {
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
     self.handle_draft_results(context);
+    self.handle_post_save_results();
     self.handle_worker_events(context);
     self.poll_external_events(context);
     if self.capture_surfaces.should_refresh() {
@@ -2663,6 +2612,8 @@ pub enum ApplicationError {
   BackgroundPrepare(#[from] BackgroundPrepareError),
   #[error(transparent)]
   DraftCoordinator(#[from] DraftCoordinatorError),
+  #[error(transparent)]
+  PostSaveCoordinator(#[from] PostSaveCoordinatorError),
   #[error(transparent)]
   Document(#[from] common::DocumentError),
   #[error("背景纹理无效")]

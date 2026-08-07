@@ -1,6 +1,6 @@
 use common::DocumentId;
 
-use crate::storage::{DocumentSummary, LocalStore, ScanFailure, StorageResult};
+use crate::storage::{DocumentSummary, LocalStore, ScanFailure, ScanResult, StorageResult};
 
 #[derive(Debug, Default)]
 pub struct RecentDocuments {
@@ -12,7 +12,11 @@ pub struct RecentDocuments {
 
 impl RecentDocuments {
   pub fn refresh(&mut self, store: &LocalStore) -> StorageResult<()> {
-    let scan = store.scan_documents()?;
+    self.apply_scan(store.scan_documents()?);
+    Ok(())
+  }
+
+  pub fn apply_scan(&mut self, scan: ScanResult) {
     self.documents = scan.documents;
     self.failures = scan.failures;
     if self
@@ -21,7 +25,6 @@ impl RecentDocuments {
     {
       self.highlighted = None;
     }
-    Ok(())
   }
 
   pub fn visible_documents(&self) -> impl Iterator<Item = &DocumentSummary> {
