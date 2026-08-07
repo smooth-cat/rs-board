@@ -29,9 +29,16 @@ xcap.workspace = true
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = [
   "NSApplication",
+  "NSColor",
+  "NSGraphics",
+  "NSPanel",
+  "NSRunningApplication",
+  "NSScreen",
   "NSPasteboard",
   "NSView",
   "NSWindow",
+  "NSWorkspace",
+  "objc2-quartz-core",
 ] }
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
@@ -69,13 +76,16 @@ objc2-core-video = { version = "0.3.2", default-features = false, features = [
 objc2-foundation = { version = "0.3.2", features = [
   "NSArray",
   "NSData",
+  "NSDictionary",
   "NSAppleEventDescriptor",
   "NSAppleEventManager",
   "NSObject",
   "NSString",
   "NSURL",
+  "NSValue",
   "objc2-core-services",
 ] }
+objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
   "SCError",
   "SCShareableContent",

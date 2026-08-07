@@ -6,6 +6,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use xcap::Monitor;
 
+use crate::capture_surface::DisplaySnapshot;
 use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 use crate::platform::global_cursor_position;
 
@@ -22,6 +23,7 @@ pub const MAX_CAPTURE_DIMENSION_PX: u32 = 8_192;
 pub struct CaptureFrame {
   pub request_id: Uuid,
   pub capture_sequence: u64,
+  pub display_id: u32,
   pub rgba_pixels: Vec<u8>,
   pub pixel_size: [u32; 2],
   pub display_bounds_global: [i32; 4],
@@ -33,19 +35,19 @@ impl CaptureFrame {
   pub fn new(
     request_id: Uuid,
     capture_sequence: u64,
+    display: DisplaySnapshot,
     rgba_pixels: Vec<u8>,
     pixel_size: [u32; 2],
-    display_bounds_global: [i32; 4],
-    scale_factor: f32,
     captured_at: DateTime<Utc>,
   ) -> Result<Self, CaptureError> {
     let frame = Self {
       request_id,
       capture_sequence,
+      display_id: display.display_id,
       rgba_pixels,
       pixel_size,
-      display_bounds_global,
-      scale_factor,
+      display_bounds_global: display.bounds_global,
+      scale_factor: display.scale_factor,
       captured_at,
     };
     frame.validate()?;
@@ -85,6 +87,7 @@ impl fmt::Debug for CaptureFrame {
       .debug_struct("CaptureFrame")
       .field("request_id", &self.request_id)
       .field("capture_sequence", &self.capture_sequence)
+      .field("display_id", &self.display_id)
       .field("rgba_bytes", &self.rgba_pixels.len())
       .field("pixel_size", &self.pixel_size)
       .field("display_bounds_global", &self.display_bounds_global)
@@ -156,7 +159,9 @@ pub fn prepare_display_capture_under_cursor_at(
     .map(Ok)
     .unwrap_or_else(primary_monitor)?;
 
-  Ok(PreparedCapture { monitor, options })
+  let display = DisplaySnapshot::from_monitor(&monitor)
+    .map_err(|error| CaptureError::CaptureFailed(error.to_string()))?;
+  Ok(PreparedCapture { monitor, display, options })
 }
 
 pub fn capture_prepared_display(
@@ -167,7 +172,7 @@ pub fn capture_prepared_display(
   let performance = PerformanceContext::capture(request_id, capture_sequence);
   let timer =
     PerformanceTimer::start("capture.api.total", performance, PerformanceDetails::default());
-  let result = capture_monitor(request_id, capture_sequence, prepared.monitor, prepared.options);
+  let result = capture_monitor(request_id, capture_sequence, prepared);
   match &result {
     Ok(_) => timer.finish_ok(),
     Err(error) => timer.finish_error(error),
@@ -189,7 +194,10 @@ pub fn capture_primary_display_with_options(
   options: CaptureOptions,
 ) -> Result<CaptureFrame, CaptureError> {
   ensure_screen_recording_permission()?;
-  capture_monitor(request_id, capture_sequence, primary_monitor()?, options)
+  let monitor = primary_monitor()?;
+  let display = DisplaySnapshot::from_monitor(&monitor)
+    .map_err(|error| CaptureError::CaptureFailed(error.to_string()))?;
+  capture_monitor(request_id, capture_sequence, PreparedCapture { monitor, display, options })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -200,7 +208,14 @@ pub struct CaptureOptions {
 #[derive(Debug, Clone)]
 pub struct PreparedCapture {
   monitor: Monitor,
+  display: DisplaySnapshot,
   options: CaptureOptions,
+}
+
+impl PreparedCapture {
+  pub fn display(&self) -> DisplaySnapshot {
+    self.display
+  }
 }
 
 pub fn validate_pixel_dimensions(pixel_size: [u32; 2]) -> Result<(), CaptureError> {
@@ -240,50 +255,37 @@ fn primary_monitor() -> Result<Monitor, CaptureError> {
 fn capture_monitor(
   request_id: Uuid,
   capture_sequence: u64,
-  monitor: Monitor,
-  options: CaptureOptions,
+  prepared: PreparedCapture,
 ) -> Result<CaptureFrame, CaptureError> {
   let performance = PerformanceContext::capture(request_id, capture_sequence);
-  let metadata_timer =
-    PerformanceTimer::start("capture.display.metadata", performance, PerformanceDetails::default());
-  let metadata_result = (|| {
-    Ok::<_, CaptureError>((
-      monitor.x().map_err(map_xcap_error)?,
-      monitor.y().map_err(map_xcap_error)?,
-      monitor.width().map_err(map_xcap_error)?,
-      monitor.height().map_err(map_xcap_error)?,
-      monitor.scale_factor().map_err(map_xcap_error)?,
-    ))
-  })();
-  match &metadata_result {
-    Ok(_) => metadata_timer.finish_ok(),
-    Err(error) => metadata_timer.finish_error(error),
-  }
-  let (x, y, logical_width, logical_height, scale_factor) = metadata_result?;
+  let DisplaySnapshot { bounds_global, scale_factor, .. } = prepared.display;
+  let [_, _, bounds_width, bounds_height] = bounds_global;
+  let logical_width = u32::try_from(bounds_width).map_err(|_| {
+    CaptureError::CaptureFailed("display width does not fit capture dimensions".to_owned())
+  })?;
+  let logical_height = u32::try_from(bounds_height).map_err(|_| {
+    CaptureError::CaptureFailed("display height does not fit capture dimensions".to_owned())
+  })?;
 
   validate_pixel_dimensions([logical_width, logical_height])?;
   validate_scale_factor(scale_factor)?;
   let expected_pixel_size =
     expected_capture_pixel_size(logical_width, logical_height, scale_factor)?;
 
-  let bounds_width = i32::try_from(logical_width).map_err(|_| {
-    CaptureError::CaptureFailed("display width does not fit global coordinates".to_owned())
-  })?;
-  let bounds_height = i32::try_from(logical_height).map_err(|_| {
-    CaptureError::CaptureFailed("display height does not fit global coordinates".to_owned())
-  })?;
-
-  let image =
-    capture_monitor_image(&monitor, expected_pixel_size, options.include_cursor, performance)?;
+  let image = capture_monitor_image(
+    &prepared.monitor,
+    expected_pixel_size,
+    prepared.options.include_cursor,
+    performance,
+  )?;
   let pixel_size = [image.width(), image.height()];
 
   CaptureFrame::new(
     request_id,
     capture_sequence,
+    prepared.display,
     image.into_raw(),
     pixel_size,
-    [x, y, bounds_width, bounds_height],
-    scale_factor,
     Utc::now(),
   )
 }
@@ -379,6 +381,7 @@ mod tests {
     CaptureFrame {
       request_id: Uuid::nil(),
       capture_sequence: 1,
+      display_id: 1,
       rgba_pixels,
       pixel_size,
       display_bounds_global: [0, 0, 100, 100],

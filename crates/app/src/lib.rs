@@ -1,5 +1,6 @@
 pub mod application;
 pub mod capture;
+pub mod capture_surface;
 pub mod editor;
 pub mod export;
 pub mod instance;

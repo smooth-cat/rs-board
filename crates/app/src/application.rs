@@ -23,6 +23,7 @@ use crate::{
     CaptureFrame, CaptureOptions, capture_prepared_display,
     prepare_display_capture_under_cursor_at, request_screen_recording_permission,
   },
+  capture_surface::{CaptureSurfaceCoordinator, DisplayRefreshOutcome, SurfaceLifecycle},
   editor::{EditorAction, EditorController, EditorTool},
   export::{copy_image, encode_png, make_preview, write_png_atomically},
   instance::InstanceBridge,
@@ -133,7 +134,7 @@ impl WorkingSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
   Idle,
-  Capturing { request_id: Uuid, capture_sequence: u64 },
+  Capturing { request_id: Uuid, capture_sequence: u64, display_id: u32 },
   Editing,
   Saving { request_id: Uuid },
   Stashing { request_id: Uuid, generation_id: GenerationId },
@@ -211,13 +212,6 @@ enum RetryKind {
 enum WindowSurface {
   Hidden,
   Library,
-  Editor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorWindowTarget {
-  DisplayBounds([i32; 4]),
-  Cursor([i32; 2]),
 }
 
 #[derive(Clone, Copy)]
@@ -258,7 +252,7 @@ pub struct RsBoardApp {
   hotkey: Option<GlobalF1Hotkey>,
   tray: Option<TrayController>,
   surface: WindowSurface,
-  editor_window_target: Option<EditorWindowTarget>,
+  capture_surfaces: CaptureSurfaceCoordinator,
   phase: Phase,
   next_capture_sequence: u64,
   next_stash_sequence: u64,
@@ -304,6 +298,13 @@ impl RsBoardApp {
     let (worker_sender, worker_receiver) = mpsc::channel();
     let open_file_bridge = OpenFileBridge::install();
     let mut library_error = None;
+    let capture_surfaces = match CaptureSurfaceCoordinator::discover() {
+      Ok(coordinator) => coordinator,
+      Err(error) => {
+        library_error = Some(format!("截图窗口预热失败：{error}"));
+        CaptureSurfaceCoordinator::default()
+      }
+    };
     let hotkey = match GlobalF1Hotkey::from_shortcut_with_waker(&settings.global_hotkey, {
       let context = creation_context.egui_ctx.clone();
       move || context.request_repaint()
@@ -341,7 +342,7 @@ impl RsBoardApp {
       hotkey,
       tray,
       surface: WindowSurface::Hidden,
-      editor_window_target: None,
+      capture_surfaces,
       phase: Phase::Idle,
       next_capture_sequence: 0,
       next_stash_sequence: 0,
@@ -437,6 +438,7 @@ impl RsBoardApp {
     }
     let request_id = Uuid::new_v4();
     let capture_sequence = next_sequence(&mut self.next_capture_sequence);
+    self.capture_surfaces.remember_frontmost_application();
     let performance = PerformanceContext::capture(request_id, capture_sequence);
     PerformanceTimer::started_at(
       "capture.request.dispatch",
@@ -474,21 +476,21 @@ impl RsBoardApp {
           )
           .finish_error(&error);
           self.phase = Phase::Idle;
+          self.capture_surfaces.hide_active();
           self.library_error = Some(error.to_string());
           self.show_library_window(context);
           return;
         }
       };
-    self.phase = Phase::Capturing { request_id, capture_sequence };
+    let display_id = prepared_capture.display().display_id;
+    self.phase = Phase::Capturing { request_id, capture_sequence, display_id };
     self.capture_presentation_trace = Some(CapturePresentationTrace {
       performance,
       started_at: trigger.received_at,
       trigger: trigger.source,
       pixel_size: None,
     });
-    self.surface = WindowSurface::Hidden;
     self.library_error = None;
-    context.send_viewport_cmd(ViewportCommand::Visible(false));
     self.update_tray();
     let spawn_result = self.spawn_worker_traced(context, performance, "capture", move || {
       let timer = PerformanceTimer::start(
@@ -518,6 +520,7 @@ impl RsBoardApp {
       )
       .finish_error(&error);
       self.phase = Phase::Idle;
+      self.capture_surfaces.hide_active();
       self.library_error = Some(format!("无法启动截图任务：{error}"));
       self.show_library_window(context);
       self.update_tray();
@@ -916,26 +919,37 @@ impl RsBoardApp {
             completed_at,
           )
           .finish_ok();
-          if self.phase != (Phase::Capturing { request_id, capture_sequence }) {
-            if self.capture_presentation_trace.is_some_and(|trace| trace.performance == performance)
-            {
-              let trace = self.capture_presentation_trace.take().expect("trace checked above");
-              PerformanceTimer::started_at(
-                "capture.request.total",
-                trace.performance,
-                PerformanceDetails::default().trigger(trace.trigger),
-                trace.started_at,
-              )
-              .finish_stale();
+          let expected_display_id = match self.phase {
+            Phase::Capturing {
+              request_id: current_request,
+              capture_sequence: current_sequence,
+              display_id,
+            } if current_request == request_id && current_sequence == capture_sequence => {
+              display_id
             }
-            record(
-              "capture.result",
-              performance,
-              PerformanceDetails::default(),
-              PerformanceOutcome::Stale,
-            );
-            continue;
-          }
+            _ => {
+              if self
+                .capture_presentation_trace
+                .is_some_and(|trace| trace.performance == performance)
+              {
+                let trace = self.capture_presentation_trace.take().expect("trace checked above");
+                PerformanceTimer::started_at(
+                  "capture.request.total",
+                  trace.performance,
+                  PerformanceDetails::default().trigger(trace.trigger),
+                  trace.started_at,
+                )
+                .finish_stale();
+              }
+              record(
+                "capture.result",
+                performance,
+                PerformanceDetails::default(),
+                PerformanceOutcome::Stale,
+              );
+              continue;
+            }
+          };
           let session_result = match result {
             Err(error) => Err(error),
             Ok(frame) => {
@@ -944,17 +958,20 @@ impl RsBoardApp {
                 performance,
                 PerformanceDetails::default().pixel_size(frame.pixel_size),
               );
-              let result =
-                if frame.request_id != request_id || frame.capture_sequence != capture_sequence {
-                  Err("capture result correlation did not match the active request".to_owned())
-                } else {
-                  let bounds = frame.display_bounds_global;
-                  let pixel_size = frame.pixel_size;
-                  self
-                    .session_from_capture(frame, context)
-                    .map(|session| (session, bounds, pixel_size))
-                    .map_err(|error| error.to_string())
-                };
+              let result = if frame.request_id != request_id
+                || frame.capture_sequence != capture_sequence
+                || frame.display_id != expected_display_id
+              {
+                Err("capture result correlation did not match the active request".to_owned())
+              } else {
+                let bounds = frame.display_bounds_global;
+                let pixel_size = frame.pixel_size;
+                let display_id = frame.display_id;
+                self
+                  .session_from_capture(frame, context)
+                  .map(|session| (session, display_id, bounds, pixel_size))
+                  .map_err(|error| error.to_string())
+              };
               match &result {
                 Ok(_) => session_timer.finish_ok(),
                 Err(_) => session_timer.finish_error_code("capture.session_prepare_failed"),
@@ -963,7 +980,7 @@ impl RsBoardApp {
             }
           };
           match session_result {
-            Ok((session, bounds, pixel_size)) => {
+            Ok((session, display_id, bounds, pixel_size)) => {
               if let Some(trace) = self.capture_presentation_trace.as_mut()
                 && trace.performance == performance
               {
@@ -971,7 +988,7 @@ impl RsBoardApp {
               }
               self.session = Some(session);
               self.phase = Phase::Editing;
-              self.show_editor_window(context, Some(bounds));
+              self.show_editor_window(context, Some(display_id), Some(bounds));
             }
             Err(error) => {
               if let Some(trace) = self.capture_presentation_trace.take()
@@ -986,6 +1003,7 @@ impl RsBoardApp {
                 .finish_error_code("capture.request_failed");
               }
               self.phase = Phase::Idle;
+              self.capture_surfaces.hide_active();
               self.library_error = Some(error);
               self.show_library_window(context);
             }
@@ -1008,7 +1026,7 @@ impl RsBoardApp {
             Ok(session) => {
               self.session = Some(session);
               self.phase = Phase::Editing;
-              self.show_editor_window(context, None);
+              self.show_editor_window(context, None, None);
             }
             Err(error) => {
               self.phase = Phase::Idle;
@@ -1034,7 +1052,7 @@ impl RsBoardApp {
                 Ok(session) => {
                   self.session = Some(session);
                   self.phase = Phase::Editing;
-                  self.show_editor_window(context, None);
+                  self.show_editor_window(context, None, None);
                 }
                 Err(error) => {
                   self.phase = Phase::Idle;
@@ -1098,7 +1116,7 @@ impl RsBoardApp {
                 self.allow_close = true;
                 context.send_viewport_cmd(ViewportCommand::Close);
               } else {
-                self.hide_window(context);
+                self.hide_editor_window(context);
               }
               self.finish_persistence_trace_ok(request_id);
             }
@@ -1195,7 +1213,7 @@ impl RsBoardApp {
                 self.allow_close = true;
                 context.send_viewport_cmd(ViewportCommand::Close);
               } else {
-                self.hide_window(context);
+                self.hide_editor_window(context);
               }
               self.finish_persistence_trace_ok(request_id);
             }
@@ -1501,7 +1519,7 @@ impl RsBoardApp {
       SessionOrigin::ExistingDocument => {
         self.remember_tool_and_release_session();
         self.phase = Phase::Idle;
-        self.hide_window(context);
+        self.hide_editor_window(context);
       }
     }
     self.update_tray();
@@ -1513,7 +1531,12 @@ impl RsBoardApp {
     }
   }
 
-  fn show_editor_window(&mut self, context: &egui::Context, display_bounds: Option<[i32; 4]>) {
+  fn show_editor_window(
+    &mut self,
+    context: &egui::Context,
+    preferred_display_id: Option<u32>,
+    display_bounds: Option<[i32; 4]>,
+  ) {
     let window_timer = self.capture_presentation_trace.map(|trace| {
       PerformanceTimer::start(
         "capture.editor_commands.enqueue",
@@ -1521,34 +1544,36 @@ impl RsBoardApp {
         PerformanceDetails::default().trigger(trace.trigger),
       )
     });
-    self.surface = WindowSurface::Editor;
-    self.editor_window_target = display_bounds
-      .map(EditorWindowTarget::DisplayBounds)
-      .or_else(|| global_cursor_position().map(EditorWindowTarget::Cursor));
-    send_platform_fullscreen_command(context, false);
-    #[cfg(not(target_os = "macos"))]
-    match self.editor_window_target {
-      Some(EditorWindowTarget::DisplayBounds(bounds)) => {
-        context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(
-          bounds[0] as f32,
-          bounds[1] as f32,
-        )));
-        context.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(
-          bounds[2].max(1) as f32,
-          bounds[3].max(1) as f32,
-        )));
-      }
-      Some(EditorWindowTarget::Cursor([x, y])) => {
-        context.send_viewport_cmd(ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
-      }
-      None => {}
+    let display_id = preferred_display_id
+      .or_else(|| {
+        display_bounds.and_then(|bounds| self.capture_surfaces.display_for_bounds(bounds))
+      })
+      .or_else(|| {
+        global_cursor_position().and_then(|point| self.capture_surfaces.display_for_point(point))
+      })
+      .or_else(|| self.capture_surfaces.active_display_id())
+      .or_else(|| self.capture_surfaces.fallback_display());
+    let Some(display_id) = display_id else {
+      self.persistent_error = Some("没有可用的截图编辑窗口".into());
+      return;
+    };
+    let Some(session_id) = self.session.as_ref().map(|session| session.session_id) else {
+      return;
+    };
+    let request_id = self
+      .capture_presentation_trace
+      .and_then(|trace| trace.performance.request_id)
+      .unwrap_or(session_id);
+    let result = self
+      .capture_surfaces
+      .present(display_id, request_id)
+      .and_then(|_| self.capture_surfaces.begin_editing(display_id, session_id));
+    if let Err(error) = result {
+      self.persistent_error = Some(error.to_string());
+      self.capture_surfaces.hide_active();
+      return;
     }
-    context.send_viewport_cmd(ViewportCommand::Decorations(false));
-    context.send_viewport_cmd(ViewportCommand::Resizable(false));
-    send_platform_window_level_command(context, WindowLevel::AlwaysOnTop);
-    context.send_viewport_cmd(ViewportCommand::Visible(true));
-    send_platform_fullscreen_command(context, true);
-    context.send_viewport_cmd(ViewportCommand::Focus);
+    context.request_repaint();
     if let Some(timer) = window_timer {
       timer.finish_ok();
     }
@@ -1565,13 +1590,18 @@ impl RsBoardApp {
     context.send_viewport_cmd(ViewportCommand::Focus);
   }
 
-  fn hide_window(&mut self, context: &egui::Context) {
+  fn hide_library_window(&mut self, context: &egui::Context) {
     self.surface = WindowSurface::Hidden;
     send_platform_fullscreen_command(context, false);
     send_platform_window_level_command(context, WindowLevel::Normal);
     context.send_viewport_cmd(ViewportCommand::Decorations(true));
     context.send_viewport_cmd(ViewportCommand::Resizable(true));
     context.send_viewport_cmd(ViewportCommand::Visible(false));
+  }
+
+  fn hide_editor_window(&mut self, context: &egui::Context) {
+    self.capture_surfaces.hide_active();
+    context.request_repaint();
   }
 
   fn poll_external_events(&mut self, context: &egui::Context) {
@@ -1746,7 +1776,7 @@ impl RsBoardApp {
           ui.heading("RS Board");
           ui.separator();
           if self.phase.has_active_session() && ui.button("返回编辑器").clicked() {
-            self.show_editor_window(context, None);
+            self.show_editor_window(context, None, None);
           }
           if ui
             .add_enabled(self.phase == Phase::Idle, egui::Button::new("新截图"))
@@ -2092,7 +2122,7 @@ impl RsBoardApp {
             {
               self.remember_tool_and_release_session();
               self.phase = Phase::Idle;
-              self.hide_window(context);
+              self.hide_editor_window(context);
             }
           });
         });
@@ -2404,71 +2434,125 @@ impl RsBoardApp {
       });
     context.request_repaint_after(Duration::from_millis(250));
   }
+
+  fn show_capture_viewports(&mut self, context: &egui::Context) {
+    for viewport in self.capture_surfaces.viewport_specs() {
+      let is_active = viewport.is_active();
+      let lifecycle = viewport.lifecycle;
+      context.show_viewport_immediate(
+        viewport.viewport_id,
+        viewport.builder,
+        |ui, _viewport_class| {
+          if !is_active {
+            egui::CentralPanel::default()
+              .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
+              .show(ui, |_| {});
+            return;
+          }
+
+          let viewport_context = ui.ctx().clone();
+          if viewport_context.input(|input| input.viewport().close_requested())
+            && self.phase.has_active_session()
+          {
+            viewport_context.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.close_editor(&viewport_context);
+          }
+          if matches!(
+            lifecycle,
+            SurfaceLifecycle::Presenting { .. } | SurfaceLifecycle::Editing { .. }
+          ) && self.session.is_some()
+          {
+            self.show_editor_ui(ui, &viewport_context);
+            self.show_dialogs(&viewport_context);
+            self.show_toast(&viewport_context);
+            self.finish_capture_presentation_trace();
+          }
+        },
+      );
+    }
+  }
+
+  fn finish_capture_presentation_trace(&mut self) {
+    let Some(trace) = self.capture_presentation_trace.take() else {
+      return;
+    };
+    let mut details = PerformanceDetails::default().trigger(trace.trigger);
+    if let Some(pixel_size) = trace.pixel_size {
+      details = details.pixel_size(pixel_size);
+    }
+    let frame_timer = PerformanceTimer::started_at(
+      "capture.editor_frame_submitted",
+      trace.performance,
+      details,
+      trace.started_at,
+    );
+    let total_timer = PerformanceTimer::started_at(
+      "capture.request.total",
+      trace.performance,
+      details,
+      trace.started_at,
+    );
+    let matches_session = self
+      .session
+      .as_ref()
+      .is_some_and(|session| session.capture_sequence == trace.performance.capture_sequence);
+    if matches_session {
+      frame_timer.finish_ok();
+      total_timer.finish_ok();
+    } else {
+      frame_timer.finish_stale();
+      total_timer.finish_stale();
+    }
+  }
 }
 
 impl eframe::App for RsBoardApp {
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
     self.handle_worker_events(context);
     self.poll_external_events(context);
+    if self.capture_surfaces.should_refresh() {
+      match self.capture_surfaces.refresh_available_displays() {
+        Ok(DisplayRefreshOutcome::ActiveDisplayRemoved(_)) => {
+          self.capture_surfaces.hide_active();
+          if self.phase == Phase::Editing {
+            self.close_editor(context);
+          }
+        }
+        Ok(DisplayRefreshOutcome::Unchanged) => {}
+        Err(error) => eprintln!("capture_surface_refresh_failed error={error:?}"),
+      }
+    }
   }
 
-  fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+  fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     let context = ui.ctx().clone();
 
     if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
       context.send_viewport_cmd(ViewportCommand::CancelClose);
-      if self.surface == WindowSurface::Library && self.phase.has_active_session() {
-        self.show_editor_window(&context, None);
-      } else if self.phase == Phase::Idle {
-        self.hide_window(&context);
+      if self.surface == WindowSurface::Library || self.phase == Phase::Idle {
+        self.hide_library_window(&context);
       } else {
         self.request_quit(&context);
       }
     }
 
     match self.surface {
-      WindowSurface::Editor if self.session.is_some() => self.show_editor_ui(ui, &context),
       WindowSurface::Library => self.show_library_ui(ui, &context),
-      WindowSurface::Hidden | WindowSurface::Editor => {
+      WindowSurface::Hidden => {
         egui::CentralPanel::default()
           .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
           .show(ui, |_| {});
       }
     }
-    self.show_dialogs(&context);
-    self.show_toast(&context);
-    sync_native_window_style(frame, self.surface, self.editor_window_target);
-    if self.surface == WindowSurface::Editor
-      && let Some(trace) = self.capture_presentation_trace.take()
-    {
-      let mut details = PerformanceDetails::default().trigger(trace.trigger);
-      if let Some(pixel_size) = trace.pixel_size {
-        details = details.pixel_size(pixel_size);
-      }
-      let frame_timer = PerformanceTimer::started_at(
-        "capture.editor_frame_submitted",
-        trace.performance,
-        details,
-        trace.started_at,
-      );
-      let total_timer = PerformanceTimer::started_at(
-        "capture.request.total",
-        trace.performance,
-        details,
-        trace.started_at,
-      );
-      let matches_session = self
-        .session
-        .as_ref()
-        .is_some_and(|session| session.capture_sequence == trace.performance.capture_sequence);
-      if matches_session {
-        frame_timer.finish_ok();
-        total_timer.finish_ok();
-      } else {
-        frame_timer.finish_stale();
-        total_timer.finish_stale();
-      }
+    if self.capture_surfaces.active_display_id().is_none() {
+      self.show_dialogs(&context);
+      self.show_toast(&context);
     }
+    self.show_capture_viewports(&context);
+  }
+
+  fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    Color32::TRANSPARENT.to_normalized_gamma_f32()
   }
 }
 
@@ -2582,19 +2666,6 @@ fn library_document_description_height(ui: &egui::Ui) -> f32 {
     + ui.text_style_height(&egui::TextStyle::Small)
 }
 
-fn uses_screen_overlay(surface: WindowSurface) -> bool {
-  surface == WindowSurface::Editor
-}
-
-fn editor_window_target_point(target: EditorWindowTarget) -> [f64; 2] {
-  match target {
-    EditorWindowTarget::DisplayBounds([x, y, width, height]) => {
-      [x as f64 + width as f64 / 2.0, y as f64 + height as f64 / 2.0]
-    }
-    EditorWindowTarget::Cursor([x, y]) => [x as f64, y as f64],
-  }
-}
-
 #[cfg(not(target_os = "macos"))]
 fn send_platform_fullscreen_command(context: &egui::Context, fullscreen: bool) {
   context.send_viewport_cmd(ViewportCommand::Fullscreen(fullscreen));
@@ -2610,140 +2681,6 @@ fn send_platform_window_level_command(context: &egui::Context, level: WindowLeve
 
 #[cfg(target_os = "macos")]
 fn send_platform_window_level_command(_context: &egui::Context, _level: WindowLevel) {}
-
-#[cfg(target_os = "macos")]
-fn sync_native_window_style(
-  frame: &eframe::Frame,
-  surface: WindowSurface,
-  target: Option<EditorWindowTarget>,
-) {
-  use winit::platform::macos::WindowExtMacOS;
-
-  let Some(window) = frame.winit_window() else {
-    return;
-  };
-  let screen_overlay = uses_screen_overlay(surface);
-  if screen_overlay {
-    activate_macos_application();
-    if !window.simple_fullscreen() {
-      if let Some(target) = target {
-        let target_point = editor_window_target_point(target);
-        if let Some(monitor) = window
-          .available_monitors()
-          .find(|monitor| monitor_contains_logical_point(monitor, target_point))
-        {
-          window.set_outer_position(monitor.position());
-        }
-      }
-      if !window.is_borderless_game() {
-        window.set_borderless_game(true);
-      }
-      if window.has_shadow() {
-        window.set_has_shadow(false);
-      }
-      window.set_simple_fullscreen(true);
-    }
-    if window.simple_fullscreen() {
-      enforce_macos_screen_overlay_presentation();
-    }
-    set_macos_window_level(window, true);
-  } else {
-    if window.simple_fullscreen() {
-      window.set_simple_fullscreen(false);
-    }
-    set_macos_window_level(window, false);
-    if window.is_borderless_game() {
-      window.set_borderless_game(false);
-    }
-    if !window.has_shadow() {
-      window.set_has_shadow(true);
-    }
-  }
-}
-
-#[cfg(target_os = "macos")]
-fn activate_macos_application() {
-  use objc2::MainThreadMarker;
-  use objc2_app_kit::NSApplication;
-
-  let Some(mtm) = MainThreadMarker::new() else {
-    return;
-  };
-  let application = NSApplication::sharedApplication(mtm);
-  if !application.isActive() {
-    #[allow(deprecated)]
-    application.activateIgnoringOtherApps(true);
-  }
-}
-
-#[cfg(target_os = "macos")]
-fn enforce_macos_screen_overlay_presentation() {
-  use objc2::MainThreadMarker;
-  use objc2_app_kit::{NSApplication, NSApplicationPresentationOptions};
-
-  let Some(mtm) = MainThreadMarker::new() else {
-    return;
-  };
-  let application = NSApplication::sharedApplication(mtm);
-  let presentation =
-    NSApplicationPresentationOptions::HideDock | NSApplicationPresentationOptions::HideMenuBar;
-  if application.presentationOptions() != presentation {
-    application.setPresentationOptions(presentation);
-  }
-}
-
-#[cfg(target_os = "macos")]
-fn set_macos_window_level(window: &winit::window::Window, screen_overlay: bool) {
-  use objc2::{MainThreadMarker, rc::Retained};
-  use objc2_app_kit::{NSNormalWindowLevel, NSScreenSaverWindowLevel, NSView};
-  use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-  if MainThreadMarker::new().is_none() {
-    return;
-  }
-  let Ok(handle) = window.window_handle() else {
-    return;
-  };
-  let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-    return;
-  };
-  // SAFETY: the live AppKit window handle contains a valid NSView pointer and this runs on main.
-  let Some(view) = (unsafe { Retained::<NSView>::retain(handle.ns_view.as_ptr().cast()) }) else {
-    return;
-  };
-  let Some(window) = view.window() else {
-    return;
-  };
-  let level = if screen_overlay { NSScreenSaverWindowLevel } else { NSNormalWindowLevel };
-  if window.level() != level {
-    window.setLevel(level);
-  }
-}
-
-#[cfg(target_os = "macos")]
-fn monitor_contains_logical_point(
-  monitor: &winit::monitor::MonitorHandle,
-  point: [f64; 2],
-) -> bool {
-  let scale_factor = monitor.scale_factor();
-  if !scale_factor.is_finite() || scale_factor <= 0.0 {
-    return false;
-  }
-  let position = monitor.position().to_logical::<f64>(scale_factor);
-  let size = monitor.size().to_logical::<f64>(scale_factor);
-  point[0] >= position.x
-    && point[0] < position.x + size.width
-    && point[1] >= position.y
-    && point[1] < position.y + size.height
-}
-
-#[cfg(not(target_os = "macos"))]
-fn sync_native_window_style(
-  _frame: &eframe::Frame,
-  _surface: WindowSurface,
-  _target: Option<EditorWindowTarget>,
-) {
-}
 
 fn configure_egui(context: &egui::Context) {
   let mut fonts = egui::FontDefinitions::default();
@@ -2912,21 +2849,6 @@ mod tests {
     assert!((second_card.left() - first_card.right() - LIBRARY_GRID_GAP).abs() < 0.1);
     assert!(
       second_card.right() <= LIBRARY_SIZE.x - LIBRARY_PANEL_MARGIN - LIBRARY_SCROLLBAR_RESERVE
-    );
-  }
-
-  #[test]
-  fn only_editor_surface_uses_the_borderless_screen_overlay() {
-    assert!(!uses_screen_overlay(WindowSurface::Hidden));
-    assert!(!uses_screen_overlay(WindowSurface::Library));
-    assert!(uses_screen_overlay(WindowSurface::Editor));
-    assert_eq!(
-      editor_window_target_point(EditorWindowTarget::DisplayBounds([-1728, 0, 1728, 1117])),
-      [-864.0, 558.5]
-    );
-    assert_eq!(
-      editor_window_target_point(EditorWindowTarget::Cursor([2056, 640])),
-      [2056.0, 640.0]
     );
   }
 
