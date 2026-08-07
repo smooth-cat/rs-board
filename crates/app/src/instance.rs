@@ -13,7 +13,10 @@ use std::{
 use single_instance::SingleInstance;
 use thiserror::Error;
 
+#[cfg(not(target_os = "macos"))]
 const INSTANCE_NAME: &str = "com.linjiajian.rs-board";
+#[cfg(target_os = "macos")]
+const INSTANCE_LOCK_FILE: &str = ".instance.lock";
 
 pub enum InstanceRole {
   Primary(InstanceBridge),
@@ -39,15 +42,13 @@ impl InstanceBridge {
     startup_files: Vec<PathBuf>,
     wake: impl Fn() + Send + Sync + 'static,
   ) -> Result<InstanceRole, InstanceError> {
-    let guard =
-      SingleInstance::new(INSTANCE_NAME).map_err(|error| InstanceError::Lock(error.to_string()))?;
+    let guard = acquire_instance_guard(app_data_dir)?;
     let socket_path = instance_socket_path(app_data_dir);
     if !guard.is_single() {
       forward_to_primary(&socket_path, &startup_files)?;
       return Ok(InstanceRole::Secondary);
     }
 
-    fs::create_dir_all(app_data_dir)?;
     #[cfg(unix)]
     let receiver = start_listener(&socket_path, Arc::new(wake))?;
     #[cfg(not(unix))]
@@ -59,6 +60,19 @@ impl InstanceBridge {
   pub fn try_recv(&self) -> Option<Vec<PathBuf>> {
     self.receiver.try_recv().ok()
   }
+}
+
+fn acquire_instance_guard(app_data_dir: &Path) -> Result<SingleInstance, InstanceError> {
+  fs::create_dir_all(app_data_dir)?;
+
+  // macOS 版 single-instance 会把名称直接当作锁文件路径，因此必须使用当前用户
+  // Application Support 下的绝对路径，不能依赖 Finder 或终端启动时的工作目录。
+  #[cfg(target_os = "macos")]
+  let instance_name = app_data_dir.join(INSTANCE_LOCK_FILE).to_string_lossy().into_owned();
+  #[cfg(not(target_os = "macos"))]
+  let instance_name = INSTANCE_NAME.to_owned();
+
+  SingleInstance::new(&instance_name).map_err(|error| InstanceError::Lock(error.to_string()))
 }
 
 fn instance_socket_path(app_data_dir: &Path) -> PathBuf {
@@ -183,5 +197,23 @@ mod tests {
     let deliberately_long = PathBuf::from("a".repeat(500));
     let socket = instance_socket_path(&deliberately_long);
     assert!(socket.as_os_str().len() < 104);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn instance_lock_is_created_inside_the_app_data_directory() {
+    let root = std::env::temp_dir().join(format!("rs-board-instance-lock-{}", Uuid::new_v4()));
+    let lock_path = root.join(INSTANCE_LOCK_FILE);
+
+    let primary = acquire_instance_guard(&root).unwrap();
+    assert!(primary.is_single());
+    assert!(lock_path.is_file());
+
+    let secondary = acquire_instance_guard(&root).unwrap();
+    assert!(!secondary.is_single());
+
+    drop(secondary);
+    drop(primary);
+    fs::remove_dir_all(root).unwrap();
   }
 }

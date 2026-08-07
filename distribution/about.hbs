@@ -1,0 +1,34 @@
+RS Board Rust Dependency Notices
+================================
+
+This section lists third-party Rust crates in the normal dependency graph
+used to build RS Board for Apple Silicon macOS. It is generated from
+Cargo.lock with cargo-about 0.9.1 for the aarch64-apple-darwin target.
+
+License overview
+----------------
+{{#each overview}}
+- {{name}} ({{count}})
+{{/each}}
+
+Third-party crate inventory
+---------------------------
+{{#each crates}}
+- {{package.name}} {{package.version}} | SPDX: {{license}}{{#if package.repository}} | {{{package.repository}}}{{/if}}
+{{/each}}
+
+License texts and covered crates
+--------------------------------
+{{#each licenses}}
+================================================================================
+{{name}}
+SPDX identifier: {{id}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} | {{{crate.repository}}}{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

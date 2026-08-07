@@ -1,5 +1,7 @@
 # Rust
 /target
+/dist/
+/.release-tmp/
 **/*.rs.bk
 *.pdb
 *.rlib

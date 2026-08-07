@@ -2,6 +2,8 @@
 name = "app"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 common.workspace = true
@@ -92,6 +94,7 @@ smappservice-rs = "0.1.3"
 name = "RS Board"
 identifier = "com.linjiajian.rs-board"
 category = "public.app-category.productivity"
+icon = ["assets/AppIcon.icns"]
 osx_minimum_system_version = "13.0"
 osx_info_plist_exts = ["assets/macos-info-plist-ext.xml"]
-copyright = "Copyright (c) 2026 Lin Jiajian"
+copyright = "Copyright (c) 2026 smooth-cat"

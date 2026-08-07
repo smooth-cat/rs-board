@@ -21,6 +21,8 @@ impl StorePaths {
 
   pub fn new(root: impl Into<PathBuf>) -> Self {
     let root = root.into();
+    // 草稿固定保存在 draft/latest；正式讲义按 document UUID 分目录保存在
+    // documents/<document-uuid>/<document-uuid>.rsboard，并带有背景图和预览图。
     let draft_root = root.join("draft");
     let latest_draft = draft_root.join("latest");
     let documents_root = root.join("documents");

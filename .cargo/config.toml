@@ -1,2 +1,4 @@
 [env]
 MACOSX_DEPLOYMENT_TARGET = "13.0"
+[alias]
+dev = "run -p app -- --show"

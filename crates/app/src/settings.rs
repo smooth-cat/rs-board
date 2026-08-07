@@ -34,6 +34,8 @@ impl Default for Settings {
 
 impl Settings {
   pub fn app_data_dir() -> Result<PathBuf, SettingsError> {
+    // 由系统目录 API 按当前登录用户解析；macOS 下对应
+    // ~/Library/Application Support/com.linjiajian.RS-Board。
     ProjectDirs::from("com", "linjiajian", "RS Board")
       .map(|dirs| dirs.data_dir().to_path_buf())
       .ok_or(SettingsError::DataDirectoryUnavailable)
