@@ -8,6 +8,32 @@ use std::{
 use uuid::Uuid;
 
 use super::{StorageError, StorageResult};
+use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
+
+#[derive(Clone, Copy)]
+pub(crate) struct AtomicTrace<'a> {
+  pub context: &'a PerformanceContext,
+  pub workflow: &'static str,
+  pub resource: &'static str,
+}
+
+impl<'a> AtomicTrace<'a> {
+  pub fn new(
+    context: &'a PerformanceContext,
+    workflow: &'static str,
+    resource: &'static str,
+  ) -> Self {
+    Self { context, workflow, resource }
+  }
+
+  fn with_resource(self, resource: &'static str) -> Self {
+    Self { resource, ..self }
+  }
+
+  fn details(self) -> PerformanceDetails {
+    PerformanceDetails::default().workflow(self.workflow).resource(self.resource)
+  }
+}
 
 pub(crate) fn create_staging_dir(parent: &Path, prefix: &str) -> StorageResult<PathBuf> {
   std::fs::create_dir_all(parent)
@@ -24,17 +50,56 @@ pub(crate) fn create_staging_dir(parent: &Path, prefix: &str) -> StorageResult<P
 }
 
 pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> StorageResult<()> {
-  let mut file = OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .open(path)
-    .map_err(|error| StorageError::io("creating a file", error))?;
-  file.write_all(bytes).map_err(|error| StorageError::io("writing a file", error))?;
-  file.sync_all().map_err(|error| StorageError::io("syncing a file", error))?;
+  write_new_file_impl(path, bytes, None)
+}
+
+pub(crate) fn write_new_file_traced(
+  path: &Path,
+  bytes: &[u8],
+  trace: AtomicTrace<'_>,
+) -> StorageResult<()> {
+  write_new_file_impl(path, bytes, Some(trace))
+}
+
+fn write_new_file_impl(
+  path: &Path,
+  bytes: &[u8],
+  trace: Option<AtomicTrace<'_>>,
+) -> StorageResult<()> {
+  let details = trace.map(|trace| trace.details().byte_count(bytes.len()));
+  let mut file = measured(trace, "persistence.file.open", details, || {
+    OpenOptions::new()
+      .create_new(true)
+      .write(true)
+      .open(path)
+      .map_err(|error| StorageError::io("creating a file", error))
+  })?;
+  measured(trace, "persistence.file.write", details, || {
+    file.write_all(bytes).map_err(|error| StorageError::io("writing a file", error))
+  })?;
+  measured(trace, "persistence.file.sync", details, || {
+    file.sync_all().map_err(|error| StorageError::io("syncing a file", error))
+  })?;
   Ok(())
 }
 
 pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> StorageResult<()> {
+  write_file_atomically_impl(path, bytes, None)
+}
+
+pub(crate) fn write_file_atomically_traced(
+  path: &Path,
+  bytes: &[u8],
+  trace: AtomicTrace<'_>,
+) -> StorageResult<()> {
+  write_file_atomically_impl(path, bytes, Some(trace))
+}
+
+fn write_file_atomically_impl(
+  path: &Path,
+  bytes: &[u8],
+  trace: Option<AtomicTrace<'_>>,
+) -> StorageResult<()> {
   let parent = path.parent().ok_or_else(|| {
     StorageError::InvalidManifest("atomic destination has no parent directory".into())
   })?;
@@ -43,10 +108,12 @@ pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> StorageResult<
   let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("resource");
   let temporary = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
   let result = (|| {
-    write_new_file(&temporary, bytes)?;
-    std::fs::rename(&temporary, path)
-      .map_err(|error| StorageError::io("committing an atomic file", error))?;
-    sync_directory(parent)?;
+    write_new_file_impl(&temporary, bytes, trace)?;
+    measured(trace, "persistence.atomic_file.rename", trace.map(AtomicTrace::details), || {
+      std::fs::rename(&temporary, path)
+        .map_err(|error| StorageError::io("committing an atomic file", error))
+    })?;
+    sync_directory_impl(parent, trace.map(|trace| trace.with_resource("parent_directory")))?;
     Ok(())
   })();
   if result.is_err() {
@@ -56,39 +123,84 @@ pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> StorageResult<
 }
 
 pub(crate) fn sync_directory(path: &Path) -> StorageResult<()> {
-  File::open(path)
-    .and_then(|directory| directory.sync_all())
-    .map_err(|error| StorageError::io("syncing a directory", error))
+  sync_directory_impl(path, None)
+}
+
+fn sync_directory_impl(path: &Path, trace: Option<AtomicTrace<'_>>) -> StorageResult<()> {
+  measured(trace, "persistence.directory.sync", trace.map(AtomicTrace::details), || {
+    File::open(path)
+      .and_then(|directory| directory.sync_all())
+      .map_err(|error| StorageError::io("syncing a directory", error))
+  })
 }
 
 pub(crate) fn commit_new_directory(staging: &Path, destination: &Path) -> StorageResult<()> {
+  commit_new_directory_impl(staging, destination, None)
+}
+
+pub(crate) fn commit_new_directory_traced(
+  staging: &Path,
+  destination: &Path,
+  trace: AtomicTrace<'_>,
+) -> StorageResult<()> {
+  commit_new_directory_impl(staging, destination, Some(trace))
+}
+
+fn commit_new_directory_impl(
+  staging: &Path,
+  destination: &Path,
+  trace: Option<AtomicTrace<'_>>,
+) -> StorageResult<()> {
   if destination.exists() {
     return Err(StorageError::AlreadyExists(destination.to_path_buf()));
   }
   let parent = destination
     .parent()
     .ok_or_else(|| StorageError::InvalidManifest("directory destination has no parent".into()))?;
-  sync_directory(staging)?;
-  std::fs::rename(staging, destination)
-    .map_err(|error| StorageError::io("committing a directory", error))?;
-  sync_directory(parent)
+  sync_directory_impl(staging, trace.map(|trace| trace.with_resource("staging_directory")))?;
+  measured(trace, "persistence.directory.rename", trace.map(AtomicTrace::details), || {
+    std::fs::rename(staging, destination)
+      .map_err(|error| StorageError::io("committing a directory", error))
+  })?;
+  sync_directory_impl(parent, trace.map(|trace| trace.with_resource("parent_directory")))
 }
 
+#[cfg(test)]
 pub(crate) fn replace_directory(staging: &Path, destination: &Path) -> StorageResult<()> {
+  replace_directory_impl(staging, destination, None)
+}
+
+pub(crate) fn replace_directory_traced(
+  staging: &Path,
+  destination: &Path,
+  trace: AtomicTrace<'_>,
+) -> StorageResult<()> {
+  replace_directory_impl(staging, destination, Some(trace))
+}
+
+fn replace_directory_impl(
+  staging: &Path,
+  destination: &Path,
+  trace: Option<AtomicTrace<'_>>,
+) -> StorageResult<()> {
   let parent = destination
     .parent()
     .ok_or_else(|| StorageError::InvalidManifest("directory destination has no parent".into()))?;
-  sync_directory(staging)?;
+  sync_directory_impl(staging, trace.map(|trace| trace.with_resource("staging_directory")))?;
   if !destination.exists() {
-    std::fs::rename(staging, destination)
-      .map_err(|error| StorageError::io("committing a directory", error))?;
-    return sync_directory(parent);
+    measured(trace, "persistence.directory.rename", trace.map(AtomicTrace::details), || {
+      std::fs::rename(staging, destination)
+        .map_err(|error| StorageError::io("committing a directory", error))
+    })?;
+    return sync_directory_impl(parent, trace.map(|trace| trace.with_resource("parent_directory")));
   }
 
   #[cfg(target_os = "macos")]
   {
-    rename_swap(staging, destination)?;
-    sync_directory(parent)?;
+    measured(trace, "persistence.directory.swap", trace.map(AtomicTrace::details), || {
+      rename_swap(staging, destination)
+    })?;
+    sync_directory_impl(parent, trace.map(|trace| trace.with_resource("parent_directory")))?;
     // After the swap, staging names the previous committed directory. Failure to
     // clean it does not make the new commit fail; startup cleanup removes it.
     let _ = std::fs::remove_dir_all(staging);
@@ -98,16 +210,41 @@ pub(crate) fn replace_directory(staging: &Path, destination: &Path) -> StorageRe
   #[cfg(not(target_os = "macos"))]
   {
     let backup = parent.join(format!(".old-{}", Uuid::new_v4()));
-    std::fs::rename(destination, &backup)
-      .map_err(|error| StorageError::io("backing up a directory", error))?;
-    if let Err(error) = std::fs::rename(staging, destination) {
+    measured(trace, "persistence.directory.rename", trace.map(AtomicTrace::details), || {
+      std::fs::rename(destination, &backup)
+        .map_err(|error| StorageError::io("backing up a directory", error))
+    })?;
+    if let Err(error) =
+      measured(trace, "persistence.directory.rename", trace.map(AtomicTrace::details), || {
+        std::fs::rename(staging, destination)
+          .map_err(|error| StorageError::io("committing a replacement directory", error))
+      })
+    {
       let _ = std::fs::rename(&backup, destination);
-      return Err(StorageError::io("committing a replacement directory", error));
+      return Err(error);
     }
-    sync_directory(parent)?;
+    sync_directory_impl(parent, trace.map(|trace| trace.with_resource("parent_directory")))?;
     let _ = std::fs::remove_dir_all(backup);
     Ok(())
   }
+}
+
+fn measured<T>(
+  trace: Option<AtomicTrace<'_>>,
+  stage: &'static str,
+  details: Option<PerformanceDetails>,
+  operation: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<T> {
+  let timer =
+    trace.map(|trace| PerformanceTimer::start(stage, *trace.context, details.unwrap_or_default()));
+  let result = operation();
+  if let Some(timer) = timer {
+    match &result {
+      Ok(_) => timer.finish_ok(),
+      Err(error) => timer.finish_error(error),
+    }
+  }
+  result
 }
 
 pub(crate) fn remove_path_if_exists(path: &Path) -> StorageResult<()> {

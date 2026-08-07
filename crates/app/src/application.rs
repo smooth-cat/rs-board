@@ -26,6 +26,9 @@ use crate::{
   editor::{EditorAction, EditorController, EditorTool},
   export::{copy_image, encode_png, make_preview, write_png_atomically},
   instance::InstanceBridge,
+  performance::{
+    PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
+  },
   platform::{GlobalF1Hotkey, OpenFileBridge, global_cursor_position, set_launch_at_login},
   recent::RecentDocuments,
   renderer::render_document_to_image,
@@ -64,6 +67,7 @@ pub enum SessionOrigin {
 
 struct WorkingSession {
   session_id: Uuid,
+  capture_sequence: Option<u64>,
   origin: SessionOrigin,
   document: BoardDocument,
   history: CommandHistory,
@@ -75,13 +79,46 @@ struct WorkingSession {
   editor: EditorController,
 }
 
+struct SessionBackground {
+  data: BackgroundData,
+  pixels: Arc<[u8]>,
+}
+
 impl WorkingSession {
   fn is_dirty(&self) -> bool {
     self.document.is_dirty_against(self.dirty_baseline)
   }
 
-  fn persistence_context(&self, request_id: Uuid) -> PersistenceContext {
-    PersistenceContext::new(request_id, self.session_id)
+  fn persistence_context(
+    &self,
+    request_id: Uuid,
+    stash_sequence: Option<u64>,
+  ) -> PersistenceContext {
+    let context = PersistenceContext::new(request_id, self.session_id)
+      .with_sequences(self.capture_sequence, stash_sequence);
+    match self.origin {
+      SessionOrigin::LatestDraft { generation_id } => context.with_generation(generation_id),
+      SessionOrigin::NewCapture | SessionOrigin::ExistingDocument => context,
+    }
+  }
+
+  fn performance_context(
+    &self,
+    request_id: Uuid,
+    stash_sequence: Option<u64>,
+  ) -> PerformanceContext {
+    PerformanceContext {
+      request_id: Some(request_id),
+      session_id: Some(self.session_id),
+      capture_sequence: self.capture_sequence,
+      stash_sequence,
+      generation_id: match self.origin {
+        SessionOrigin::LatestDraft { generation_id } => Some(generation_id.as_uuid()),
+        SessionOrigin::NewCapture | SessionOrigin::ExistingDocument => None,
+      },
+      document_id: Some(self.document.document_id.as_uuid()),
+      revision: Some(self.document.revision),
+    }
   }
 
   fn image(&self) -> Option<RgbaImage> {
@@ -96,7 +133,7 @@ impl WorkingSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
   Idle,
-  Capturing { request_id: Uuid },
+  Capturing { request_id: Uuid, capture_sequence: u64 },
   Editing,
   Saving { request_id: Uuid },
   Stashing { request_id: Uuid, generation_id: GenerationId },
@@ -115,11 +152,33 @@ impl Phase {
 }
 
 enum WorkerEvent {
-  Capture { request_id: Uuid, result: Result<CaptureFrame, String> },
-  Open { request_id: Uuid, document_id: DocumentId, result: Result<LoadedDocument, String> },
-  Restore { request_id: Uuid, result: Result<Option<LoadedDraft>, String> },
-  Stash { request_id: Uuid, result: Result<LatestDraft, String> },
-  Save { request_id: Uuid, result: Result<SavedDocument, String> },
+  Capture {
+    request_id: Uuid,
+    capture_sequence: u64,
+    completed_at: Instant,
+    result: Result<CaptureFrame, String>,
+  },
+  Open {
+    request_id: Uuid,
+    document_id: DocumentId,
+    result: Result<LoadedDocument, String>,
+  },
+  Restore {
+    request_id: Uuid,
+    result: Result<Option<LoadedDraft>, String>,
+  },
+  Stash {
+    request_id: Uuid,
+    context: PersistenceContext,
+    completed_at: Instant,
+    result: Result<LatestDraft, String>,
+  },
+  Save {
+    request_id: Uuid,
+    context: PersistenceContext,
+    completed_at: Instant,
+    result: Result<SavedDocument, String>,
+  },
   Import(Result<ImportedDocument, String>),
   LibraryChanged(Result<Option<DocumentId>, String>),
   Auxiliary(Result<String, String>),
@@ -161,6 +220,34 @@ enum EditorWindowTarget {
   Cursor([i32; 2]),
 }
 
+#[derive(Clone, Copy)]
+struct CaptureTrigger {
+  source: &'static str,
+  received_at: Instant,
+}
+
+impl CaptureTrigger {
+  fn now(source: &'static str) -> Self {
+    Self { source, received_at: Instant::now() }
+  }
+}
+
+#[derive(Clone, Copy)]
+struct CapturePresentationTrace {
+  performance: PerformanceContext,
+  started_at: Instant,
+  trigger: &'static str,
+  pixel_size: Option<[u32; 2]>,
+}
+
+#[derive(Clone, Copy)]
+struct PersistenceUiTrace {
+  performance: PerformanceContext,
+  started_at: Instant,
+  workflow: &'static str,
+  pixel_size: [u32; 2],
+}
+
 pub struct RsBoardApp {
   store: LocalStore,
   settings_path: PathBuf,
@@ -173,6 +260,10 @@ pub struct RsBoardApp {
   surface: WindowSurface,
   editor_window_target: Option<EditorWindowTarget>,
   phase: Phase,
+  next_capture_sequence: u64,
+  next_stash_sequence: u64,
+  capture_presentation_trace: Option<CapturePresentationTrace>,
+  persistence_ui_trace: Option<PersistenceUiTrace>,
   session: Option<WorkingSession>,
   recent: RecentDocuments,
   draft_available: bool,
@@ -252,6 +343,10 @@ impl RsBoardApp {
       surface: WindowSurface::Hidden,
       editor_window_target: None,
       phase: Phase::Idle,
+      next_capture_sequence: 0,
+      next_stash_sequence: 0,
+      capture_presentation_trace: None,
+      persistence_ui_trace: None,
       session: None,
       recent,
       draft_available,
@@ -287,44 +382,146 @@ impl RsBoardApp {
     &self,
     context: &egui::Context,
     work: impl FnOnce() -> WorkerEvent + Send + 'static,
-  ) {
+  ) -> Result<(), std::io::Error> {
+    self.spawn_worker_traced(context, PerformanceContext::default(), "auxiliary", work)
+  }
+
+  fn spawn_worker_traced(
+    &self,
+    context: &egui::Context,
+    performance: PerformanceContext,
+    workflow: &'static str,
+    work: impl FnOnce() -> WorkerEvent + Send + 'static,
+  ) -> Result<(), std::io::Error> {
     let sender = self.worker_sender.clone();
     let context = context.clone();
-    let _ = thread::Builder::new().name("rs-board-worker".into()).spawn(move || {
+    let timer = PerformanceTimer::start(
+      "worker.spawn",
+      performance,
+      PerformanceDetails::default().workflow(workflow),
+    );
+    let result = thread::Builder::new().name("rs-board-worker".into()).spawn(move || {
+      let lifecycle_timer = PerformanceTimer::start(
+        "worker.lifecycle",
+        performance,
+        PerformanceDetails::default().workflow(workflow),
+      );
       let event = work();
+      lifecycle_timer.finish_ok();
       let _ = sender.send(event);
       context.request_repaint();
     });
+    match result {
+      Ok(_) => {
+        timer.finish_ok();
+        Ok(())
+      }
+      Err(error) => {
+        timer.finish_error(&error);
+        Err(error)
+      }
+    }
   }
 
-  fn start_capture(&mut self, context: &egui::Context) {
+  fn start_capture(&mut self, context: &egui::Context, trigger: CaptureTrigger) {
     if self.phase != Phase::Idle {
+      PerformanceTimer::started_at(
+        "capture.request.dispatch",
+        PerformanceContext::default(),
+        PerformanceDetails::default().trigger(trigger.source),
+        trigger.received_at,
+      )
+      .finish_rejected();
       self.set_toast("正在处理当前任务");
       return;
     }
     let request_id = Uuid::new_v4();
+    let capture_sequence = next_sequence(&mut self.next_capture_sequence);
+    let performance = PerformanceContext::capture(request_id, capture_sequence);
+    PerformanceTimer::started_at(
+      "capture.request.dispatch",
+      performance,
+      PerformanceDetails::default().trigger(trigger.source),
+      trigger.received_at,
+    )
+    .finish_ok();
     let capture_options = CaptureOptions { include_cursor: self.settings.include_cursor };
+    let cursor_timer = PerformanceTimer::start(
+      "capture.cursor.query",
+      performance,
+      PerformanceDetails::default().trigger(trigger.source),
+    );
     let cursor_position = global_cursor_position();
+    cursor_timer.finish_ok();
+    let prepare_timer = PerformanceTimer::start(
+      "capture.display.prepare",
+      performance,
+      PerformanceDetails::default().trigger(trigger.source),
+    );
     let prepared_capture =
       match prepare_display_capture_under_cursor_at(capture_options, cursor_position) {
-        Ok(prepared_capture) => prepared_capture,
+        Ok(prepared_capture) => {
+          prepare_timer.finish_ok();
+          prepared_capture
+        }
         Err(error) => {
+          prepare_timer.finish_error(&error);
+          PerformanceTimer::started_at(
+            "capture.request.total",
+            performance,
+            PerformanceDetails::default().trigger(trigger.source),
+            trigger.received_at,
+          )
+          .finish_error(&error);
           self.phase = Phase::Idle;
           self.library_error = Some(error.to_string());
           self.show_library_window(context);
           return;
         }
       };
-    self.phase = Phase::Capturing { request_id };
+    self.phase = Phase::Capturing { request_id, capture_sequence };
+    self.capture_presentation_trace = Some(CapturePresentationTrace {
+      performance,
+      started_at: trigger.received_at,
+      trigger: trigger.source,
+      pixel_size: None,
+    });
     self.surface = WindowSurface::Hidden;
     self.library_error = None;
     context.send_viewport_cmd(ViewportCommand::Visible(false));
     self.update_tray();
-    self.spawn_worker(context, move || WorkerEvent::Capture {
-      request_id,
-      result: capture_prepared_display(request_id, prepared_capture)
-        .map_err(|error| error.to_string()),
+    let spawn_result = self.spawn_worker_traced(context, performance, "capture", move || {
+      let timer = PerformanceTimer::start(
+        "capture.worker",
+        performance,
+        PerformanceDetails::default().trigger(trigger.source),
+      );
+      let result = capture_prepared_display(request_id, capture_sequence, prepared_capture);
+      match &result {
+        Ok(_) => timer.finish_ok(),
+        Err(error) => timer.finish_error(error),
+      }
+      WorkerEvent::Capture {
+        request_id,
+        capture_sequence,
+        completed_at: Instant::now(),
+        result: result.map_err(|error| error.to_string()),
+      }
     });
+    if let Err(error) = spawn_result {
+      self.capture_presentation_trace = None;
+      PerformanceTimer::started_at(
+        "capture.request.total",
+        performance,
+        PerformanceDetails::default().trigger(trigger.source),
+        trigger.received_at,
+      )
+      .finish_error(&error);
+      self.phase = Phase::Idle;
+      self.library_error = Some(format!("无法启动截图任务：{error}"));
+      self.show_library_window(context);
+      self.update_tray();
+    }
   }
 
   fn start_open_document(&mut self, document_id: DocumentId, context: &egui::Context) {
@@ -334,11 +531,15 @@ impl RsBoardApp {
     let request_id = Uuid::new_v4();
     self.phase = Phase::Opening { request_id, document_id };
     let store = self.store.clone();
-    self.spawn_worker(context, move || WorkerEvent::Open {
+    let spawn_result = self.spawn_worker(context, move || WorkerEvent::Open {
       request_id,
       document_id,
       result: store.open_document(document_id).map_err(|error| error.to_string()),
     });
+    if let Err(error) = spawn_result {
+      self.phase = Phase::Idle;
+      self.library_error = Some(format!("无法启动讲义打开任务：{error}"));
+    }
     self.update_tray();
   }
 
@@ -349,10 +550,14 @@ impl RsBoardApp {
     let request_id = Uuid::new_v4();
     self.phase = Phase::Restoring { request_id };
     let store = self.store.clone();
-    self.spawn_worker(context, move || WorkerEvent::Restore {
+    let spawn_result = self.spawn_worker(context, move || WorkerEvent::Restore {
       request_id,
       result: store.load_latest_draft().map_err(|error| error.to_string()),
     });
+    if let Err(error) = spawn_result {
+      self.phase = Phase::Idle;
+      self.library_error = Some(format!("无法启动草稿恢复任务：{error}"));
+    }
     self.update_tray();
   }
 
@@ -360,30 +565,74 @@ impl RsBoardApp {
     if self.phase != Phase::Editing {
       return;
     }
+    let started_at = Instant::now();
     let Some(session) = self.session.as_ref() else {
       return;
     };
     let request_id = Uuid::new_v4();
+    let performance = session.performance_context(request_id, None);
+    let pixel_size =
+      [session.document.canvas_size_px.width_px, session.document.canvas_size_px.height_px];
+    let snapshot_timer = PerformanceTimer::start(
+      "persistence.snapshot",
+      performance,
+      PerformanceDetails::default().workflow("save"),
+    );
     let snapshot = match session.document.snapshot(session.document.revision) {
-      Ok(snapshot) => snapshot,
+      Ok(snapshot) => {
+        snapshot_timer.finish_ok();
+        snapshot
+      }
       Err(error) => {
+        snapshot_timer.finish_error(&error);
+        PerformanceTimer::started_at(
+          "persistence.request_to_ui_complete",
+          performance,
+          PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
+          started_at,
+        )
+        .finish_error(&error);
         self.persistent_error = Some(error.to_string());
         return;
       }
     };
+    let persistence_context = session.persistence_context(request_id, None);
     let request = SaveRequest {
-      context: session.persistence_context(request_id),
+      context: persistence_context,
       snapshot,
       background: session.background.clone(),
     };
     self.phase = Phase::Saving { request_id };
+    self.persistence_ui_trace =
+      Some(PersistenceUiTrace { performance, started_at, workflow: "save", pixel_size });
     self.persistent_error = None;
     self.retry_kind = None;
     let store = self.store.clone();
-    self.spawn_worker(context, move || WorkerEvent::Save {
-      request_id,
-      result: store.save_document(request).map_err(|error| error.to_string()),
+    let spawn_result = self.spawn_worker_traced(context, performance, "save", move || {
+      let timer = PerformanceTimer::start(
+        "persistence.worker",
+        performance,
+        PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
+      );
+      let result = store.save_document(request);
+      match &result {
+        Ok(_) => timer.finish_ok(),
+        Err(error) => timer.finish_error(error),
+      }
+      WorkerEvent::Save {
+        request_id,
+        context: persistence_context,
+        completed_at: Instant::now(),
+        result: result.map_err(|error| error.to_string()),
+      }
     });
+    if let Err(error) = spawn_result {
+      self.finish_persistence_trace_error(request_id);
+      self.phase = Phase::Editing;
+      self.persistent_error = Some(format!("无法启动保存任务：{error}"));
+      self.retry_kind = Some(RetryKind::Save);
+      self.quit_after_persist = false;
+    }
     self.update_tray();
   }
 
@@ -391,6 +640,8 @@ impl RsBoardApp {
     if self.phase != Phase::Editing {
       return;
     }
+    let started_at = Instant::now();
+    let stash_sequence = next_sequence(&mut self.next_stash_sequence);
     let Some(session) = self.session.as_ref() else {
       return;
     };
@@ -399,27 +650,78 @@ impl RsBoardApp {
     }
     let request_id = Uuid::new_v4();
     let generation_id = GenerationId::new();
+    let performance = PerformanceContext {
+      generation_id: Some(generation_id.as_uuid()),
+      ..session.performance_context(request_id, Some(stash_sequence))
+    };
+    let pixel_size =
+      [session.document.canvas_size_px.width_px, session.document.canvas_size_px.height_px];
+    let snapshot_timer = PerformanceTimer::start(
+      "persistence.snapshot",
+      performance,
+      PerformanceDetails::default().workflow("stash"),
+    );
     let snapshot = match session.document.snapshot(session.document.revision) {
-      Ok(snapshot) => snapshot,
+      Ok(snapshot) => {
+        snapshot_timer.finish_ok();
+        snapshot
+      }
       Err(error) => {
+        snapshot_timer.finish_error(&error);
+        PerformanceTimer::started_at(
+          "persistence.request_to_ui_complete",
+          performance,
+          PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
+          started_at,
+        )
+        .finish_error(&error);
         self.persistent_error = Some(error.to_string());
         return;
       }
     };
+    let persistence_context =
+      session.persistence_context(request_id, Some(stash_sequence)).with_generation(generation_id);
     let request = StashRequest {
-      context: session.persistence_context(request_id),
+      context: persistence_context,
       generation_id,
       snapshot,
       background: session.background.clone(),
     };
     self.phase = Phase::Stashing { request_id, generation_id };
+    self.persistence_ui_trace =
+      Some(PersistenceUiTrace { performance, started_at, workflow: "stash", pixel_size });
     self.persistent_error = None;
     self.retry_kind = None;
     let store = self.store.clone();
-    self.spawn_worker(context, move || WorkerEvent::Stash {
-      request_id,
-      result: store.replace_latest_draft(request).map_err(|error| error.to_string()),
+    let spawn_result = self.spawn_worker_traced(context, performance, "stash", move || {
+      let timer = PerformanceTimer::start(
+        "persistence.worker",
+        performance,
+        PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
+      );
+      let result = store.replace_latest_draft(request);
+      match &result {
+        Ok(_) => timer.finish_ok(),
+        Err(error) => timer.finish_error(error),
+      }
+      WorkerEvent::Stash {
+        request_id,
+        context: persistence_context,
+        completed_at: Instant::now(),
+        result: result.map_err(|error| error.to_string()),
+      }
     });
+    if let Err(error) = spawn_result {
+      self.finish_persistence_trace_error(request_id);
+      if self.quit_after_persist {
+        self.allow_close = true;
+        context.send_viewport_cmd(ViewportCommand::Close);
+      } else {
+        self.phase = Phase::Editing;
+        self.persistent_error = Some(format!("无法启动暂存任务：{error}"));
+        self.retry_kind = Some(RetryKind::Stash);
+      }
+    }
     self.update_tray();
   }
 
@@ -437,9 +739,11 @@ impl RsBoardApp {
       manifest_path: path,
     };
     let store = self.store.clone();
-    self.spawn_worker(context, move || {
+    if let Err(error) = self.spawn_worker(context, move || {
       WorkerEvent::Import(store.import_document(request).map_err(|error| error.to_string()))
-    });
+    }) {
+      self.library_error = Some(format!("无法启动讲义导入任务：{error}"));
+    }
   }
 
   fn session_from_capture(
@@ -447,6 +751,7 @@ impl RsBoardApp {
     frame: CaptureFrame,
     context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
+    let performance = PerformanceContext::capture(frame.request_id, frame.capture_sequence);
     let [width_px, height_px] = frame.pixel_size;
     let canvas_size_px = SizePx::new(width_px, height_px);
     let bounds = frame.display_bounds_global;
@@ -466,44 +771,77 @@ impl RsBoardApp {
     )?;
     let pixels: Arc<[u8]> = Arc::from(frame.rgba_pixels);
     let background = BackgroundData::rgba8(width_px, height_px, Arc::clone(&pixels))?;
-    self.make_session(SessionOrigin::NewCapture, document, background, pixels, context)
+    self.make_session(
+      SessionOrigin::NewCapture,
+      Some(frame.capture_sequence),
+      document,
+      SessionBackground { data: background, pixels },
+      performance,
+      context,
+    )
   }
 
   fn session_from_loaded(
     &self,
     origin: SessionOrigin,
+    capture_sequence: Option<u64>,
     loaded: LoadedDocument,
+    performance: PerformanceContext,
     context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
     let (_, _, pixels) = loaded.background.decode_rgba8()?;
-    self.make_session(origin, loaded.document, loaded.background, pixels, context)
+    self.make_session(
+      origin,
+      capture_sequence,
+      loaded.document,
+      SessionBackground { data: loaded.background, pixels },
+      performance,
+      context,
+    )
   }
 
   fn make_session(
     &self,
     origin: SessionOrigin,
+    capture_sequence: Option<u64>,
     document: BoardDocument,
-    background: BackgroundData,
-    pixels: Arc<[u8]>,
+    background: SessionBackground,
+    performance: PerformanceContext,
     context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
     document.validate()?;
-    let texture = load_rgba_texture(
+    let texture_timer = PerformanceTimer::start(
+      "capture.background_texture.register",
+      PerformanceContext {
+        document_id: Some(document.document_id.as_uuid()),
+        revision: Some(document.revision),
+        ..performance
+      },
+      PerformanceDetails::default()
+        .pixel_size([document.canvas_size_px.width_px, document.canvas_size_px.height_px]),
+    );
+    let texture_result = load_rgba_texture(
       context,
       &format!("background-{}", document.document_id),
       document.canvas_size_px,
-      &pixels,
-    )?;
+      &background.pixels,
+    );
+    match &texture_result {
+      Ok(_) => texture_timer.finish_ok(),
+      Err(error) => texture_timer.finish_error(error),
+    }
+    let texture = texture_result?;
     let dirty_baseline = document.dirty_baseline();
     Ok(WorkingSession {
       session_id: Uuid::new_v4(),
+      capture_sequence,
       origin,
       document,
       history: CommandHistory::new(),
       dirty_baseline,
       element_clipboard: None,
-      background,
-      background_pixels: pixels,
+      background: background.data,
+      background_pixels: background.pixels,
       background_texture: texture,
       editor: EditorController::new(self.last_tool),
     })
@@ -519,26 +857,134 @@ impl RsBoardApp {
     self.toast = Some((message.into(), Instant::now()));
   }
 
+  fn persistence_trace_for(&self, request_id: Uuid) -> Option<PersistenceUiTrace> {
+    self.persistence_ui_trace.filter(|trace| trace.performance.request_id == Some(request_id))
+  }
+
+  fn finish_persistence_trace_ok(&mut self, request_id: Uuid) {
+    let Some(trace) = self.persistence_trace_for(request_id) else {
+      return;
+    };
+    self.persistence_ui_trace = None;
+    PerformanceTimer::started_at(
+      "persistence.request_to_ui_complete",
+      trace.performance,
+      PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
+      trace.started_at,
+    )
+    .finish_ok();
+  }
+
+  fn finish_persistence_trace_error(&mut self, request_id: Uuid) {
+    let Some(trace) = self.persistence_trace_for(request_id) else {
+      return;
+    };
+    self.persistence_ui_trace = None;
+    PerformanceTimer::started_at(
+      "persistence.request_to_ui_complete",
+      trace.performance,
+      PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
+      trace.started_at,
+    )
+    .finish_error_code("persistence.ui_failed");
+  }
+
+  fn finish_persistence_trace_stale(&mut self, request_id: Uuid) {
+    let Some(trace) = self.persistence_trace_for(request_id) else {
+      return;
+    };
+    self.persistence_ui_trace = None;
+    PerformanceTimer::started_at(
+      "persistence.request_to_ui_complete",
+      trace.performance,
+      PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
+      trace.started_at,
+    )
+    .finish_stale();
+  }
+
   fn handle_worker_events(&mut self, context: &egui::Context) {
     let events: Vec<_> = self.worker_receiver.try_iter().collect();
     for event in events {
       match event {
-        WorkerEvent::Capture { request_id, result }
-          if self.phase == Phase::Capturing { request_id } =>
-        {
-          match result.and_then(|frame| {
-            let bounds = frame.display_bounds_global;
-            self
-              .session_from_capture(frame, context)
-              .map(|session| (session, bounds))
-              .map_err(|error| error.to_string())
-          }) {
-            Ok((session, bounds)) => {
+        WorkerEvent::Capture { request_id, capture_sequence, completed_at, result } => {
+          let performance = PerformanceContext::capture(request_id, capture_sequence);
+          PerformanceTimer::started_at(
+            "capture.worker_to_ui",
+            performance,
+            PerformanceDetails::default(),
+            completed_at,
+          )
+          .finish_ok();
+          if self.phase != (Phase::Capturing { request_id, capture_sequence }) {
+            if self.capture_presentation_trace.is_some_and(|trace| trace.performance == performance)
+            {
+              let trace = self.capture_presentation_trace.take().expect("trace checked above");
+              PerformanceTimer::started_at(
+                "capture.request.total",
+                trace.performance,
+                PerformanceDetails::default().trigger(trace.trigger),
+                trace.started_at,
+              )
+              .finish_stale();
+            }
+            record(
+              "capture.result",
+              performance,
+              PerformanceDetails::default(),
+              PerformanceOutcome::Stale,
+            );
+            continue;
+          }
+          let session_result = match result {
+            Err(error) => Err(error),
+            Ok(frame) => {
+              let session_timer = PerformanceTimer::start(
+                "capture.session.prepare",
+                performance,
+                PerformanceDetails::default().pixel_size(frame.pixel_size),
+              );
+              let result =
+                if frame.request_id != request_id || frame.capture_sequence != capture_sequence {
+                  Err("capture result correlation did not match the active request".to_owned())
+                } else {
+                  let bounds = frame.display_bounds_global;
+                  let pixel_size = frame.pixel_size;
+                  self
+                    .session_from_capture(frame, context)
+                    .map(|session| (session, bounds, pixel_size))
+                    .map_err(|error| error.to_string())
+                };
+              match &result {
+                Ok(_) => session_timer.finish_ok(),
+                Err(_) => session_timer.finish_error_code("capture.session_prepare_failed"),
+              }
+              result
+            }
+          };
+          match session_result {
+            Ok((session, bounds, pixel_size)) => {
+              if let Some(trace) = self.capture_presentation_trace.as_mut()
+                && trace.performance == performance
+              {
+                trace.pixel_size = Some(pixel_size);
+              }
               self.session = Some(session);
               self.phase = Phase::Editing;
               self.show_editor_window(context, Some(bounds));
             }
             Err(error) => {
+              if let Some(trace) = self.capture_presentation_trace.take()
+                && trace.performance == performance
+              {
+                PerformanceTimer::started_at(
+                  "capture.request.total",
+                  trace.performance,
+                  PerformanceDetails::default().trigger(trace.trigger),
+                  trace.started_at,
+                )
+                .finish_error_code("capture.request_failed");
+              }
               self.phase = Phase::Idle;
               self.library_error = Some(error);
               self.show_library_window(context);
@@ -550,7 +996,13 @@ impl RsBoardApp {
         {
           match result.and_then(|loaded| {
             self
-              .session_from_loaded(SessionOrigin::ExistingDocument, loaded, context)
+              .session_from_loaded(
+                SessionOrigin::ExistingDocument,
+                None,
+                loaded,
+                PerformanceContext { request_id: Some(request_id), ..Default::default() },
+                context,
+              )
               .map_err(|error| error.to_string())
           }) {
             Ok(session) => {
@@ -570,7 +1022,15 @@ impl RsBoardApp {
           match result {
             Ok(Some(draft)) => {
               let origin = SessionOrigin::LatestDraft { generation_id: draft.generation_id };
-              match self.session_from_loaded(origin, draft.loaded, context) {
+              let capture_sequence = next_sequence(&mut self.next_capture_sequence);
+              let performance = PerformanceContext::capture(request_id, capture_sequence);
+              match self.session_from_loaded(
+                origin,
+                Some(capture_sequence),
+                draft.loaded,
+                performance,
+                context,
+              ) {
                 Ok(session) => {
                   self.session = Some(session);
                   self.phase = Phase::Editing;
@@ -593,8 +1053,31 @@ impl RsBoardApp {
             }
           }
         }
-        WorkerEvent::Stash { request_id, result } if matches!(self.phase, Phase::Stashing { request_id: current, .. } if current == request_id) =>
-        {
+        WorkerEvent::Stash { request_id, context: expected_context, completed_at, result } => {
+          if !matches!(self.phase, Phase::Stashing { request_id: current, .. } if current == request_id)
+          {
+            let performance = self
+              .persistence_trace_for(request_id)
+              .map(|trace| trace.performance)
+              .unwrap_or_else(|| performance_from_persistence_context(expected_context));
+            record(
+              "persistence.result",
+              performance,
+              PerformanceDetails::default().workflow("stash"),
+              PerformanceOutcome::Stale,
+            );
+            self.finish_persistence_trace_stale(request_id);
+            continue;
+          }
+          if let Some(trace) = self.persistence_trace_for(request_id) {
+            PerformanceTimer::started_at(
+              "persistence.worker_to_ui",
+              trace.performance,
+              PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
+              completed_at,
+            )
+            .finish_ok();
+          }
           let expected_generation = match self.phase {
             Phase::Stashing { generation_id, .. } => generation_id,
             _ => unreachable!(),
@@ -603,6 +1086,7 @@ impl RsBoardApp {
             Ok(stored)
               if self.persistence_result_matches(
                 stored.context,
+                expected_context,
                 stored.document_id,
                 stored.revision,
               ) && stored.generation_id == expected_generation =>
@@ -616,9 +1100,32 @@ impl RsBoardApp {
               } else {
                 self.hide_window(context);
               }
+              self.finish_persistence_trace_ok(request_id);
             }
-            Ok(_) => {}
+            Ok(_) => {
+              if let Some(trace) = self.persistence_trace_for(request_id) {
+                record(
+                  "persistence.result",
+                  trace.performance,
+                  PerformanceDetails::default()
+                    .workflow(trace.workflow)
+                    .pixel_size(trace.pixel_size),
+                  PerformanceOutcome::Stale,
+                );
+              }
+              self.finish_persistence_trace_error(request_id);
+              let error = "暂存结果与当前请求不匹配".to_owned();
+              if self.quit_after_persist {
+                self.allow_close = true;
+                context.send_viewport_cmd(ViewportCommand::Close);
+              } else {
+                self.phase = Phase::Editing;
+                self.persistent_error = Some(error);
+                self.retry_kind = Some(RetryKind::Stash);
+              }
+            }
             Err(error) => {
+              self.finish_persistence_trace_error(request_id);
               if self.quit_after_persist {
                 self.allow_close = true;
                 context.send_viewport_cmd(ViewportCommand::Close);
@@ -630,19 +1137,59 @@ impl RsBoardApp {
             }
           }
         }
-        WorkerEvent::Save { request_id, result } if self.phase == Phase::Saving { request_id } => {
+        WorkerEvent::Save { request_id, context: expected_context, completed_at, result } => {
+          if self.phase != (Phase::Saving { request_id }) {
+            let performance = self
+              .persistence_trace_for(request_id)
+              .map(|trace| trace.performance)
+              .unwrap_or_else(|| performance_from_persistence_context(expected_context));
+            record(
+              "persistence.result",
+              performance,
+              PerformanceDetails::default().workflow("save"),
+              PerformanceOutcome::Stale,
+            );
+            self.finish_persistence_trace_stale(request_id);
+            continue;
+          }
+          let performance = self.persistence_trace_for(request_id).map(|trace| trace.performance);
+          if let Some(trace) = self.persistence_trace_for(request_id) {
+            PerformanceTimer::started_at(
+              "persistence.worker_to_ui",
+              trace.performance,
+              PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
+              completed_at,
+            )
+            .finish_ok();
+          }
           match result {
             Ok(saved)
               if self.persistence_result_matches(
                 saved.context,
+                expected_context,
                 saved.document_id,
                 saved.revision,
               ) =>
             {
-              self.start_post_save_tasks(&saved, context);
+              if let Some(performance) = performance {
+                self.start_post_save_tasks(&saved, performance, context);
+              }
               self.remember_tool_and_release_session();
               self.phase = Phase::Idle;
-              let _ = self.recent.refresh(&self.store);
+              if let Some(performance) = performance {
+                let recent_timer = PerformanceTimer::start(
+                  "post_save.recent_refresh",
+                  performance,
+                  PerformanceDetails::default().workflow("save"),
+                );
+                let result = self.recent.refresh(&self.store);
+                match &result {
+                  Ok(_) => recent_timer.finish_ok(),
+                  Err(error) => recent_timer.finish_error(error),
+                }
+              } else {
+                let _ = self.recent.refresh(&self.store);
+              }
               self.preview_textures.remove(&saved.document_id);
               if self.quit_after_persist {
                 self.allow_close = true;
@@ -650,9 +1197,25 @@ impl RsBoardApp {
               } else {
                 self.hide_window(context);
               }
+              self.finish_persistence_trace_ok(request_id);
             }
-            Ok(_) => {}
+            Ok(_) => {
+              if let Some(trace) = self.persistence_trace_for(request_id) {
+                record(
+                  "persistence.result",
+                  trace.performance,
+                  PerformanceDetails::default().workflow(trace.workflow),
+                  PerformanceOutcome::Stale,
+                );
+              }
+              self.finish_persistence_trace_error(request_id);
+              self.phase = Phase::Editing;
+              self.persistent_error = Some("保存结果与当前请求不匹配".to_owned());
+              self.retry_kind = Some(RetryKind::Save);
+              self.quit_after_persist = false;
+            }
             Err(error) => {
+              self.finish_persistence_trace_error(request_id);
               self.phase = Phase::Editing;
               self.persistent_error = Some(error);
               self.retry_kind = Some(RetryKind::Save);
@@ -700,25 +1263,59 @@ impl RsBoardApp {
   fn persistence_result_matches(
     &self,
     persistence: PersistenceContext,
+    expected: PersistenceContext,
     document_id: DocumentId,
     revision: u64,
   ) -> bool {
     self.session.as_ref().is_some_and(|session| {
-      persistence.session_id == session.session_id
+      persistence == expected
+        && persistence.session_id == session.session_id
+        && persistence.capture_sequence == session.capture_sequence
         && document_id == session.document.document_id
         && revision == session.document.revision
     })
   }
 
-  fn start_post_save_tasks(&self, saved: &SavedDocument, context: &egui::Context) {
+  fn start_post_save_tasks(
+    &mut self,
+    saved: &SavedDocument,
+    performance: PerformanceContext,
+    context: &egui::Context,
+  ) {
     let Some(session) = self.session.as_ref() else {
       return;
     };
-    let Ok(snapshot) = session.document.snapshot(saved.revision) else {
-      return;
+    let snapshot_timer = PerformanceTimer::start(
+      "post_save.snapshot",
+      performance,
+      PerformanceDetails::default().workflow("save"),
+    );
+    let snapshot = match session.document.snapshot(saved.revision) {
+      Ok(snapshot) => {
+        snapshot_timer.finish_ok();
+        snapshot
+      }
+      Err(error) => {
+        snapshot_timer.finish_error(&error);
+        return;
+      }
     };
-    let Some(background) = session.image() else {
-      return;
+    let background_timer = PerformanceTimer::start(
+      "post_save.background_copy",
+      performance,
+      PerformanceDetails::default()
+        .workflow("save")
+        .pixel_size([snapshot.canvas_size_px.width_px, snapshot.canvas_size_px.height_px]),
+    );
+    let background = match session.image() {
+      Some(background) => {
+        background_timer.finish_ok();
+        background
+      }
+      None => {
+        background_timer.finish_error_code("post_save.invalid_background_buffer");
+        return;
+      }
     };
     let copy_after_save = self.settings.copy_image_after_save;
     let draft_generation = match session.origin {
@@ -728,32 +1325,97 @@ impl RsBoardApp {
     let store = self.store.clone();
     let document_id = saved.document_id;
     let revision = saved.revision;
-    self.spawn_worker(context, move || {
+    let spawn_result = self.spawn_worker_traced(context, performance, "post_save", move || {
+      let total_timer = PerformanceTimer::start(
+        "post_save.total",
+        performance,
+        PerformanceDetails::default().workflow("save"),
+      );
+      let render_timer = PerformanceTimer::start(
+        "post_save.render",
+        performance,
+        PerformanceDetails::default().workflow("save"),
+      );
       let image = render_document_to_image(&snapshot, &background);
+      render_timer.finish_ok();
       let mut warnings = Vec::new();
+      let preview_timer = PerformanceTimer::start(
+        "post_save.preview_resize",
+        performance,
+        PerformanceDetails::default().workflow("save"),
+      );
       let preview = make_preview(&image, 480);
-      match encode_png(&preview).map_err(|error| error.to_string()).and_then(|bytes| {
-        store
-          .install_preview_if_current(document_id, revision, bytes)
-          .map_err(|error| error.to_string())
-      }) {
-        Ok(_) => {}
+      preview_timer.finish_ok();
+      let encode_timer = PerformanceTimer::start(
+        "post_save.preview_encode",
+        performance,
+        PerformanceDetails::default().workflow("save"),
+      );
+      let encoded = encode_png(&preview);
+      match &encoded {
+        Ok(_) => encode_timer.finish_ok(),
+        Err(error) => encode_timer.finish_error(error),
+      }
+      match encoded {
+        Ok(bytes) => {
+          let install_timer = PerformanceTimer::start(
+            "post_save.preview_install",
+            performance,
+            PerformanceDetails::default().workflow("save").byte_count(bytes.len()),
+          );
+          let result = store.install_preview_if_current(document_id, revision, bytes);
+          match &result {
+            Ok(_) => install_timer.finish_ok(),
+            Err(error) => install_timer.finish_error(error),
+          }
+          if let Err(error) = result {
+            warnings.push(format!("预览生成失败: {error}"));
+          }
+        }
         Err(error) => warnings.push(format!("预览生成失败: {error}")),
       }
-      if copy_after_save && let Err(error) = copy_image(&image) {
-        warnings.push(format!("剪贴板写入失败: {error}"));
+      if copy_after_save {
+        let clipboard_timer = PerformanceTimer::start(
+          "post_save.clipboard",
+          performance,
+          PerformanceDetails::default().workflow("save"),
+        );
+        let result = copy_image(&image);
+        match &result {
+          Ok(_) => clipboard_timer.finish_ok(),
+          Err(error) => clipboard_timer.finish_error(error),
+        }
+        if let Err(error) = result {
+          warnings.push(format!("剪贴板写入失败: {error}"));
+        }
       }
-      if let Some(generation_id) = draft_generation
-        && let Err(error) = store.delete_latest_if_generation(generation_id)
-      {
-        warnings.push(format!("草稿清理失败: {error}"));
+      if let Some(generation_id) = draft_generation {
+        let delete_timer = PerformanceTimer::start(
+          "post_save.draft_delete",
+          PerformanceContext { generation_id: Some(generation_id.as_uuid()), ..performance },
+          PerformanceDetails::default().workflow("save"),
+        );
+        let result = store.delete_latest_if_generation(generation_id);
+        match &result {
+          Ok(_) => delete_timer.finish_ok(),
+          Err(error) => delete_timer.finish_error(error),
+        }
+        if let Err(error) = result {
+          warnings.push(format!("草稿清理失败: {error}"));
+        }
       }
       if warnings.is_empty() {
+        total_timer.finish_ok();
         WorkerEvent::Auxiliary(Ok("讲义已保存".into()))
       } else {
-        WorkerEvent::Auxiliary(Err(warnings.join("；")))
+        let warning = warnings.join("；");
+        total_timer.finish_error_code("post_save.task_failed");
+        WorkerEvent::Auxiliary(Err(warning))
       }
     });
+    if let Err(error) = spawn_result {
+      self.set_toast(format!("保存后任务启动失败：{error}"));
+    }
   }
 
   fn handle_editor_actions(&mut self, actions: Vec<EditorAction>, context: &egui::Context) {
@@ -852,6 +1514,13 @@ impl RsBoardApp {
   }
 
   fn show_editor_window(&mut self, context: &egui::Context, display_bounds: Option<[i32; 4]>) {
+    let window_timer = self.capture_presentation_trace.map(|trace| {
+      PerformanceTimer::start(
+        "capture.editor_commands.enqueue",
+        trace.performance,
+        PerformanceDetails::default().trigger(trace.trigger),
+      )
+    });
     self.surface = WindowSurface::Editor;
     self.editor_window_target = display_bounds
       .map(EditorWindowTarget::DisplayBounds)
@@ -880,6 +1549,9 @@ impl RsBoardApp {
     context.send_viewport_cmd(ViewportCommand::Visible(true));
     send_platform_fullscreen_command(context, true);
     context.send_viewport_cmd(ViewportCommand::Focus);
+    if let Some(timer) = window_timer {
+      timer.finish_ok();
+    }
   }
 
   fn show_library_window(&mut self, context: &egui::Context) {
@@ -903,15 +1575,15 @@ impl RsBoardApp {
   }
 
   fn poll_external_events(&mut self, context: &egui::Context) {
-    let hotkey_pressed = self.hotkey.as_ref().is_some_and(GlobalF1Hotkey::poll_pressed);
-    if hotkey_pressed {
-      self.start_capture(context);
+    let hotkey_received_at = self.hotkey.as_ref().and_then(GlobalF1Hotkey::poll_capture_requested);
+    if let Some(received_at) = hotkey_received_at {
+      self.start_capture(context, CaptureTrigger { source: "hotkey", received_at });
     }
 
     let tray_action = self.tray.as_ref().and_then(TrayController::poll_action);
     if let Some(action) = tray_action {
       match action {
-        TrayAction::Capture => self.start_capture(context),
+        TrayAction::Capture => self.start_capture(context, CaptureTrigger::now("tray")),
         TrayAction::ShowRecent => {
           if matches!(self.phase, Phase::Saving { .. } | Phase::Stashing { .. }) {
             self.set_toast("保存或暂存完成后再打开最近讲义");
@@ -1081,7 +1753,7 @@ impl RsBoardApp {
             .on_hover_text("捕获鼠标所在屏幕 (F1)")
             .clicked()
           {
-            self.start_capture(context);
+            self.start_capture(context, CaptureTrigger::now("library"));
           }
           if ui
             .add_enabled(
@@ -1351,14 +2023,16 @@ impl RsBoardApp {
       LibraryAction::ExportBundle(document_id) => {
         if let Some(directory) = rfd::FileDialog::new().pick_folder() {
           let store = self.store.clone();
-          self.spawn_worker(context, move || {
+          if let Err(error) = self.spawn_worker(context, move || {
             WorkerEvent::Auxiliary(
               store
                 .export_document(document_id, &directory)
                 .map(|bundle| format!("已导出 {}.rsboard", bundle.stem))
                 .map_err(|error| error.to_string()),
             )
-          });
+          }) {
+            self.set_toast(format!("无法启动讲义导出任务：{error}"));
+          }
         }
       }
       LibraryAction::Delete(document_id) => self.delete_document_dialog = Some(document_id),
@@ -1366,14 +2040,14 @@ impl RsBoardApp {
   }
 
   fn start_render_export(
-    &self,
+    &mut self,
     document_id: DocumentId,
     destination: Option<PathBuf>,
     clipboard: bool,
     context: &egui::Context,
   ) {
     let store = self.store.clone();
-    self.spawn_worker(context, move || {
+    if let Err(error) = self.spawn_worker(context, move || {
       let result = (|| {
         let loaded = store.open_document(document_id).map_err(|error| error.to_string())?;
         let (_, _, pixels) = loaded.background.decode_rgba8().map_err(|error| error.to_string())?;
@@ -1394,7 +2068,9 @@ impl RsBoardApp {
         }
       })();
       WorkerEvent::Auxiliary(result)
-    });
+    }) {
+      self.set_toast(format!("无法启动图片导出任务：{error}"));
+    }
   }
 
   fn show_dialogs(&mut self, context: &egui::Context) {
@@ -1538,14 +2214,16 @@ impl RsBoardApp {
         let title = current_title.clone();
         self.rename_dialog = None;
         let store = self.store.clone();
-        self.spawn_worker(context, move || {
+        if let Err(error) = self.spawn_worker(context, move || {
           WorkerEvent::LibraryChanged(
             store
               .rename_document(document_id, title)
               .map(|_| Some(document_id))
               .map_err(|error| error.to_string()),
           )
-        });
+        }) {
+          self.library_error = Some(format!("无法启动讲义重命名任务：{error}"));
+        }
       }
     }
 
@@ -1571,11 +2249,13 @@ impl RsBoardApp {
       } else if confirm {
         self.delete_document_dialog = None;
         let store = self.store.clone();
-        self.spawn_worker(context, move || {
+        if let Err(error) = self.spawn_worker(context, move || {
           WorkerEvent::LibraryChanged(
             store.delete_document(document_id).map(|_| None).map_err(|error| error.to_string()),
           )
-        });
+        }) {
+          self.library_error = Some(format!("无法启动讲义删除任务：{error}"));
+        }
       }
     }
 
@@ -1601,11 +2281,13 @@ impl RsBoardApp {
       } else if confirm {
         self.delete_draft_dialog = false;
         let store = self.store.clone();
-        self.spawn_worker(context, move || {
+        if let Err(error) = self.spawn_worker(context, move || {
           WorkerEvent::LibraryChanged(
             store.delete_latest_draft().map(|_| None).map_err(|error| error.to_string()),
           )
-        });
+        }) {
+          self.library_error = Some(format!("无法启动草稿删除任务：{error}"));
+        }
       }
     }
 
@@ -1647,11 +2329,13 @@ impl RsBoardApp {
     } else if confirm {
       self.clear_confirmation_stage = 0;
       let store = self.store.clone();
-      self.spawn_worker(context, move || {
+      if let Err(error) = self.spawn_worker(context, move || {
         WorkerEvent::LibraryChanged(
           store.clear_all_content().map(|_| None).map_err(|error| error.to_string()),
         )
-      });
+      }) {
+        self.library_error = Some(format!("无法启动内容清理任务：{error}"));
+      }
     }
   }
 
@@ -1754,6 +2438,37 @@ impl eframe::App for RsBoardApp {
     self.show_dialogs(&context);
     self.show_toast(&context);
     sync_native_window_style(frame, self.surface, self.editor_window_target);
+    if self.surface == WindowSurface::Editor
+      && let Some(trace) = self.capture_presentation_trace.take()
+    {
+      let mut details = PerformanceDetails::default().trigger(trace.trigger);
+      if let Some(pixel_size) = trace.pixel_size {
+        details = details.pixel_size(pixel_size);
+      }
+      let frame_timer = PerformanceTimer::started_at(
+        "capture.editor_frame_submitted",
+        trace.performance,
+        details,
+        trace.started_at,
+      );
+      let total_timer = PerformanceTimer::started_at(
+        "capture.request.total",
+        trace.performance,
+        details,
+        trace.started_at,
+      );
+      let matches_session = self
+        .session
+        .as_ref()
+        .is_some_and(|session| session.capture_sequence == trace.performance.capture_sequence);
+      if matches_session {
+        frame_timer.finish_ok();
+        total_timer.finish_ok();
+      } else {
+        frame_timer.finish_stale();
+        total_timer.finish_stale();
+      }
+    }
   }
 }
 
@@ -1787,6 +2502,22 @@ fn load_rgba_texture(
     ),
     TextureOptions::LINEAR,
   ))
+}
+
+fn next_sequence(sequence: &mut u64) -> u64 {
+  *sequence = sequence.checked_add(1).expect("performance sequence exhausted");
+  *sequence
+}
+
+fn performance_from_persistence_context(context: PersistenceContext) -> PerformanceContext {
+  PerformanceContext {
+    request_id: Some(context.request_id),
+    session_id: Some(context.session_id),
+    capture_sequence: context.capture_sequence,
+    stash_sequence: context.stash_sequence,
+    generation_id: context.generation_id.map(GenerationId::as_uuid),
+    ..PerformanceContext::default()
+  }
 }
 
 fn fixed_height_centered_row<R>(

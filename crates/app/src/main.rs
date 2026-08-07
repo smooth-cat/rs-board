@@ -7,6 +7,7 @@ use std::{
 use app::{
   application::RsBoardApp,
   instance::{InstanceBridge, InstanceError, InstanceRole},
+  performance::{PerformanceLogError, PerformanceLogGuard},
   settings::{Settings, SettingsError},
 };
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), StartupError> {
+  let _performance_log = PerformanceLogGuard::from_environment()?;
   let arguments = StartupArguments::from_environment();
   let app_data_dir = Settings::app_data_dir()?;
   let egui_context = eframe::egui::Context::default();
@@ -142,6 +144,8 @@ enum StartupError {
   Settings(#[from] SettingsError),
   #[error(transparent)]
   Instance(#[from] InstanceError),
+  #[error(transparent)]
+  PerformanceLog(#[from] PerformanceLogError),
   #[error("无法创建原生窗口：{0}")]
   Native(#[from] eframe::Error),
 }

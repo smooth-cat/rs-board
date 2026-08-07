@@ -13,8 +13,9 @@ use uuid::Uuid;
 use super::{
   BackgroundData, GenerationId, ResourceName, StorageError, StorageResult, StorePaths,
   atomic::{
-    commit_new_directory, create_staging_dir, remove_path_if_exists, replace_directory,
-    sync_directory, write_file_atomically, write_new_file,
+    AtomicTrace, commit_new_directory, commit_new_directory_traced, create_staging_dir,
+    remove_path_if_exists, replace_directory_traced, sync_directory, write_file_atomically,
+    write_file_atomically_traced, write_new_file, write_new_file_traced,
   },
   bundle_name::choose_available_bundle_names,
   image_data::MAX_ENCODED_IMAGE_BYTES,
@@ -25,16 +26,41 @@ use super::{
   metadata::{COMMIT_MARKER_FILE_NAME, CommitKind, CommitMarker, SLOT_FILE_NAME, SlotMetadata},
   open_regular_file,
 };
+use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PersistenceContext {
   pub request_id: Uuid,
   pub session_id: Uuid,
+  pub capture_sequence: Option<u64>,
+  pub stash_sequence: Option<u64>,
+  pub generation_id: Option<GenerationId>,
 }
 
 impl PersistenceContext {
   pub fn new(request_id: Uuid, session_id: Uuid) -> Self {
-    Self { request_id, session_id }
+    Self {
+      request_id,
+      session_id,
+      capture_sequence: None,
+      stash_sequence: None,
+      generation_id: None,
+    }
+  }
+
+  pub fn with_sequences(
+    mut self,
+    capture_sequence: Option<u64>,
+    stash_sequence: Option<u64>,
+  ) -> Self {
+    self.capture_sequence = capture_sequence;
+    self.stash_sequence = stash_sequence;
+    self
+  }
+
+  pub fn with_generation(mut self, generation_id: GenerationId) -> Self {
+    self.generation_id = Some(generation_id);
+    self
   }
 }
 
@@ -161,49 +187,131 @@ impl LocalStore {
   }
 
   pub fn replace_latest_draft(&self, request: StashRequest) -> StorageResult<LatestDraft> {
-    let _guard = self.lock()?;
-    request.snapshot.validate().map_err(invalid_manifest)?;
-    validate_managed_names(&request.snapshot.to_document())?;
-    let document_id = request.snapshot.document_id;
-    let revision = request.snapshot.revision;
-    let background = request.background.normalized_png(
-      request.snapshot.canvas_size_px.width_px,
-      request.snapshot.canvas_size_px.height_px,
-    )?;
-    let manifest = encode_snapshot(&request.snapshot).map_err(format_error)?;
-    let staging = create_staging_dir(self.paths.draft_root(), "tmp-draft")?;
-    let commit_result = (|| {
-      let manifest_name = managed_manifest_name(document_id)?;
-      let background_name = ResourceName::new(request.snapshot.background.file.clone())?;
-      write_new_file(&staging.join(background_name.as_os_str()), &background)?;
-      write_new_file(&staging.join(manifest_name.as_os_str()), &manifest)?;
-      let slot = SlotMetadata::new(request.generation_id, document_id.to_string(), revision);
-      write_new_file(&staging.join(SLOT_FILE_NAME), &slot.encode()?)?;
-      let marker = CommitMarker::new(
-        CommitKind::Draft,
-        document_id.to_string(),
-        revision,
-        Some(request.generation_id),
+    let performance = persistence_performance_context(
+      request.context,
+      &request.snapshot,
+      Some(request.generation_id),
+    );
+    let pixel_size =
+      [request.snapshot.canvas_size_px.width_px, request.snapshot.canvas_size_px.height_px];
+    let total_timer = PerformanceTimer::start(
+      "persistence.store.total",
+      performance,
+      PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
+    );
+    let result = (|| {
+      let lock_timer = PerformanceTimer::start(
+        "persistence.store.lock_wait",
+        performance,
+        PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
       );
-      write_new_file(&staging.join(COMMIT_MARKER_FILE_NAME), &marker.encode()?)?;
-      replace_directory(&staging, self.paths.latest_draft())
-    })();
-    if commit_result.is_err() {
-      let _ = remove_path_if_exists(&staging);
-    }
-    commit_result?;
+      let guard_result = self.lock();
+      match &guard_result {
+        Ok(_) => lock_timer.finish_ok(),
+        Err(error) => lock_timer.finish_error(error),
+      }
+      let _guard = guard_result?;
+      request.snapshot.validate().map_err(invalid_manifest)?;
+      validate_managed_names(&request.snapshot.to_document())?;
+      let document_id = request.snapshot.document_id;
+      let revision = request.snapshot.revision;
+      let encode_timer = PerformanceTimer::start(
+        "persistence.background.normalize_png",
+        performance,
+        PerformanceDetails::default().workflow("stash").pixel_size([
+          request.snapshot.canvas_size_px.width_px,
+          request.snapshot.canvas_size_px.height_px,
+        ]),
+      );
+      let background_result = request.background.normalized_png(
+        request.snapshot.canvas_size_px.width_px,
+        request.snapshot.canvas_size_px.height_px,
+      );
+      match &background_result {
+        Ok(_) => encode_timer.finish_ok(),
+        Err(error) => encode_timer.finish_error(error),
+      }
+      let background = background_result?;
+      let manifest_timer = PerformanceTimer::start(
+        "persistence.manifest.encode",
+        performance,
+        PerformanceDetails::default().workflow("stash"),
+      );
+      let manifest_result = encode_snapshot(&request.snapshot).map_err(format_error);
+      match &manifest_result {
+        Ok(_) => manifest_timer.finish_ok(),
+        Err(error) => manifest_timer.finish_error(error),
+      }
+      let manifest = manifest_result?;
+      let staging_timer = PerformanceTimer::start(
+        "persistence.staging.create",
+        performance,
+        PerformanceDetails::default().workflow("stash"),
+      );
+      let staging_result = create_staging_dir(self.paths.draft_root(), "tmp-draft");
+      match &staging_result {
+        Ok(_) => staging_timer.finish_ok(),
+        Err(error) => staging_timer.finish_error(error),
+      }
+      let staging = staging_result?;
+      let commit_result = (|| {
+        let manifest_name = managed_manifest_name(document_id)?;
+        let background_name = ResourceName::new(request.snapshot.background.file.clone())?;
+        write_new_file_traced(
+          &staging.join(background_name.as_os_str()),
+          &background,
+          AtomicTrace::new(&performance, "stash", "background"),
+        )?;
+        write_new_file_traced(
+          &staging.join(manifest_name.as_os_str()),
+          &manifest,
+          AtomicTrace::new(&performance, "stash", "manifest"),
+        )?;
+        let slot = SlotMetadata::new(request.generation_id, document_id.to_string(), revision);
+        write_new_file_traced(
+          &staging.join(SLOT_FILE_NAME),
+          &slot.encode()?,
+          AtomicTrace::new(&performance, "stash", "slot"),
+        )?;
+        let marker = CommitMarker::new(
+          CommitKind::Draft,
+          document_id.to_string(),
+          revision,
+          Some(request.generation_id),
+        );
+        write_new_file_traced(
+          &staging.join(COMMIT_MARKER_FILE_NAME),
+          &marker.encode()?,
+          AtomicTrace::new(&performance, "stash", "commit_marker"),
+        )?;
+        replace_directory_traced(
+          &staging,
+          self.paths.latest_draft(),
+          AtomicTrace::new(&performance, "stash", "latest_draft"),
+        )
+      })();
+      if commit_result.is_err() {
+        let _ = remove_path_if_exists(&staging);
+      }
+      commit_result?;
 
-    Ok(LatestDraft {
-      context: request.context,
-      generation_id: request.generation_id,
-      document_id,
-      revision,
-      directory_path: self.paths.latest_draft().to_path_buf(),
-      manifest_path: self
-        .paths
-        .latest_draft()
-        .join(managed_manifest_name(document_id)?.as_os_str()),
-    })
+      Ok(LatestDraft {
+        context: request.context,
+        generation_id: request.generation_id,
+        document_id,
+        revision,
+        directory_path: self.paths.latest_draft().to_path_buf(),
+        manifest_path: self
+          .paths
+          .latest_draft()
+          .join(managed_manifest_name(document_id)?.as_os_str()),
+      })
+    })();
+    match &result {
+      Ok(_) => total_timer.finish_ok(),
+      Err(error) => total_timer.finish_error(error),
+    }
+    result
   }
 
   pub fn load_latest_draft(&self) -> StorageResult<Option<LoadedDraft>> {
@@ -264,8 +372,35 @@ impl LocalStore {
   }
 
   pub fn save_document(&self, request: SaveRequest) -> StorageResult<SavedDocument> {
-    let _guard = self.lock()?;
-    self.save_document_locked(request, CommitKind::Document)
+    let performance = persistence_performance_context(request.context, &request.snapshot, None);
+    let pixel_size =
+      [request.snapshot.canvas_size_px.width_px, request.snapshot.canvas_size_px.height_px];
+    let total_timer = PerformanceTimer::start(
+      "persistence.store.total",
+      performance,
+      PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
+    );
+    let lock_timer = PerformanceTimer::start(
+      "persistence.store.lock_wait",
+      performance,
+      PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
+    );
+    let guard_result = self.lock();
+    match &guard_result {
+      Ok(_) => lock_timer.finish_ok(),
+      Err(error) => lock_timer.finish_error(error),
+    }
+    let result = match guard_result {
+      Ok(_guard) => {
+        self.save_document_locked_impl(request, CommitKind::Document, Some((&performance, "save")))
+      }
+      Err(error) => Err(error),
+    };
+    match &result {
+      Ok(_) => total_timer.finish_ok(),
+      Err(error) => total_timer.finish_error(error),
+    }
+    result
   }
 
   pub fn open_document(&self, document_id: DocumentId) -> StorageResult<LoadedDocument> {
@@ -494,6 +629,15 @@ impl LocalStore {
     request: SaveRequest,
     commit_kind: CommitKind,
   ) -> StorageResult<SavedDocument> {
+    self.save_document_locked_impl(request, commit_kind, None)
+  }
+
+  fn save_document_locked_impl(
+    &self,
+    request: SaveRequest,
+    commit_kind: CommitKind,
+    trace: Option<(&PerformanceContext, &'static str)>,
+  ) -> StorageResult<SavedDocument> {
     request.snapshot.validate().map_err(invalid_manifest)?;
     validate_managed_names(&request.snapshot.to_document())?;
     let document_id = request.snapshot.document_id;
@@ -501,7 +645,11 @@ impl LocalStore {
     let directory = self.paths.document_dir(document_id);
     let manifest_name = managed_manifest_name(document_id)?;
     let background_name = ResourceName::new(request.snapshot.background.file.clone())?;
-    let manifest = encode_snapshot(&request.snapshot).map_err(format_error)?;
+    let manifest_result =
+      measured_store(trace, "persistence.manifest.encode", PerformanceDetails::default(), || {
+        encode_snapshot(&request.snapshot).map_err(format_error)
+      });
+    let manifest = manifest_result?;
 
     if directory.exists() {
       require_plain_directory(&directory)?;
@@ -513,26 +661,97 @@ impl LocalStore {
           "document ID does not match its managed directory".into(),
         ));
       }
-      if self.validate_managed_background(&directory, &request.snapshot).is_err() {
-        let background = request.background.normalized_png(
+      let validation = measured_store(
+        trace,
+        "persistence.background.validate_existing",
+        PerformanceDetails::default(),
+        || self.validate_managed_background(&directory, &request.snapshot),
+      );
+      if validation.is_err() {
+        let background = measured_store(
+          trace,
+          "persistence.background.normalize_png",
+          PerformanceDetails::default().pixel_size([
+            request.snapshot.canvas_size_px.width_px,
+            request.snapshot.canvas_size_px.height_px,
+          ]),
+          || {
+            request.background.normalized_png(
+              request.snapshot.canvas_size_px.width_px,
+              request.snapshot.canvas_size_px.height_px,
+            )
+          },
+        )?;
+        if let Some((performance, workflow)) = trace {
+          write_file_atomically_traced(
+            &directory.join(background_name.as_os_str()),
+            &background,
+            AtomicTrace::new(performance, workflow, "background"),
+          )?;
+        } else {
+          write_file_atomically(&directory.join(background_name.as_os_str()), &background)?;
+        }
+      }
+      if let Some((performance, workflow)) = trace {
+        write_file_atomically_traced(
+          &directory.join(manifest_name.as_os_str()),
+          &manifest,
+          AtomicTrace::new(performance, workflow, "manifest"),
+        )?;
+      } else {
+        write_file_atomically(&directory.join(manifest_name.as_os_str()), &manifest)?;
+      }
+    } else {
+      let background = measured_store(
+        trace,
+        "persistence.background.normalize_png",
+        PerformanceDetails::default().pixel_size([
           request.snapshot.canvas_size_px.width_px,
           request.snapshot.canvas_size_px.height_px,
-        )?;
-        write_file_atomically(&directory.join(background_name.as_os_str()), &background)?;
-      }
-      write_file_atomically(&directory.join(manifest_name.as_os_str()), &manifest)?;
-    } else {
-      let background = request.background.normalized_png(
-        request.snapshot.canvas_size_px.width_px,
-        request.snapshot.canvas_size_px.height_px,
+        ]),
+        || {
+          request.background.normalized_png(
+            request.snapshot.canvas_size_px.width_px,
+            request.snapshot.canvas_size_px.height_px,
+          )
+        },
       )?;
-      let staging = create_staging_dir(self.paths.documents_root(), "tmp-document")?;
+      let staging =
+        measured_store(trace, "persistence.staging.create", PerformanceDetails::default(), || {
+          create_staging_dir(self.paths.documents_root(), "tmp-document")
+        })?;
       let commit_result = (|| {
-        write_new_file(&staging.join(background_name.as_os_str()), &background)?;
-        write_new_file(&staging.join(manifest_name.as_os_str()), &manifest)?;
+        if let Some((performance, workflow)) = trace {
+          write_new_file_traced(
+            &staging.join(background_name.as_os_str()),
+            &background,
+            AtomicTrace::new(performance, workflow, "background"),
+          )?;
+          write_new_file_traced(
+            &staging.join(manifest_name.as_os_str()),
+            &manifest,
+            AtomicTrace::new(performance, workflow, "manifest"),
+          )?;
+        } else {
+          write_new_file(&staging.join(background_name.as_os_str()), &background)?;
+          write_new_file(&staging.join(manifest_name.as_os_str()), &manifest)?;
+        }
         let marker = CommitMarker::new(commit_kind, document_id.to_string(), revision, None);
-        write_new_file(&staging.join(COMMIT_MARKER_FILE_NAME), &marker.encode()?)?;
-        commit_new_directory(&staging, &directory)
+        if let Some((performance, workflow)) = trace {
+          write_new_file_traced(
+            &staging.join(COMMIT_MARKER_FILE_NAME),
+            &marker.encode()?,
+            AtomicTrace::new(performance, workflow, "commit_marker"),
+          )?;
+          commit_new_directory_traced(
+            &staging,
+            &directory,
+            AtomicTrace::new(performance, workflow, "document"),
+          )
+        } else {
+          write_new_file(&staging.join(COMMIT_MARKER_FILE_NAME), &marker.encode()?)?;
+          commit_new_directory(&staging, &directory)
+        }
       })();
       if commit_result.is_err() {
         let _ = remove_path_if_exists(&staging);
@@ -788,6 +1007,41 @@ fn valid_preview_path(directory: &Path, document: &BoardDocument) -> Option<Path
 
 fn parse_document_id(value: &str) -> Option<DocumentId> {
   Uuid::parse_str(value).ok().map(DocumentId::from_uuid)
+}
+
+fn persistence_performance_context(
+  context: PersistenceContext,
+  snapshot: &DocumentSnapshot,
+  generation_id: Option<GenerationId>,
+) -> PerformanceContext {
+  PerformanceContext {
+    request_id: Some(context.request_id),
+    session_id: Some(context.session_id),
+    capture_sequence: context.capture_sequence,
+    stash_sequence: context.stash_sequence,
+    generation_id: generation_id.or(context.generation_id).map(GenerationId::as_uuid),
+    document_id: Some(snapshot.document_id.as_uuid()),
+    revision: Some(snapshot.revision),
+  }
+}
+
+fn measured_store<T>(
+  trace: Option<(&PerformanceContext, &'static str)>,
+  stage: &'static str,
+  details: PerformanceDetails,
+  operation: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<T> {
+  let timer = trace.map(|(performance, workflow)| {
+    PerformanceTimer::start(stage, *performance, details.workflow(workflow))
+  });
+  let result = operation();
+  if let Some(timer) = timer {
+    match &result {
+      Ok(_) => timer.finish_ok(),
+      Err(error) => timer.finish_error(error),
+    }
+  }
+  result
 }
 
 fn invalid_manifest(error: impl std::fmt::Display) -> StorageError {

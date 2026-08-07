@@ -6,6 +6,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use xcap::Monitor;
 
+use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 use crate::platform::global_cursor_position;
 
 #[cfg(target_os = "macos")]
@@ -20,6 +21,7 @@ pub const MAX_CAPTURE_DIMENSION_PX: u32 = 8_192;
 #[derive(Clone, PartialEq)]
 pub struct CaptureFrame {
   pub request_id: Uuid,
+  pub capture_sequence: u64,
   pub rgba_pixels: Vec<u8>,
   pub pixel_size: [u32; 2],
   pub display_bounds_global: [i32; 4],
@@ -30,6 +32,7 @@ pub struct CaptureFrame {
 impl CaptureFrame {
   pub fn new(
     request_id: Uuid,
+    capture_sequence: u64,
     rgba_pixels: Vec<u8>,
     pixel_size: [u32; 2],
     display_bounds_global: [i32; 4],
@@ -38,6 +41,7 @@ impl CaptureFrame {
   ) -> Result<Self, CaptureError> {
     let frame = Self {
       request_id,
+      capture_sequence,
       rgba_pixels,
       pixel_size,
       display_bounds_global,
@@ -80,6 +84,7 @@ impl fmt::Debug for CaptureFrame {
     formatter
       .debug_struct("CaptureFrame")
       .field("request_id", &self.request_id)
+      .field("capture_sequence", &self.capture_sequence)
       .field("rgba_bytes", &self.rgba_pixels.len())
       .field("pixel_size", &self.pixel_size)
       .field("display_bounds_global", &self.display_bounds_global)
@@ -107,15 +112,23 @@ pub enum CaptureError {
 ///
 /// If the global cursor position cannot be queried, or no display contains
 /// that point, this falls back to the primary display.
-pub fn capture_display_under_cursor(request_id: Uuid) -> Result<CaptureFrame, CaptureError> {
-  capture_display_under_cursor_with_options(request_id, CaptureOptions::default())
+pub fn capture_display_under_cursor(
+  request_id: Uuid,
+  capture_sequence: u64,
+) -> Result<CaptureFrame, CaptureError> {
+  capture_display_under_cursor_with_options(request_id, capture_sequence, CaptureOptions::default())
 }
 
 pub fn capture_display_under_cursor_with_options(
   request_id: Uuid,
+  capture_sequence: u64,
   options: CaptureOptions,
 ) -> Result<CaptureFrame, CaptureError> {
-  capture_prepared_display(request_id, prepare_display_capture_under_cursor(options)?)
+  capture_prepared_display(
+    request_id,
+    capture_sequence,
+    prepare_display_capture_under_cursor(options)?,
+  )
 }
 
 /// Checks macOS Screen Recording access and asks the system to prompt when possible.
@@ -148,22 +161,35 @@ pub fn prepare_display_capture_under_cursor_at(
 
 pub fn capture_prepared_display(
   request_id: Uuid,
+  capture_sequence: u64,
   prepared: PreparedCapture,
 ) -> Result<CaptureFrame, CaptureError> {
-  capture_monitor(request_id, prepared.monitor, prepared.options)
+  let performance = PerformanceContext::capture(request_id, capture_sequence);
+  let timer =
+    PerformanceTimer::start("capture.api.total", performance, PerformanceDetails::default());
+  let result = capture_monitor(request_id, capture_sequence, prepared.monitor, prepared.options);
+  match &result {
+    Ok(_) => timer.finish_ok(),
+    Err(error) => timer.finish_error(error),
+  }
+  result
 }
 
 /// Captures the complete primary display.
-pub fn capture_primary_display(request_id: Uuid) -> Result<CaptureFrame, CaptureError> {
-  capture_primary_display_with_options(request_id, CaptureOptions::default())
+pub fn capture_primary_display(
+  request_id: Uuid,
+  capture_sequence: u64,
+) -> Result<CaptureFrame, CaptureError> {
+  capture_primary_display_with_options(request_id, capture_sequence, CaptureOptions::default())
 }
 
 pub fn capture_primary_display_with_options(
   request_id: Uuid,
+  capture_sequence: u64,
   options: CaptureOptions,
 ) -> Result<CaptureFrame, CaptureError> {
   ensure_screen_recording_permission()?;
-  capture_monitor(request_id, primary_monitor()?, options)
+  capture_monitor(request_id, capture_sequence, primary_monitor()?, options)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -213,14 +239,27 @@ fn primary_monitor() -> Result<Monitor, CaptureError> {
 
 fn capture_monitor(
   request_id: Uuid,
+  capture_sequence: u64,
   monitor: Monitor,
   options: CaptureOptions,
 ) -> Result<CaptureFrame, CaptureError> {
-  let x = monitor.x().map_err(map_xcap_error)?;
-  let y = monitor.y().map_err(map_xcap_error)?;
-  let logical_width = monitor.width().map_err(map_xcap_error)?;
-  let logical_height = monitor.height().map_err(map_xcap_error)?;
-  let scale_factor = monitor.scale_factor().map_err(map_xcap_error)?;
+  let performance = PerformanceContext::capture(request_id, capture_sequence);
+  let metadata_timer =
+    PerformanceTimer::start("capture.display.metadata", performance, PerformanceDetails::default());
+  let metadata_result = (|| {
+    Ok::<_, CaptureError>((
+      monitor.x().map_err(map_xcap_error)?,
+      monitor.y().map_err(map_xcap_error)?,
+      monitor.width().map_err(map_xcap_error)?,
+      monitor.height().map_err(map_xcap_error)?,
+      monitor.scale_factor().map_err(map_xcap_error)?,
+    ))
+  })();
+  match &metadata_result {
+    Ok(_) => metadata_timer.finish_ok(),
+    Err(error) => metadata_timer.finish_error(error),
+  }
+  let (x, y, logical_width, logical_height, scale_factor) = metadata_result?;
 
   validate_pixel_dimensions([logical_width, logical_height])?;
   validate_scale_factor(scale_factor)?;
@@ -234,11 +273,13 @@ fn capture_monitor(
     CaptureError::CaptureFailed("display height does not fit global coordinates".to_owned())
   })?;
 
-  let image = capture_monitor_image(&monitor, expected_pixel_size, options.include_cursor)?;
+  let image =
+    capture_monitor_image(&monitor, expected_pixel_size, options.include_cursor, performance)?;
   let pixel_size = [image.width(), image.height()];
 
   CaptureFrame::new(
     request_id,
+    capture_sequence,
     image.into_raw(),
     pixel_size,
     [x, y, bounds_width, bounds_height],
@@ -252,9 +293,10 @@ fn capture_monitor_image(
   monitor: &Monitor,
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
+  performance: PerformanceContext,
 ) -> Result<RgbaImage, CaptureError> {
   let display_id = monitor.id().map_err(map_xcap_error)?;
-  macos::capture_display(display_id, expected_pixel_size, include_cursor)
+  macos::capture_display(display_id, expected_pixel_size, include_cursor, performance)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -262,6 +304,7 @@ fn capture_monitor_image(
   monitor: &Monitor,
   _expected_pixel_size: [u32; 2],
   _include_cursor: bool,
+  _performance: PerformanceContext,
 ) -> Result<RgbaImage, CaptureError> {
   monitor.capture_image().map_err(map_xcap_error)
 }
@@ -335,6 +378,7 @@ mod tests {
   fn valid_frame(pixel_size: [u32; 2], rgba_pixels: Vec<u8>) -> CaptureFrame {
     CaptureFrame {
       request_id: Uuid::nil(),
+      capture_sequence: 1,
       rgba_pixels,
       pixel_size,
       display_bounds_global: [0, 0, 100, 100],

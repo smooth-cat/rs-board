@@ -33,6 +33,9 @@ use objc2_screen_capture_kit::{
 };
 
 use super::{CaptureError, validate_pixel_dimensions};
+use crate::performance::{
+  PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
+};
 
 const CONTENT_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -52,6 +55,8 @@ unsafe impl Send for ShareableContentSnapshot {}
 struct ScreenCaptureOutputIvars {
   sender: SyncSender<Result<RgbaImage, CaptureError>>,
   completed: AtomicBool,
+  performance: PerformanceContext,
+  details: PerformanceDetails,
 }
 
 impl ScreenCaptureOutputIvars {
@@ -86,7 +91,23 @@ define_class!(
         return;
       }
       if self.ivars().claim() {
-        self.ivars().send_claimed(sample_buffer_to_rgba(sample_buffer));
+        record(
+          "capture.frame.complete_received",
+          self.ivars().performance,
+          self.ivars().details,
+          PerformanceOutcome::Ok,
+        );
+        let timer = PerformanceTimer::start(
+          "capture.pixel_convert",
+          self.ivars().performance,
+          self.ivars().details,
+        );
+        let result = sample_buffer_to_rgba(sample_buffer);
+        match &result {
+          Ok(_) => timer.finish_ok(),
+          Err(error) => timer.finish_error(error),
+        }
+        self.ivars().send_claimed(result);
       }
     }
   }
@@ -96,10 +117,18 @@ define_class!(
 );
 
 impl ScreenCaptureOutput {
-  fn new(sender: SyncSender<Result<RgbaImage, CaptureError>>) -> Retained<Self> {
+  fn new(
+    sender: SyncSender<Result<RgbaImage, CaptureError>>,
+    performance: PerformanceContext,
+    details: PerformanceDetails,
+  ) -> Retained<Self> {
     assert_send_sync::<Self>();
-    let this = Self::alloc()
-      .set_ivars(ScreenCaptureOutputIvars { sender, completed: AtomicBool::new(false) });
+    let this = Self::alloc().set_ivars(ScreenCaptureOutputIvars {
+      sender,
+      completed: AtomicBool::new(false),
+      performance,
+      details,
+    });
     unsafe { msg_send![super(this), init] }
   }
 }
@@ -161,46 +190,93 @@ pub(super) fn capture_display(
   display_id: u32,
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
+  performance: PerformanceContext,
 ) -> Result<RgbaImage, CaptureError> {
-  autoreleasepool(|_| capture_display_inner(display_id, expected_pixel_size, include_cursor))
+  let details =
+    PerformanceDetails::default().display_id(display_id).pixel_size(expected_pixel_size);
+  let timer = PerformanceTimer::start("capture.macos_backend.total", performance, details);
+  let result = autoreleasepool(|_| {
+    capture_display_inner(display_id, expected_pixel_size, include_cursor, performance, details)
+  });
+  match &result {
+    Ok(_) => timer.finish_ok(),
+    Err(error) => timer.finish_error(error),
+  }
+  result
 }
 
 fn capture_display_inner(
   display_id: u32,
   expected_pixel_size: [u32; 2],
   include_cursor: bool,
+  performance: PerformanceContext,
+  details: PerformanceDetails,
 ) -> Result<RgbaImage, CaptureError> {
-  let content = shareable_content()?;
-  let display = find_display(&content, display_id)?;
-  let filter = content_filter(&content, &display)?;
-  let configuration = stream_configuration(expected_pixel_size, include_cursor);
-
-  let (frame_sender, frame_receiver) = sync_channel(1);
-  let output = ScreenCaptureOutput::new(frame_sender);
-  let sample_queue = DispatchQueue::new(SAMPLE_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
-  let cleanup_queue = DispatchQueue::new(CLEANUP_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
-  let stream = unsafe {
-    SCStream::initWithFilter_configuration_delegate(
-      SCStream::alloc(),
-      &filter,
-      &configuration,
-      None,
-    )
-  };
-  let stream_output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
-  unsafe {
-    stream.addStreamOutput_type_sampleHandlerQueue_error(
-      stream_output,
-      SCStreamOutputType::Screen,
-      Some(&sample_queue),
-    )
+  let content_timer = PerformanceTimer::start("capture.shareable_content", performance, details);
+  let content_result = shareable_content();
+  match &content_result {
+    Ok(_) => content_timer.finish_ok(),
+    Err(error) => content_timer.finish_error(error),
   }
-  .map_err(|error| capture_error_from_ns_error(&error, "adding stream output"))?;
+  let content = content_result?;
 
-  let session = CaptureSession { stream, output, sample_queue, cleanup_queue };
-  let session = start_stream(session)?;
+  let setup_timer = PerformanceTimer::start("capture.stream.setup", performance, details);
+  let setup_result = (|| {
+    let display = find_display(&content, display_id)?;
+    let filter = content_filter(&content, &display)?;
+    let configuration = stream_configuration(expected_pixel_size, include_cursor);
+
+    let (frame_sender, frame_receiver) = sync_channel(1);
+    let output = ScreenCaptureOutput::new(frame_sender, performance, details);
+    let sample_queue = DispatchQueue::new(SAMPLE_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
+    let cleanup_queue = DispatchQueue::new(CLEANUP_QUEUE_LABEL, DispatchQueueAttr::SERIAL);
+    let stream = unsafe {
+      SCStream::initWithFilter_configuration_delegate(
+        SCStream::alloc(),
+        &filter,
+        &configuration,
+        None,
+      )
+    };
+    let stream_output: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*output);
+    unsafe {
+      stream.addStreamOutput_type_sampleHandlerQueue_error(
+        stream_output,
+        SCStreamOutputType::Screen,
+        Some(&sample_queue),
+      )
+    }
+    .map_err(|error| capture_error_from_ns_error(&error, "adding stream output"))?;
+    Ok::<_, CaptureError>((
+      CaptureSession { stream, output, sample_queue, cleanup_queue },
+      frame_receiver,
+    ))
+  })();
+  match &setup_result {
+    Ok(_) => setup_timer.finish_ok(),
+    Err(error) => setup_timer.finish_error(error),
+  }
+  let (session, frame_receiver) = setup_result?;
+
+  let start_timer = PerformanceTimer::start("capture.stream.start", performance, details);
+  let start_result = start_stream(session);
+  match &start_result {
+    Ok(_) => start_timer.finish_ok(),
+    Err(error) => start_timer.finish_error(error),
+  }
+  let session = start_result?;
+  let frame_timer = PerformanceTimer::start("capture.frame.wait", performance, details);
   let frame_result = receive_result(frame_receiver, FRAME_TIMEOUT, "waiting for a complete frame");
+  match &frame_result {
+    Ok(_) => frame_timer.finish_ok(),
+    Err(error) => frame_timer.finish_error(error),
+  }
+  let stop_timer = PerformanceTimer::start("capture.stream.stop", performance, details);
   let stop_result = stop_stream(session);
+  match &stop_result {
+    Ok(_) => stop_timer.finish_ok(),
+    Err(error) => stop_timer.finish_error(error),
+  }
   let image = match (frame_result, stop_result) {
     (Err(error), _) => return Err(error),
     (Ok(_), Err(error)) => return Err(error),

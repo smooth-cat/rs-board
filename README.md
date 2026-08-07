@@ -30,6 +30,31 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+## 性能基线
+
+性能埋点默认关闭。使用 release 构建采样时，通过环境变量把非阻塞 JSONL 日志写入指定文件，并为本轮固定语料和路径分类：
+
+```bash
+RS_BOARD_PERF_LOG=/tmp/rs-board-perf-ui-hot.jsonl \
+RS_BOARD_PERF_CORPUS=ui \
+RS_BOARD_PERF_RUN_KIND=hot \
+cargo run -p app --release -- --show
+```
+
+日志文件使用 append 模式；每轮热路径实验应使用一个新的文件，并在同一进程连续执行至少 105 次，等待后台任务结束后正常退出应用再汇总。`RS_BOARD_PERF_CORPUS` 必须是 `solid`、`ui`、`photo`，`RS_BOARD_PERF_RUN_KIND` 必须是 `hot` 或 `cold`。汇总器会按 `run_id` 分别剔除每个热路径 run 的前 5 次，并要求剩余至少 100 次，多个不完整 run 不会被拼成完整样本。
+
+冷路径还必须设置 `RS_BOARD_PERF_COLD_SOURCE=startup|wake|display_change`，三种来源和三类语料分别至少采样 10 次。每个进程/run 只执行一次对应的启动、唤醒或显示器变化，再采集一次首次 `F1`；完成后正常退出并用新进程进行下一次，多个 run 可追加到同一个、只用于该实验的日志文件。汇总器要求至少 10 个独立 run 且每个 run 只有一个同组冷样本。4K 冷路径以 `max_us` 和 `within_limit` 检查 500ms 单次上限，不以 p95 代替。汇总单个阶段或全部阶段：
+
+```bash
+scripts/summarize-capture-performance.sh /tmp/rs-board-perf-ui-hot.jsonl \
+  capture.editor_frame_submitted
+scripts/summarize-capture-performance.sh /tmp/rs-board-perf-ui-hot.jsonl
+```
+
+汇总器拒绝 debug、非法或缺失标签、任何非成功测量、缺少唯一且位于末尾的 clean `run_complete`，以及包含 dropped event 的数据；只有 `complete=yes` 的行可作为基线。确认验收行的 `resolution` 是原生 `3840x2160` 或 `7680x4320`；没有尺寸字段的内部阶段显示 `-`，不能单独用于跨分辨率验收。截图呈现看 `capture.editor_frame_submitted`，暂存/保存的当前 UI 完成边界看 `persistence.request_to_ui_complete` 并区分 `workflow`，可靠存储提交看 `persistence.store.total`。
+
+`capture.editor_frame_submitted` 表示首个编辑器 UI pass 和窗口命令已提交，是当前 eframe 链路的代理终点，不等同于系统 compositor 已显示；原生双层窗口接入后再补充精确的合成完成事件。日志只包含关联 ID、尺寸、字节数、阶段、耗时和脱敏错误码，不记录错误文本、图像、文字、标题或完整路径。
+
 ## 打包
 
 ### 第 1 步: 安装发布工具（每台开发机仅需一次）

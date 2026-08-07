@@ -3,6 +3,7 @@ use std::{
   path::PathBuf,
   str::FromStr,
   sync::mpsc::{self, Receiver},
+  time::Instant,
 };
 use thiserror::Error;
 
@@ -22,7 +23,13 @@ use objc2_foundation::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformEvent {
-  CaptureRequested,
+  CaptureRequested { received_at: Instant },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimedHotkeyEvent {
+  event: GlobalHotKeyEvent,
+  received_at: Instant,
 }
 
 #[derive(Debug, Error)]
@@ -60,7 +67,7 @@ pub fn set_launch_at_login(_enabled: bool) -> Result<(), PlatformError> {
 pub struct GlobalF1Hotkey {
   manager: GlobalHotKeyManager,
   hotkey: HotKey,
-  events: Receiver<GlobalHotKeyEvent>,
+  events: Receiver<TimedHotkeyEvent>,
 }
 
 impl GlobalF1Hotkey {
@@ -85,7 +92,7 @@ impl GlobalF1Hotkey {
       .register(hotkey)
       .map_err(|source| PlatformError::Hotkey { operation: "registration", source })?;
     GlobalHotKeyEvent::set_event_handler(Some(move |event| {
-      let _ = sender.send(event);
+      let _ = sender.send(TimedHotkeyEvent { event, received_at: Instant::now() });
       wake();
     }));
 
@@ -98,11 +105,14 @@ impl GlobalF1Hotkey {
 
   /// Polls queued global-hotkey messages and returns the next app event.
   pub fn poll_event(&self) -> Option<PlatformEvent> {
-    self.events.try_iter().find_map(|event| map_hotkey_event(self.hotkey.id(), event))
+    self
+      .events
+      .try_iter()
+      .find_map(|event| map_hotkey_event(self.hotkey.id(), event.event, event.received_at))
   }
 
-  pub fn poll_pressed(&self) -> bool {
-    self.poll_event() == Some(PlatformEvent::CaptureRequested)
+  pub fn poll_capture_requested(&self) -> Option<Instant> {
+    self.poll_event().map(|PlatformEvent::CaptureRequested { received_at }| received_at)
   }
 
   pub fn update_shortcut(&mut self, shortcut: &str) -> Result<(), PlatformError> {
@@ -127,9 +137,13 @@ impl Drop for GlobalF1Hotkey {
   }
 }
 
-fn map_hotkey_event(hotkey_id: u32, event: GlobalHotKeyEvent) -> Option<PlatformEvent> {
+fn map_hotkey_event(
+  hotkey_id: u32,
+  event: GlobalHotKeyEvent,
+  received_at: Instant,
+) -> Option<PlatformEvent> {
   (event.id == hotkey_id && event.state == HotKeyState::Pressed)
-    .then_some(PlatformEvent::CaptureRequested)
+    .then_some(PlatformEvent::CaptureRequested { received_at })
 }
 
 /// Returns `[x, y]` in the global display coordinate space on macOS.
@@ -294,13 +308,17 @@ mod tests {
 
   #[test]
   fn maps_only_matching_pressed_event_to_capture_request() {
+    let received_at = Instant::now();
     let pressed = GlobalHotKeyEvent { id: HOTKEY_ID, state: HotKeyState::Pressed };
     let released = GlobalHotKeyEvent { id: HOTKEY_ID, state: HotKeyState::Released };
     let other = GlobalHotKeyEvent { id: HOTKEY_ID + 1, state: HotKeyState::Pressed };
 
-    assert_eq!(map_hotkey_event(HOTKEY_ID, pressed), Some(PlatformEvent::CaptureRequested));
-    assert_eq!(map_hotkey_event(HOTKEY_ID, released), None);
-    assert_eq!(map_hotkey_event(HOTKEY_ID, other), None);
+    assert_eq!(
+      map_hotkey_event(HOTKEY_ID, pressed, received_at),
+      Some(PlatformEvent::CaptureRequested { received_at })
+    );
+    assert_eq!(map_hotkey_event(HOTKEY_ID, released, received_at), None);
+    assert_eq!(map_hotkey_event(HOTKEY_ID, other, received_at), None);
   }
 
   #[cfg(target_os = "macos")]
