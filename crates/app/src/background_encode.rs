@@ -54,6 +54,11 @@ impl PreparedBackground {
     }
   }
 
+  #[cfg(test)]
+  pub(crate) fn pending_for_test(capture_sequence: u64, pixel_size: [u32; 2]) -> Self {
+    Self::pending(capture_sequence, pixel_size)
+  }
+
   pub fn ready(
     capture_sequence: u64,
     background: BackgroundData,
@@ -111,7 +116,7 @@ impl PreparedBackground {
     self.shared.changed.notify_all();
   }
 
-  fn supersede(&self) {
+  pub(crate) fn supersede(&self) {
     let mut state = lock_unpoisoned(&self.shared.state);
     if matches!(*state, PreparedState::Pending) {
       *state = PreparedState::Superseded;

@@ -26,6 +26,7 @@ use crate::{
     prewarm_capture_backend, request_screen_recording_permission,
   },
   capture_surface::{CaptureSurfaceCoordinator, DisplayRefreshOutcome, SurfaceLifecycle},
+  draft_coordinator::{DraftCoordinator, DraftCoordinatorError, DraftResult, StashJob},
   editor::{EditorAction, EditorController, EditorTool},
   export::{copy_image, encode_png, make_preview, write_png_atomically},
   instance::InstanceBridge,
@@ -37,9 +38,8 @@ use crate::{
   renderer::render_document_to_image,
   settings::{Settings, SettingsError},
   storage::{
-    GenerationId, ImportRequest, ImportedDocument, LatestDraft, LoadedDocument, LoadedDraft,
-    LocalStore, PersistenceContext, SaveRequest, SavedDocument, StashRequest, StorageError,
-    StorePaths,
+    GenerationId, ImportRequest, ImportedDocument, LoadedDocument, LoadedDraft, LocalStore,
+    PersistenceContext, SaveRequest, SavedDocument, StorageError, StorePaths,
   },
   tray::{TrayAction, TrayController},
 };
@@ -145,7 +145,6 @@ enum Phase {
   Capturing { request_id: Uuid, capture_sequence: u64, display_id: u32 },
   Editing,
   Saving { request_id: Uuid },
-  Stashing { request_id: Uuid, generation_id: GenerationId },
   Opening { request_id: Uuid, document_id: DocumentId },
   Restoring { request_id: Uuid },
   ConfirmingDiscard,
@@ -153,10 +152,7 @@ enum Phase {
 
 impl Phase {
   fn has_active_session(self) -> bool {
-    matches!(
-      self,
-      Self::Editing | Self::Saving { .. } | Self::Stashing { .. } | Self::ConfirmingDiscard
-    )
+    matches!(self, Self::Editing | Self::Saving { .. } | Self::ConfirmingDiscard)
   }
 }
 
@@ -175,12 +171,6 @@ enum WorkerEvent {
   Restore {
     request_id: Uuid,
     result: Result<Option<LoadedDraft>, String>,
-  },
-  Stash {
-    request_id: Uuid,
-    context: PersistenceContext,
-    completed_at: Instant,
-    result: Result<LatestDraft, String>,
   },
   Save {
     request_id: Uuid,
@@ -213,7 +203,6 @@ enum ExitChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryKind {
   Save,
-  Stash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +251,7 @@ pub struct RsBoardApp {
   surface: WindowSurface,
   capture_surfaces: CaptureSurfaceCoordinator,
   background_encoder: BackgroundEncodeScheduler,
+  draft_coordinator: DraftCoordinator,
   phase: Phase,
   next_capture_sequence: u64,
   next_stash_sequence: u64,
@@ -308,6 +298,10 @@ impl RsBoardApp {
       prewarm_capture_backend();
     }
     let (worker_sender, worker_receiver) = mpsc::channel();
+    let draft_coordinator = DraftCoordinator::new(store.clone(), {
+      let context = creation_context.egui_ctx.clone();
+      move || context.request_repaint()
+    })?;
     let open_file_bridge = OpenFileBridge::install();
     let mut library_error = None;
     let capture_surfaces = match CaptureSurfaceCoordinator::discover() {
@@ -356,6 +350,7 @@ impl RsBoardApp {
       surface: WindowSurface::Hidden,
       capture_surfaces,
       background_encoder: BackgroundEncodeScheduler::new(),
+      draft_coordinator,
       phase: Phase::Idle,
       next_capture_sequence: 0,
       next_stash_sequence: 0,
@@ -671,7 +666,7 @@ impl RsBoardApp {
     }
     let started_at = Instant::now();
     let stash_sequence = next_sequence(&mut self.next_stash_sequence);
-    let Some(session) = self.session.as_mut() else {
+    let Some(session) = self.session.as_ref() else {
       return;
     };
     if matches!(session.origin, SessionOrigin::ExistingDocument) {
@@ -708,65 +703,39 @@ impl RsBoardApp {
         return;
       }
     };
-    if session.prepared_background.needs_retry() {
-      let Some(image) = session.native_background.clone() else {
-        self.persistent_error = Some("背景编码失败且没有可用于重试的内存图像".into());
-        return;
-      };
-      session.prepared_background = self.background_encoder.submit(
-        session.prepared_background.capture_sequence(),
-        image,
-        performance,
-      );
-    }
-    let prepared_background = session.prepared_background.clone();
     let persistence_context =
       session.persistence_context(request_id, Some(stash_sequence)).with_generation(generation_id);
-    self.phase = Phase::Stashing { request_id, generation_id };
-    self.persistence_ui_trace =
-      Some(PersistenceUiTrace { performance, started_at, workflow: "stash", pixel_size });
-    self.persistent_error = None;
-    self.retry_kind = None;
-    let store = self.store.clone();
-    let spawn_result = self.spawn_worker_traced(context, performance, "stash", move || {
-      let timer = PerformanceTimer::start(
-        "persistence.worker",
+    let job = StashJob {
+      context: persistence_context,
+      generation_id,
+      snapshot,
+      prepared_background: session.prepared_background.clone(),
+      requested_at: started_at,
+    };
+    if let Err(error) = self.draft_coordinator.enqueue_commit(job) {
+      PerformanceTimer::started_at(
+        "persistence.request_to_ui_complete",
         performance,
         PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
-      );
-      let result = match prepared_background.wait() {
-        Ok(background) => store
-          .replace_latest_draft(StashRequest {
-            context: persistence_context,
-            generation_id,
-            snapshot,
-            background,
-          })
-          .map_err(|error| error.to_string()),
-        Err(error) => Err(error.to_string()),
-      };
-      match &result {
-        Ok(_) => timer.finish_ok(),
-        Err(_) => timer.finish_error_code("persistence.stash_failed"),
-      }
-      WorkerEvent::Stash {
-        request_id,
-        context: persistence_context,
-        completed_at: Instant::now(),
-        result,
-      }
-    });
-    if let Err(error) = spawn_result {
-      self.finish_persistence_trace_error(request_id);
-      if self.quit_after_persist {
-        self.allow_close = true;
-        context.send_viewport_cmd(ViewportCommand::Close);
-      } else {
-        self.phase = Phase::Editing;
-        self.persistent_error = Some(format!("无法启动暂存任务：{error}"));
-        self.retry_kind = Some(RetryKind::Stash);
-      }
+        started_at,
+      )
+      .finish_error(&error);
+      self.persistent_error = Some(error.to_string());
+      return;
     }
+
+    self.phase = Phase::Idle;
+    self.persistent_error = None;
+    self.retry_kind = None;
+    self.hide_editor_window(context);
+    self.remember_tool_and_release_session();
+    PerformanceTimer::started_at(
+      "persistence.request_to_ui_complete",
+      performance,
+      PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
+      started_at,
+    )
+    .finish_ok();
     self.update_tray();
   }
 
@@ -965,6 +934,137 @@ impl RsBoardApp {
     .finish_stale();
   }
 
+  fn handle_draft_results(&mut self, _context: &egui::Context) {
+    while let Some(event) = self.draft_coordinator.try_recv() {
+      match event {
+        DraftResult::Commit {
+          context: expected,
+          generation_id,
+          completed_at,
+          is_latest,
+          result,
+        } => {
+          let performance = PerformanceContext {
+            generation_id: Some(generation_id.as_uuid()),
+            ..performance_from_persistence_context(expected)
+          };
+          PerformanceTimer::started_at(
+            "persistence.worker_to_ui",
+            performance,
+            PerformanceDetails::default().workflow("stash"),
+            completed_at,
+          )
+          .finish_ok();
+          match *result {
+            Ok(stored) if stored.context == expected && stored.generation_id == generation_id => {
+              self.draft_available = true;
+              record(
+                "persistence.result",
+                performance,
+                PerformanceDetails::default().workflow("stash"),
+                if is_latest { PerformanceOutcome::Ok } else { PerformanceOutcome::Stale },
+              );
+            }
+            Ok(_) => {
+              self.draft_available = true;
+              self.report_background_failure(
+                performance,
+                is_latest,
+                "draft_result_mismatch",
+                "最新草稿暂存失败",
+              );
+            }
+            Err(error) => {
+              eprintln!(
+                "draft_commit_failed capture_sequence={:?} stash_sequence={:?} generation_id={} latest={} error={error}",
+                expected.capture_sequence, expected.stash_sequence, generation_id, is_latest,
+              );
+              self.report_background_failure(
+                performance,
+                is_latest,
+                "draft_commit_failed",
+                "最新草稿暂存失败",
+              );
+            }
+          }
+        }
+        DraftResult::DeleteIfGeneration { generation_id, result } => match result {
+          Ok(_) => {
+            self.draft_available = self.store.paths().latest_draft().exists();
+          }
+          Err(error) => {
+            eprintln!("draft_delete_generation_failed generation_id={generation_id} error={error}");
+            self.report_background_failure(
+              PerformanceContext {
+                generation_id: Some(generation_id.as_uuid()),
+                ..Default::default()
+              },
+              true,
+              "draft_delete_failed",
+              "草稿清理失败",
+            );
+          }
+        },
+        DraftResult::DeleteLatest { result } => match result {
+          Ok(_) => {
+            self.draft_available = self.store.paths().latest_draft().exists();
+          }
+          Err(error) => {
+            eprintln!("draft_delete_latest_failed error={error}");
+            self.report_background_failure(
+              PerformanceContext::default(),
+              true,
+              "draft_delete_failed",
+              "草稿删除失败",
+            );
+          }
+        },
+        DraftResult::ClearAll { result } => match result {
+          Ok(()) => {
+            self.draft_available = false;
+            let _ = self.recent.refresh(&self.store);
+            self.preview_textures.clear();
+          }
+          Err(error) => {
+            eprintln!("clear_all_content_failed error={error}");
+            self.report_background_failure(
+              PerformanceContext::default(),
+              true,
+              "clear_all_failed",
+              "内容清理失败",
+            );
+          }
+        },
+      }
+    }
+  }
+
+  fn report_background_failure(
+    &mut self,
+    performance: PerformanceContext,
+    is_latest: bool,
+    error_code: &'static str,
+    visible_message: &'static str,
+  ) {
+    if !is_latest {
+      return;
+    }
+    eprintln!("draft_background_failure code={error_code}");
+    record(
+      "draft.background_result",
+      performance,
+      PerformanceDetails::default().workflow("stash"),
+      PerformanceOutcome::Error,
+    );
+    if self.has_visible_window() {
+      self.set_toast(visible_message);
+    }
+  }
+
+  fn has_visible_window(&self) -> bool {
+    self.surface == WindowSurface::Library || self.capture_surfaces.active_display_id().is_some()
+  }
+
   fn handle_worker_events(&mut self, context: &egui::Context) {
     let events: Vec<_> = self.worker_receiver.try_iter().collect();
     for event in events {
@@ -1027,9 +1127,15 @@ impl RsBoardApp {
                 let pixel_size = frame.pixel_size;
                 let display_id = frame.display_id;
                 self
-                  .session_from_capture(frame, context)
-                  .map(|session| (session, display_id, bounds, pixel_size))
+                  .capture_surfaces
+                  .set_frozen_image(display_id, &frame.image)
                   .map_err(|error| error.to_string())
+                  .and_then(|_| {
+                    self
+                      .session_from_capture(frame, context)
+                      .map(|session| (session, display_id, bounds, pixel_size))
+                      .map_err(|error| error.to_string())
+                  })
               };
               match &result {
                 Ok(_) => session_timer.finish_ok(),
@@ -1045,6 +1151,7 @@ impl RsBoardApp {
               {
                 trace.pixel_size = Some(pixel_size);
               }
+              self.draft_coordinator.publish_capture(capture_sequence);
               self.session = Some(session);
               self.phase = Phase::Editing;
               self.show_editor_window(context, Some(display_id), Some(bounds));
@@ -1109,6 +1216,7 @@ impl RsBoardApp {
                 context,
               ) {
                 Ok(session) => {
+                  self.draft_coordinator.publish_capture(capture_sequence);
                   self.session = Some(session);
                   self.phase = Phase::Editing;
                   self.show_editor_window(context, None, None);
@@ -1127,90 +1235,6 @@ impl RsBoardApp {
             Err(error) => {
               self.phase = Phase::Idle;
               self.library_error = Some(error);
-            }
-          }
-        }
-        WorkerEvent::Stash { request_id, context: expected_context, completed_at, result } => {
-          if !matches!(self.phase, Phase::Stashing { request_id: current, .. } if current == request_id)
-          {
-            let performance = self
-              .persistence_trace_for(request_id)
-              .map(|trace| trace.performance)
-              .unwrap_or_else(|| performance_from_persistence_context(expected_context));
-            record(
-              "persistence.result",
-              performance,
-              PerformanceDetails::default().workflow("stash"),
-              PerformanceOutcome::Stale,
-            );
-            self.finish_persistence_trace_stale(request_id);
-            continue;
-          }
-          if let Some(trace) = self.persistence_trace_for(request_id) {
-            PerformanceTimer::started_at(
-              "persistence.worker_to_ui",
-              trace.performance,
-              PerformanceDetails::default().workflow(trace.workflow).pixel_size(trace.pixel_size),
-              completed_at,
-            )
-            .finish_ok();
-          }
-          let expected_generation = match self.phase {
-            Phase::Stashing { generation_id, .. } => generation_id,
-            _ => unreachable!(),
-          };
-          match result {
-            Ok(stored)
-              if self.persistence_result_matches(
-                stored.context,
-                expected_context,
-                stored.document_id,
-                stored.revision,
-              ) && stored.generation_id == expected_generation =>
-            {
-              self.remember_tool_and_release_session();
-              self.phase = Phase::Idle;
-              self.draft_available = true;
-              if self.quit_after_persist {
-                self.allow_close = true;
-                context.send_viewport_cmd(ViewportCommand::Close);
-              } else {
-                self.hide_editor_window(context);
-              }
-              self.finish_persistence_trace_ok(request_id);
-            }
-            Ok(_) => {
-              if let Some(trace) = self.persistence_trace_for(request_id) {
-                record(
-                  "persistence.result",
-                  trace.performance,
-                  PerformanceDetails::default()
-                    .workflow(trace.workflow)
-                    .pixel_size(trace.pixel_size),
-                  PerformanceOutcome::Stale,
-                );
-              }
-              self.finish_persistence_trace_error(request_id);
-              let error = "暂存结果与当前请求不匹配".to_owned();
-              if self.quit_after_persist {
-                self.allow_close = true;
-                context.send_viewport_cmd(ViewportCommand::Close);
-              } else {
-                self.phase = Phase::Editing;
-                self.persistent_error = Some(error);
-                self.retry_kind = Some(RetryKind::Stash);
-              }
-            }
-            Err(error) => {
-              self.finish_persistence_trace_error(request_id);
-              if self.quit_after_persist {
-                self.allow_close = true;
-                context.send_viewport_cmd(ViewportCommand::Close);
-              } else {
-                self.phase = Phase::Editing;
-                self.persistent_error = Some(error);
-                self.retry_kind = Some(RetryKind::Stash);
-              }
             }
           }
         }
@@ -1248,8 +1272,25 @@ impl RsBoardApp {
                 saved.revision,
               ) =>
             {
+              let saved_draft_generation = self.session.as_ref().and_then(|session| {
+                if let SessionOrigin::LatestDraft { generation_id } = session.origin {
+                  Some(generation_id)
+                } else {
+                  None
+                }
+              });
               if let Some(performance) = performance {
                 self.start_post_save_tasks(&saved, performance, context);
+              }
+              if let Some(generation_id) = saved_draft_generation
+                && let Err(error) = self.draft_coordinator.delete_if_generation(generation_id)
+              {
+                eprintln!(
+                  "draft_delete_enqueue_failed generation_id={generation_id} error={error}"
+                );
+                if self.has_visible_window() {
+                  self.set_toast("草稿清理失败");
+                }
               }
               self.remember_tool_and_release_session();
               self.phase = Phase::Idle;
@@ -1395,10 +1436,6 @@ impl RsBoardApp {
       }
     };
     let copy_after_save = self.settings.copy_image_after_save;
-    let draft_generation = match session.origin {
-      SessionOrigin::LatestDraft { generation_id } => Some(generation_id),
-      _ => None,
-    };
     let store = self.store.clone();
     let document_id = saved.document_id;
     let revision = saved.revision;
@@ -1464,21 +1501,6 @@ impl RsBoardApp {
         }
         if let Err(error) = result {
           warnings.push(format!("剪贴板写入失败: {error}"));
-        }
-      }
-      if let Some(generation_id) = draft_generation {
-        let delete_timer = PerformanceTimer::start(
-          "post_save.draft_delete",
-          PerformanceContext { generation_id: Some(generation_id.as_uuid()), ..performance },
-          PerformanceDetails::default().workflow("save"),
-        );
-        let result = store.delete_latest_if_generation(generation_id);
-        match &result {
-          Ok(_) => delete_timer.finish_ok(),
-          Err(error) => delete_timer.finish_error(error),
-        }
-        if let Err(error) = result {
-          warnings.push(format!("草稿清理失败: {error}"));
         }
       }
       if warnings.is_empty() {
@@ -1682,16 +1704,16 @@ impl RsBoardApp {
       match action {
         TrayAction::Capture => self.start_capture(context, CaptureTrigger::now("tray")),
         TrayAction::ShowRecent => {
-          if matches!(self.phase, Phase::Saving { .. } | Phase::Stashing { .. }) {
-            self.set_toast("保存或暂存完成后再打开最近讲义");
+          if matches!(self.phase, Phase::Saving { .. }) {
+            self.set_toast("保存完成后再打开最近讲义");
           } else {
             self.show_library_window(context);
           }
         }
         TrayAction::RestoreDraft => self.start_restore(context),
         TrayAction::ShowSettings => {
-          if matches!(self.phase, Phase::Saving { .. } | Phase::Stashing { .. }) {
-            self.set_toast("保存或暂存完成后再修改设置");
+          if matches!(self.phase, Phase::Saving { .. }) {
+            self.set_toast("保存完成后再修改设置");
           } else {
             self.settings_draft = self.settings.clone();
             self.show_settings = true;
@@ -1728,7 +1750,7 @@ impl RsBoardApp {
 
   fn request_quit(&mut self, context: &egui::Context) {
     match self.phase {
-      Phase::Saving { .. } | Phase::Stashing { .. } => {
+      Phase::Saving { .. } => {
         self.quit_after_persist = true;
       }
       Phase::Editing | Phase::ConfirmingDiscard => {
@@ -1738,8 +1760,11 @@ impl RsBoardApp {
         match session.origin {
           SessionOrigin::NewCapture | SessionOrigin::LatestDraft { .. } => {
             self.phase = Phase::Editing;
-            self.quit_after_persist = true;
             self.start_stash(context);
+            if self.phase == Phase::Idle {
+              self.allow_close = true;
+              context.send_viewport_cmd(ViewportCommand::Close);
+            }
           }
           SessionOrigin::ExistingDocument if session.is_dirty() => {
             self.phase = Phase::Editing;
@@ -1774,7 +1799,6 @@ impl RsBoardApp {
               if self.retry_kind.is_some() && ui.button("重试").clicked() {
                 match self.retry_kind {
                   Some(RetryKind::Save) => self.start_save(context),
-                  Some(RetryKind::Stash) => self.start_stash(context),
                   None => {}
                 }
               }
@@ -1798,7 +1822,7 @@ impl RsBoardApp {
               session.background_texture.as_ref(),
             );
           }
-          Phase::Saving { .. } | Phase::Stashing { .. } | Phase::ConfirmingDiscard => {
+          Phase::Saving { .. } | Phase::ConfirmingDiscard => {
             session.editor.show_read_only(
               ui,
               &session.document,
@@ -1822,12 +1846,7 @@ impl RsBoardApp {
       self.handle_editor_actions(actions, context);
     }
 
-    if matches!(self.phase, Phase::Saving { .. } | Phase::Stashing { .. }) {
-      let text = if matches!(self.phase, Phase::Saving { .. }) {
-        "正在保存..."
-      } else {
-        "正在暂存..."
-      };
+    if matches!(self.phase, Phase::Saving { .. }) {
       egui::Area::new(egui::Id::new("persisting-overlay"))
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .order(egui::Order::Tooltip)
@@ -1835,7 +1854,7 @@ impl RsBoardApp {
           egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
               ui.spinner();
-              ui.label(text);
+              ui.label("正在保存...");
             });
           });
         });
@@ -2387,13 +2406,8 @@ impl RsBoardApp {
         self.delete_draft_dialog = false;
       } else if confirm {
         self.delete_draft_dialog = false;
-        let store = self.store.clone();
-        if let Err(error) = self.spawn_worker(context, move || {
-          WorkerEvent::LibraryChanged(
-            store.delete_latest_draft().map(|_| None).map_err(|error| error.to_string()),
-          )
-        }) {
-          self.library_error = Some(format!("无法启动草稿删除任务：{error}"));
+        if let Err(error) = self.draft_coordinator.delete_latest() {
+          self.library_error = Some(format!("无法提交草稿删除任务：{error}"));
         }
       }
     }
@@ -2435,13 +2449,8 @@ impl RsBoardApp {
       self.clear_confirmation_stage = 2;
     } else if confirm {
       self.clear_confirmation_stage = 0;
-      let store = self.store.clone();
-      if let Err(error) = self.spawn_worker(context, move || {
-        WorkerEvent::LibraryChanged(
-          store.clear_all_content().map(|_| None).map_err(|error| error.to_string()),
-        )
-      }) {
-        self.library_error = Some(format!("无法启动内容清理任务：{error}"));
+      if let Err(error) = self.draft_coordinator.clear_all() {
+        self.library_error = Some(format!("无法提交内容清理任务：{error}"));
       }
     }
   }
@@ -2585,6 +2594,7 @@ impl RsBoardApp {
 
 impl eframe::App for RsBoardApp {
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    self.handle_draft_results(context);
     self.handle_worker_events(context);
     self.poll_external_events(context);
     if self.capture_surfaces.should_refresh() {
@@ -2633,6 +2643,12 @@ impl eframe::App for RsBoardApp {
   fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
     Color32::TRANSPARENT.to_normalized_gamma_f32()
   }
+
+  fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    if !self.draft_coordinator.shutdown(Duration::from_secs(2)) {
+      eprintln!("draft_coordinator_shutdown_timeout timeout_ms=2000");
+    }
+  }
 }
 
 #[derive(Debug, Error)]
@@ -2645,6 +2661,8 @@ pub enum ApplicationError {
   Capture(#[from] crate::capture::CaptureError),
   #[error(transparent)]
   BackgroundPrepare(#[from] BackgroundPrepareError),
+  #[error(transparent)]
+  DraftCoordinator(#[from] DraftCoordinatorError),
   #[error(transparent)]
   Document(#[from] common::DocumentError),
   #[error("背景纹理无效")]

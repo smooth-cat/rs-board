@@ -2,6 +2,7 @@ pub mod application;
 pub mod background_encode;
 pub mod capture;
 pub mod capture_surface;
+pub mod draft_coordinator;
 pub mod editor;
 pub mod export;
 pub mod instance;
