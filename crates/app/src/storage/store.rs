@@ -580,7 +580,7 @@ impl LocalStore {
     exported.validate().map_err(invalid_manifest)?;
     let manifest = encode_document(&exported).map_err(format_error)?;
     let background = match &loaded.background {
-      BackgroundData::EncodedPng(bytes) => bytes.to_vec(),
+      BackgroundData::EncodedPng(bytes) => Arc::clone(bytes),
       other => {
         other.normalized_png(exported.canvas_size_px.width_px, exported.canvas_size_px.height_px)?
       }

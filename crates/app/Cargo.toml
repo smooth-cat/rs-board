@@ -76,6 +76,12 @@ objc2-foundation = { version = "0.3.2", features = [
   "NSValue",
   "objc2-core-services",
 ] }
+objc2-image-io = { version = "0.3.2", default-features = false, features = [
+  "CGImageDestination",
+  "CGImageSource",
+  "objc2-core-graphics",
+  "std",
+] }
 objc2-quartz-core = { version = "0.3.2", features = ["CALayer", "CATransaction"] }
 objc2-screen-capture-kit = { version = "0.3.2", default-features = false, features = [
   "SCError",

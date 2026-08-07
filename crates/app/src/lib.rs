@@ -1,4 +1,5 @@
 pub mod application;
+pub mod background_encode;
 pub mod capture;
 pub mod capture_surface;
 pub mod editor;

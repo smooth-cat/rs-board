@@ -69,6 +69,63 @@ impl NativeCaptureImage {
     &self.image
   }
 
+  pub fn from_encoded_png(bytes: &[u8]) -> Result<Self, CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+      use objc2_core_foundation::CFData;
+      use objc2_image_io::CGImageSource;
+
+      let data = CFData::from_bytes(bytes);
+      let source = unsafe { CGImageSource::with_data(&data, None) }
+        .ok_or_else(|| CaptureError::CaptureFailed("creating PNG image source failed".into()))?;
+      let image = unsafe { source.image_at_index(0, None) }
+        .ok_or_else(|| CaptureError::CaptureFailed("decoding PNG image failed".into()))?;
+      Self::from_cg_image(image)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      use image::{DynamicImage, ImageFormat};
+
+      image::load_from_memory_with_format(bytes, ImageFormat::Png)
+        .map(DynamicImage::into_rgba8)
+        .map_err(|error| CaptureError::CaptureFailed(error.to_string()))
+        .and_then(Self::from_rgba)
+    }
+  }
+
+  pub fn encode_png(&self) -> Result<Arc<[u8]>, CaptureError> {
+    #[cfg(target_os = "macos")]
+    {
+      use objc2_core_foundation::{CFMutableData, CFString};
+      use objc2_image_io::CGImageDestination;
+
+      let data = CFMutableData::new(None, 0)
+        .ok_or_else(|| CaptureError::CaptureFailed("allocating PNG output failed".into()))?;
+      let png_type = CFString::from_static_str("public.png");
+      let destination = unsafe { CGImageDestination::with_data(&data, &png_type, 1, None) }
+        .ok_or_else(|| CaptureError::CaptureFailed("creating PNG encoder failed".into()))?;
+      unsafe {
+        destination.add_image(self.cg_image(), None);
+        if !destination.finalize() {
+          return Err(CaptureError::CaptureFailed("finalizing PNG encoder failed".into()));
+        }
+      }
+      Ok(Arc::from(data.to_vec()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      use std::io::Cursor;
+
+      use image::{DynamicImage, ImageFormat};
+
+      let mut output = Cursor::new(Vec::new());
+      DynamicImage::ImageRgba8((*self.image).clone())
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|error| CaptureError::CaptureFailed(error.to_string()))?;
+      Ok(Arc::from(output.into_inner()))
+    }
+  }
+
   pub fn to_rgba8(&self) -> Result<Arc<[u8]>, CaptureError> {
     #[cfg(target_os = "macos")]
     {

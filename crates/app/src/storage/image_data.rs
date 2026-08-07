@@ -50,11 +50,18 @@ impl BackgroundData {
     }
   }
 
+  pub fn encoded_png_bytes(&self) -> Option<Arc<[u8]>> {
+    match self {
+      Self::EncodedPng(bytes) => Some(Arc::clone(bytes)),
+      Self::Rgba8 { .. } => None,
+    }
+  }
+
   pub(crate) fn normalized_png(
     &self,
     expected_width_px: u32,
     expected_height_px: u32,
-  ) -> StorageResult<Vec<u8>> {
+  ) -> StorageResult<Arc<[u8]>> {
     validate_dimensions(expected_width_px, expected_height_px)?;
     let (width_px, height_px) = self.dimensions()?;
     if (width_px, height_px) != (expected_width_px, expected_height_px) {
@@ -68,9 +75,9 @@ impl BackgroundData {
         RgbaImage::from_raw(expected_width_px, expected_height_px, pixels.to_vec())
           .ok_or_else(|| StorageError::InvalidImage("invalid RGBA pixel buffer".into()))?
       }
-      Self::EncodedPng(bytes) => decode_png(bytes)?,
+      Self::EncodedPng(bytes) => return Ok(Arc::clone(bytes)),
     };
-    encode_rgba_png(rgba)
+    encode_rgba_png(rgba).map(Arc::from)
   }
 }
 
@@ -147,5 +154,14 @@ mod tests {
   fn expected_dimensions_are_enforced() {
     let background = BackgroundData::rgba8(1, 1, vec![0; 4]).unwrap();
     assert!(background.normalized_png(2, 1).is_err());
+  }
+
+  #[test]
+  fn validated_encoded_png_is_reused_without_reencoding() {
+    let encoded =
+      BackgroundData::rgba8(1, 1, vec![10, 20, 30, 255]).unwrap().normalized_png(1, 1).unwrap();
+    let background = BackgroundData::encoded_png(Arc::clone(&encoded)).unwrap();
+    let normalized = background.normalized_png(1, 1).unwrap();
+    assert!(Arc::ptr_eq(&encoded, &normalized));
   }
 }

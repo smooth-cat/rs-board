@@ -19,6 +19,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+  background_encode::{BackgroundEncodeScheduler, BackgroundPrepareError, PreparedBackground},
   capture::{
     CaptureFrame, CaptureOptions, NativeCaptureImage, capture_prepared_display,
     invalidate_capture_backend_cache, prepare_display_capture_under_cursor_at,
@@ -36,9 +37,9 @@ use crate::{
   renderer::render_document_to_image,
   settings::{Settings, SettingsError},
   storage::{
-    BackgroundData, GenerationId, ImportRequest, ImportedDocument, LatestDraft, LoadedDocument,
-    LoadedDraft, LocalStore, PersistenceContext, SaveRequest, SavedDocument, StashRequest,
-    StorageError, StorePaths,
+    GenerationId, ImportRequest, ImportedDocument, LatestDraft, LoadedDocument, LoadedDraft,
+    LocalStore, PersistenceContext, SaveRequest, SavedDocument, StashRequest, StorageError,
+    StorePaths,
   },
   tray::{TrayAction, TrayController},
 };
@@ -75,7 +76,7 @@ struct WorkingSession {
   history: CommandHistory,
   dirty_baseline: DirtyBaseline,
   element_clipboard: Option<Element>,
-  background: Option<BackgroundData>,
+  prepared_background: PreparedBackground,
   background_pixels: Option<Arc<[u8]>>,
   native_background: Option<NativeCaptureImage>,
   background_texture: Option<TextureHandle>,
@@ -83,7 +84,7 @@ struct WorkingSession {
 }
 
 struct SessionBackground {
-  data: Option<BackgroundData>,
+  prepared: PreparedBackground,
   pixels: Option<Arc<[u8]>>,
   native: Option<NativeCaptureImage>,
 }
@@ -123,22 +124,6 @@ impl WorkingSession {
       document_id: Some(self.document.document_id.as_uuid()),
       revision: Some(self.document.revision),
     }
-  }
-
-  fn materialize_background(&mut self) -> Result<BackgroundData, ApplicationError> {
-    if let Some(background) = &self.background {
-      return Ok(background.clone());
-    }
-    let native = self.native_background.as_ref().ok_or(ApplicationError::InvalidTexture)?;
-    let pixels = native.to_rgba8().map_err(ApplicationError::Capture)?;
-    let background = BackgroundData::rgba8(
-      self.document.canvas_size_px.width_px,
-      self.document.canvas_size_px.height_px,
-      Arc::clone(&pixels),
-    )?;
-    self.background_pixels = Some(pixels);
-    self.background = Some(background.clone());
-    Ok(background)
   }
 
   fn image(&self) -> Option<RgbaImage> {
@@ -276,6 +261,7 @@ pub struct RsBoardApp {
   tray: Option<TrayController>,
   surface: WindowSurface,
   capture_surfaces: CaptureSurfaceCoordinator,
+  background_encoder: BackgroundEncodeScheduler,
   phase: Phase,
   next_capture_sequence: u64,
   next_stash_sequence: u64,
@@ -369,6 +355,7 @@ impl RsBoardApp {
       tray,
       surface: WindowSurface::Hidden,
       capture_surfaces,
+      background_encoder: BackgroundEncodeScheduler::new(),
       phase: Phase::Idle,
       next_capture_sequence: 0,
       next_stash_sequence: 0,
@@ -626,22 +613,19 @@ impl RsBoardApp {
         return;
       }
     };
-    let background = match session.materialize_background() {
-      Ok(background) => background,
-      Err(error) => {
-        PerformanceTimer::started_at(
-          "persistence.request_to_ui_complete",
-          performance,
-          PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
-          started_at,
-        )
-        .finish_error(&error);
-        self.persistent_error = Some(error.to_string());
+    if session.prepared_background.needs_retry() {
+      let Some(image) = session.native_background.clone() else {
+        self.persistent_error = Some("背景编码失败且没有可用于重试的内存图像".into());
         return;
-      }
-    };
+      };
+      session.prepared_background = self.background_encoder.submit(
+        session.prepared_background.capture_sequence(),
+        image,
+        performance,
+      );
+    }
+    let prepared_background = session.prepared_background.clone();
     let persistence_context = session.persistence_context(request_id, None);
-    let request = SaveRequest { context: persistence_context, snapshot, background };
     self.phase = Phase::Saving { request_id };
     self.persistence_ui_trace =
       Some(PersistenceUiTrace { performance, started_at, workflow: "save", pixel_size });
@@ -654,16 +638,21 @@ impl RsBoardApp {
         performance,
         PerformanceDetails::default().workflow("save").pixel_size(pixel_size),
       );
-      let result = store.save_document(request);
+      let result = match prepared_background.wait() {
+        Ok(background) => store
+          .save_document(SaveRequest { context: persistence_context, snapshot, background })
+          .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+      };
       match &result {
         Ok(_) => timer.finish_ok(),
-        Err(error) => timer.finish_error(error),
+        Err(_) => timer.finish_error_code("persistence.save_failed"),
       }
       WorkerEvent::Save {
         request_id,
         context: persistence_context,
         completed_at: Instant::now(),
-        result: result.map_err(|error| error.to_string()),
+        result,
       }
     });
     if let Err(error) = spawn_result {
@@ -719,24 +708,20 @@ impl RsBoardApp {
         return;
       }
     };
-    let background = match session.materialize_background() {
-      Ok(background) => background,
-      Err(error) => {
-        PerformanceTimer::started_at(
-          "persistence.request_to_ui_complete",
-          performance,
-          PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
-          started_at,
-        )
-        .finish_error(&error);
-        self.persistent_error = Some(error.to_string());
+    if session.prepared_background.needs_retry() {
+      let Some(image) = session.native_background.clone() else {
+        self.persistent_error = Some("背景编码失败且没有可用于重试的内存图像".into());
         return;
-      }
-    };
+      };
+      session.prepared_background = self.background_encoder.submit(
+        session.prepared_background.capture_sequence(),
+        image,
+        performance,
+      );
+    }
+    let prepared_background = session.prepared_background.clone();
     let persistence_context =
       session.persistence_context(request_id, Some(stash_sequence)).with_generation(generation_id);
-    let request =
-      StashRequest { context: persistence_context, generation_id, snapshot, background };
     self.phase = Phase::Stashing { request_id, generation_id };
     self.persistence_ui_trace =
       Some(PersistenceUiTrace { performance, started_at, workflow: "stash", pixel_size });
@@ -749,16 +734,26 @@ impl RsBoardApp {
         performance,
         PerformanceDetails::default().workflow("stash").pixel_size(pixel_size),
       );
-      let result = store.replace_latest_draft(request);
+      let result = match prepared_background.wait() {
+        Ok(background) => store
+          .replace_latest_draft(StashRequest {
+            context: persistence_context,
+            generation_id,
+            snapshot,
+            background,
+          })
+          .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+      };
       match &result {
         Ok(_) => timer.finish_ok(),
-        Err(error) => timer.finish_error(error),
+        Err(_) => timer.finish_error_code("persistence.stash_failed"),
       }
       WorkerEvent::Stash {
         request_id,
         context: persistence_context,
         completed_at: Instant::now(),
-        result: result.map_err(|error| error.to_string()),
+        result,
       }
     });
     if let Err(error) = spawn_result {
@@ -819,11 +814,13 @@ impl RsBoardApp {
       },
       frame.captured_at.with_timezone(&chrono::Local),
     )?;
+    let prepared =
+      self.background_encoder.submit(frame.capture_sequence, frame.image.clone(), performance);
     self.make_session(
       SessionOrigin::NewCapture,
       Some(frame.capture_sequence),
       document,
-      SessionBackground { data: None, pixels: None, native: Some(frame.image) },
+      SessionBackground { prepared, pixels: None, native: Some(frame.image) },
       performance,
       _context,
     )
@@ -837,12 +834,24 @@ impl RsBoardApp {
     performance: PerformanceContext,
     context: &egui::Context,
   ) -> Result<WorkingSession, ApplicationError> {
-    let (_, _, pixels) = loaded.background.decode_rgba8()?;
+    let prepared =
+      PreparedBackground::ready(capture_sequence.unwrap_or_default(), loaded.background.clone())?;
+    #[cfg(target_os = "macos")]
+    let (pixels, native) = {
+      let encoded =
+        loaded.background.encoded_png_bytes().ok_or(ApplicationError::InvalidTexture)?;
+      (None, Some(NativeCaptureImage::from_encoded_png(&encoded)?))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (pixels, native) = {
+      let (_, _, pixels) = loaded.background.decode_rgba8()?;
+      (Some(pixels), None)
+    };
     self.make_session(
       origin,
       capture_sequence,
       loaded.document,
-      SessionBackground { data: Some(loaded.background), pixels: Some(pixels), native: None },
+      SessionBackground { prepared, pixels, native },
       performance,
       context,
     )
@@ -892,7 +901,7 @@ impl RsBoardApp {
       history: CommandHistory::new(),
       dirty_baseline,
       element_clipboard: None,
-      background: background.data,
+      prepared_background: background.prepared,
       background_pixels: background.pixels,
       native_background: background.native,
       background_texture: texture,
@@ -1018,15 +1027,9 @@ impl RsBoardApp {
                 let pixel_size = frame.pixel_size;
                 let display_id = frame.display_id;
                 self
-                  .capture_surfaces
-                  .set_frozen_image(display_id, &frame.image)
+                  .session_from_capture(frame, context)
+                  .map(|session| (session, display_id, bounds, pixel_size))
                   .map_err(|error| error.to_string())
-                  .and_then(|_| {
-                    self
-                      .session_from_capture(frame, context)
-                      .map(|session| (session, display_id, bounds, pixel_size))
-                      .map_err(|error| error.to_string())
-                  })
               };
               match &result {
                 Ok(_) => session_timer.finish_ok(),
@@ -1620,6 +1623,14 @@ impl RsBoardApp {
       .capture_presentation_trace
       .and_then(|trace| trace.performance.request_id)
       .unwrap_or(session_id);
+    if let Some(image) =
+      self.session.as_ref().and_then(|session| session.native_background.as_ref())
+      && let Err(error) = self.capture_surfaces.set_frozen_image(display_id, image)
+    {
+      self.persistent_error = Some(error.to_string());
+      self.capture_surfaces.hide_active();
+      return;
+    }
     let result = self
       .capture_surfaces
       .present(display_id, request_id)
@@ -2632,6 +2643,8 @@ pub enum ApplicationError {
   Storage(#[from] StorageError),
   #[error(transparent)]
   Capture(#[from] crate::capture::CaptureError),
+  #[error(transparent)]
+  BackgroundPrepare(#[from] BackgroundPrepareError),
   #[error(transparent)]
   Document(#[from] common::DocumentError),
   #[error("背景纹理无效")]
