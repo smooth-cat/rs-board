@@ -2470,20 +2470,18 @@ impl RsBoardApp {
   }
 
   fn show_capture_viewports(&mut self, context: &egui::Context) {
-    for viewport in self.capture_surfaces.viewport_specs() {
-      let is_active = viewport.is_active();
+    for viewport in self.capture_surfaces.viewport_specs_for_frame() {
       let lifecycle = viewport.lifecycle;
+      let is_active = viewport.is_active();
       context.show_viewport_immediate(
         viewport.viewport_id,
         viewport.builder,
         |ui, _viewport_class| {
           if !is_active {
-            egui::CentralPanel::default()
-              .frame(egui::Frame::NONE.fill(Color32::TRANSPARENT))
-              .show(ui, |_| {});
             return;
           }
 
+          self.capture_surfaces.configure_active_overlay_window();
           let viewport_context = ui.ctx().clone();
           if viewport_context.input(|input| input.viewport().close_requested())
             && self.phase.has_active_session()

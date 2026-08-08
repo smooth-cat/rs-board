@@ -31,7 +31,7 @@ fn run() -> Result<(), StartupError> {
   let _performance_log = PerformanceLogGuard::from_environment()?;
   let arguments = StartupArguments::from_environment();
   let app_data_dir = Settings::app_data_dir()?;
-  let egui_context = eframe::egui::Context::default();
+  let egui_context = native_egui_context();
   let instance =
     match InstanceBridge::acquire_with_waker(&app_data_dir, arguments.files.clone(), {
       let egui_context = egui_context.clone();
@@ -62,12 +62,21 @@ fn run() -> Result<(), StartupError> {
   Ok(())
 }
 
+fn native_egui_context() -> eframe::egui::Context {
+  let context = eframe::egui::Context::default();
+  context.set_embed_viewports(false);
+  context
+}
+
 fn native_options(initially_visible: bool) -> eframe::NativeOptions {
   let mut options = eframe::NativeOptions {
     viewport: eframe::egui::ViewportBuilder::default()
       .with_title(APP_NAME)
       .with_app_id(APP_ID)
       .with_inner_size([1120.0, 760.0])
+      // Glow reuses the root OpenGL pixel format for child viewports. The capture overlay
+      // needs an alpha channel even though the library paints an opaque background.
+      .with_transparent(true)
       .with_visible(initially_visible)
       .with_active(initially_visible),
     centered: true,
@@ -169,5 +178,15 @@ mod tests {
     assert!(plist_extension.contains("CFBundleDocumentTypes"));
     assert!(plist_extension.contains("com.linjiajian.rs-board.document"));
     assert!(plist_extension.contains("<string>rsboard</string>"));
+  }
+
+  #[test]
+  fn root_viewport_negotiates_transparency_for_capture_overlays() {
+    assert_eq!(native_options(true).viewport.transparent, Some(true));
+  }
+
+  #[test]
+  fn native_context_creates_capture_overlays_as_native_viewports() {
+    assert!(!native_egui_context().embed_viewports());
   }
 }

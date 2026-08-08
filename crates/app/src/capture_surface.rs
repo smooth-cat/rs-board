@@ -12,6 +12,7 @@ use crate::capture::NativeCaptureImage;
 
 const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COLD_REFRESH_WALL_CLOCK_GAP: Duration = Duration::from_secs(5);
+const CAPTURE_OVERLAY_TITLE: &str = "RS Board Capture Overlay";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplaySnapshot {
@@ -68,7 +69,7 @@ impl DisplaySnapshot {
     let [x, y, width, height] = self.bounds_global;
     let visible = !matches!(lifecycle, SurfaceLifecycle::Hidden);
     ViewportBuilder::default()
-      .with_title("RS Board Capture Overlay")
+      .with_title(CAPTURE_OVERLAY_TITLE)
       .with_app_id("com.linjiajian.rs-board.capture-overlay")
       .with_position(egui::pos2(x as f32, y as f32))
       .with_inner_size(egui::vec2(width as f32, height as f32))
@@ -116,6 +117,8 @@ struct DisplayCaptureSurface {
   pending_display: Option<DisplaySnapshot>,
   #[cfg(target_os = "macos")]
   frozen_panel: Option<macos::FrozenImagePanel>,
+  #[cfg(target_os = "macos")]
+  overlay_window_configured: bool,
 }
 
 impl DisplayCaptureSurface {
@@ -126,6 +129,8 @@ impl DisplayCaptureSurface {
       pending_display: None,
       #[cfg(target_os = "macos")]
       frozen_panel: macos::FrozenImagePanel::new(display).ok(),
+      #[cfg(target_os = "macos")]
+      overlay_window_configured: false,
     }
   }
 
@@ -144,8 +149,11 @@ impl DisplayCaptureSurface {
   fn present(&mut self, request_id: Uuid) {
     self.lifecycle = SurfaceLifecycle::Presenting { request_id };
     #[cfg(target_os = "macos")]
-    if let Some(panel) = self.frozen_panel.as_ref() {
-      panel.present();
+    {
+      self.overlay_window_configured = false;
+      if let Some(panel) = self.frozen_panel.as_ref() {
+        panel.present();
+      }
     }
   }
 
@@ -172,8 +180,11 @@ impl DisplayCaptureSurface {
   fn hide(&mut self) {
     self.lifecycle = SurfaceLifecycle::Hidden;
     #[cfg(target_os = "macos")]
-    if let Some(panel) = self.frozen_panel.as_ref() {
-      panel.hide();
+    {
+      self.overlay_window_configured = false;
+      if let Some(panel) = self.frozen_panel.as_ref() {
+        panel.hide();
+      }
     }
     if let Some(display) = self.pending_display.take() {
       self.update_display(display);
@@ -191,6 +202,7 @@ pub enum DisplayRefreshOutcome {
 pub struct CaptureSurfaceCoordinator {
   surfaces: HashMap<u32, DisplayCaptureSurface>,
   active_display_id: Option<u32>,
+  retained_display_id: Option<u32>,
   last_refresh: Instant,
   last_refresh_wall_clock: SystemTime,
   focus_restore: FocusRestore,
@@ -202,6 +214,7 @@ impl CaptureSurfaceCoordinator {
     let mut coordinator = Self {
       surfaces: HashMap::new(),
       active_display_id: None,
+      retained_display_id: None,
       last_refresh: Instant::now(),
       last_refresh_wall_clock: SystemTime::now(),
       focus_restore: FocusRestore::default(),
@@ -269,6 +282,7 @@ impl CaptureSurfaceCoordinator {
     self.surfaces.retain(|display_id, surface| {
       available_ids.contains(display_id)
         || Some(*display_id) == self.active_display_id
+        || Some(*display_id) == self.retained_display_id
         || surface.lifecycle != SurfaceLifecycle::Hidden
     });
 
@@ -296,6 +310,9 @@ impl CaptureSurfaceCoordinator {
       .get_mut(&display_id)
       .ok_or(CaptureSurfaceError::DisplayUnavailable(display_id))?;
     surface.present(request_id);
+    if self.retained_display_id == Some(display_id) {
+      self.retained_display_id = None;
+    }
     self.active_display_id = Some(display_id);
     Ok(())
   }
@@ -362,6 +379,7 @@ impl CaptureSurfaceCoordinator {
       && let Some(surface) = self.surfaces.get_mut(&display_id)
     {
       surface.hide();
+      self.retained_display_id = Some(display_id);
     }
     self.focus_restore.restore();
   }
@@ -380,6 +398,37 @@ impl CaptureSurfaceCoordinator {
     viewports.sort_by_key(|viewport| viewport.display.display_id);
     viewports
   }
+
+  pub fn viewport_specs_for_frame(&self) -> Vec<SurfaceViewport> {
+    let mut viewports = Vec::with_capacity(2);
+
+    if let Some(display_id) = self.retained_display_id
+      && Some(display_id) != self.active_display_id
+      && let Some(surface) = self.surfaces.get(&display_id)
+    {
+      viewports.push(retained_surface_viewport(surface));
+    }
+
+    if let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get(&id))
+      && surface.lifecycle != SurfaceLifecycle::Hidden
+    {
+      // Keep the active viewport last so the current GL context always belongs to a viewport
+      // that eframe will retain on the following frame.
+      viewports.push(surface_viewport(surface));
+    }
+
+    viewports
+  }
+
+  pub fn configure_active_overlay_window(&mut self) {
+    #[cfg(target_os = "macos")]
+    if let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get_mut(&id))
+      && !surface.overlay_window_configured
+      && macos::configure_overlay_window(surface.display.display_id)
+    {
+      surface.overlay_window_configured = true;
+    }
+  }
 }
 
 impl Default for CaptureSurfaceCoordinator {
@@ -387,11 +436,32 @@ impl Default for CaptureSurfaceCoordinator {
     Self {
       surfaces: HashMap::new(),
       active_display_id: None,
+      retained_display_id: None,
       last_refresh: Instant::now(),
       last_refresh_wall_clock: SystemTime::now(),
       focus_restore: FocusRestore::default(),
     }
   }
+}
+
+fn surface_viewport(surface: &DisplayCaptureSurface) -> SurfaceViewport {
+  SurfaceViewport {
+    display: surface.display,
+    lifecycle: surface.lifecycle,
+    viewport_id: ViewportId::from_hash_of(("capture-overlay", surface.display.display_id)),
+    builder: surface.display.viewport_builder(surface.lifecycle),
+  }
+}
+
+fn retained_surface_viewport(surface: &DisplayCaptureSurface) -> SurfaceViewport {
+  let mut viewport = surface_viewport(surface);
+  // On macOS, hiding the current native window clears NSOpenGLContext.view before eframe can
+  // switch back to the root surface. Keep the retained window transparent and click-through.
+  // Changing `active` recreates the eframe 0.36 native viewport. Preserve the active builder
+  // value so the current CGL surface survives until the root viewport has rendered.
+  viewport.builder =
+    viewport.builder.with_visible(true).with_active(true).with_mouse_passthrough(true);
+  viewport
 }
 
 fn available_displays() -> Result<Vec<DisplaySnapshot>, CaptureSurfaceError> {
@@ -473,7 +543,7 @@ mod macos {
   use objc2_foundation::{NSNumber, NSString};
   use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
 
-  use super::{CaptureSurfaceError, DisplaySnapshot};
+  use super::{CAPTURE_OVERLAY_TITLE, CaptureSurfaceError, DisplaySnapshot};
   use crate::capture::NativeCaptureImage;
 
   pub(super) struct FrozenImagePanel {
@@ -568,6 +638,41 @@ mod macos {
     }
   }
 
+  pub(super) fn configure_overlay_window(display_id: u32) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+      return false;
+    };
+    let Some(screen) = screen_for_display(mtm, display_id) else {
+      return false;
+    };
+    let application = NSApplication::sharedApplication(mtm);
+    let Some(window) = application
+      .windows()
+      .into_iter()
+      .find(|window| window.title().to_string() == CAPTURE_OVERLAY_TITLE)
+    else {
+      return false;
+    };
+
+    window.setStyleMask(NSWindowStyleMask::Borderless);
+    window.setFrame_display(screen.frame(), false);
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    window.setHasShadow(false);
+    window.setIgnoresMouseEvents(false);
+    window.setLevel(NSFloatingWindowLevel);
+    window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    window.setCollectionBehavior(
+      NSWindowCollectionBehavior::CanJoinAllSpaces
+        | NSWindowCollectionBehavior::Stationary
+        | NSWindowCollectionBehavior::IgnoresCycle
+        | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    window.setSharingType(NSWindowSharingType::None);
+    window.orderFrontRegardless();
+    true
+  }
+
   impl Drop for FrozenImagePanel {
     fn drop(&mut self) {
       self.panel.orderOut(None);
@@ -618,7 +723,12 @@ mod tests {
 
     coordinator.hide_active();
     assert_eq!(coordinator.refresh(Vec::new()), DisplayRefreshOutcome::DisplaysChanged);
-    assert!(coordinator.viewport_specs().is_empty());
+    let retained = coordinator.viewport_specs_for_frame().pop().unwrap();
+    assert_eq!(retained.display.display_id, 4);
+    assert_eq!(retained.lifecycle, SurfaceLifecycle::Hidden);
+    assert!(coordinator.viewport_specs_for_frame().pop().is_some());
+    assert_eq!(coordinator.refresh(Vec::new()), DisplayRefreshOutcome::DisplaysChanged);
+    assert_eq!(coordinator.viewport_specs().len(), 1);
   }
 
   #[test]
@@ -627,6 +737,60 @@ mod tests {
     coordinator.refresh(vec![display(1, [-1920, 0, 1920, 1080]), display(2, [0, 0, 1728, 1117])]);
     assert_eq!(coordinator.display_for_point([-10, 20]), Some(1));
     assert_eq!(coordinator.display_for_point([100, 20]), Some(2));
+  }
+
+  #[test]
+  fn retains_the_last_egui_viewport_after_hiding() {
+    let mut coordinator = CaptureSurfaceCoordinator::default();
+    coordinator.refresh(vec![display(1, [0, 0, 100, 80]), display(2, [100, 0, 100, 80])]);
+
+    assert!(coordinator.viewport_specs_for_frame().is_empty());
+
+    coordinator.present(2, Uuid::new_v4()).unwrap();
+    let viewport = coordinator.viewport_specs_for_frame().pop().unwrap();
+    assert_eq!(viewport.display.display_id, 2);
+    assert!(viewport.is_active());
+
+    coordinator.hide_active();
+    let retained = coordinator.viewport_specs_for_frame().pop().unwrap();
+    assert_eq!(retained.display.display_id, 2);
+    assert_eq!(retained.lifecycle, SurfaceLifecycle::Hidden);
+    assert!(!retained.is_active());
+    assert_eq!(retained.builder.visible, Some(true));
+    assert_eq!(retained.builder.active, Some(true));
+    assert_eq!(retained.builder.mouse_passthrough, Some(true));
+    assert!(coordinator.viewport_specs_for_frame().pop().is_some());
+  }
+
+  #[test]
+  fn a_new_presentation_reuses_the_retained_viewport_for_the_same_display() {
+    let mut coordinator = CaptureSurfaceCoordinator::default();
+    coordinator.refresh(vec![display(2, [100, 0, 100, 80])]);
+    coordinator.present(2, Uuid::new_v4()).unwrap();
+    coordinator.hide_active();
+
+    coordinator.present(2, Uuid::new_v4()).unwrap();
+
+    let viewports = coordinator.viewport_specs_for_frame();
+    assert_eq!(viewports.len(), 1);
+    assert_eq!(viewports[0].display.display_id, 2);
+    assert!(viewports[0].is_active());
+  }
+
+  #[test]
+  fn a_retained_viewport_precedes_a_new_active_viewport() {
+    let mut coordinator = CaptureSurfaceCoordinator::default();
+    coordinator.refresh(vec![display(1, [0, 0, 100, 80]), display(2, [100, 0, 100, 80])]);
+    coordinator.present(1, Uuid::new_v4()).unwrap();
+    coordinator.hide_active();
+    coordinator.present(2, Uuid::new_v4()).unwrap();
+
+    let viewports = coordinator.viewport_specs_for_frame();
+    assert_eq!(viewports.len(), 2);
+    assert_eq!(viewports[0].display.display_id, 1);
+    assert!(!viewports[0].is_active());
+    assert_eq!(viewports[1].display.display_id, 2);
+    assert!(viewports[1].is_active());
   }
 
   #[test]
