@@ -12,7 +12,11 @@ use crate::capture::NativeCaptureImage;
 
 const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COLD_REFRESH_WALL_CLOCK_GAP: Duration = Duration::from_secs(5);
-const CAPTURE_OVERLAY_TITLE: &str = "RS Board Capture Overlay";
+const CAPTURE_OVERLAY_TITLE_PREFIX: &str = "RS Board Capture Overlay";
+
+fn capture_overlay_title(display_id: u32) -> String {
+  format!("{CAPTURE_OVERLAY_TITLE_PREFIX} [{display_id}]")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplaySnapshot {
@@ -69,7 +73,7 @@ impl DisplaySnapshot {
     let [x, y, width, height] = self.bounds_global;
     let visible = !matches!(lifecycle, SurfaceLifecycle::Hidden);
     let builder = ViewportBuilder::default()
-      .with_title(CAPTURE_OVERLAY_TITLE)
+      .with_title(capture_overlay_title(self.display_id))
       .with_app_id("com.linjiajian.rs-board.capture-overlay")
       .with_position(egui::pos2(x as f32, y as f32))
       .with_inner_size(egui::vec2(width as f32, height as f32))
@@ -122,7 +126,7 @@ struct DisplayCaptureSurface {
   #[cfg(target_os = "macos")]
   frozen_panel: Option<macos::FrozenImagePanel>,
   #[cfg(target_os = "macos")]
-  overlay_window_configured: bool,
+  overlay_window: Option<macos::OverlayWindow>,
 }
 
 impl DisplayCaptureSurface {
@@ -134,7 +138,7 @@ impl DisplayCaptureSurface {
       #[cfg(target_os = "macos")]
       frozen_panel: macos::FrozenImagePanel::new(display).ok(),
       #[cfg(target_os = "macos")]
-      overlay_window_configured: false,
+      overlay_window: None,
     }
   }
 
@@ -152,13 +156,6 @@ impl DisplayCaptureSurface {
 
   fn present(&mut self, request_id: Uuid) {
     self.lifecycle = SurfaceLifecycle::Presenting { request_id };
-    #[cfg(target_os = "macos")]
-    {
-      self.overlay_window_configured = false;
-      if let Some(panel) = self.frozen_panel.as_ref() {
-        panel.present();
-      }
-    }
   }
 
   fn set_frozen_image(&mut self, image: &NativeCaptureImage) -> Result<(), CaptureSurfaceError> {
@@ -184,12 +181,11 @@ impl DisplayCaptureSurface {
   fn hide(&mut self) {
     self.lifecycle = SurfaceLifecycle::Hidden;
     #[cfg(target_os = "macos")]
-    {
-      self.overlay_window_configured = false;
-      if let Some(panel) = self.frozen_panel.as_ref() {
-        panel.hide();
-      }
-    }
+    macos::hide_window_pair(
+      self.display.display_id,
+      &mut self.overlay_window,
+      self.frozen_panel.as_ref(),
+    );
     if let Some(display) = self.pending_display.take() {
       self.update_display(display);
     }
@@ -201,6 +197,13 @@ pub enum DisplayRefreshOutcome {
   Unchanged,
   DisplaysChanged,
   ActiveDisplayRemoved(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayWindowReadiness {
+  Ready,
+  Pending,
+  Failed,
 }
 
 pub struct CaptureSurfaceCoordinator {
@@ -424,14 +427,25 @@ impl CaptureSurfaceCoordinator {
     viewports
   }
 
-  pub fn configure_active_overlay_window(&mut self) {
+  pub fn configure_active_overlay_window(&mut self) -> OverlayWindowReadiness {
     #[cfg(target_os = "macos")]
-    if let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get_mut(&id)) {
-      surface.overlay_window_configured = if surface.overlay_window_configured {
-        macos::enforce_overlay_window_level()
-      } else {
-        macos::configure_overlay_window(surface.display.display_id)
+    {
+      let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get_mut(&id)) else {
+        return OverlayWindowReadiness::Failed;
       };
+      let Some(panel) = surface.frozen_panel.as_ref() else {
+        return OverlayWindowReadiness::Failed;
+      };
+      macos::configure_active_window_pair(surface.display, &mut surface.overlay_window, panel)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+      if self.active_display_id.is_some() {
+        OverlayWindowReadiness::Ready
+      } else {
+        OverlayWindowReadiness::Failed
+      }
     }
   }
 }
@@ -501,19 +515,29 @@ impl CaptureSurfaceError {
 #[derive(Default)]
 struct FocusRestore {
   application: Option<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>>,
+  own_key_window: Option<objc2::rc::Retained<objc2_app_kit::NSWindow>>,
 }
 
 #[cfg(target_os = "macos")]
 impl FocusRestore {
   fn capture() -> Self {
-    use objc2_app_kit::NSWorkspace;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSRunningApplication, NSWorkspace};
 
-    Self { application: NSWorkspace::sharedWorkspace().frontmostApplication() }
+    let application = NSWorkspace::sharedWorkspace().frontmostApplication();
+    let current_pid = NSRunningApplication::currentApplication().processIdentifier();
+    let own_key_window = application
+      .as_ref()
+      .filter(|application| application.processIdentifier() == current_pid)
+      .and_then(|_| MainThreadMarker::new())
+      .and_then(|mtm| NSApplication::sharedApplication(mtm).keyWindow());
+    Self { application, own_key_window }
   }
 
   fn restore(&mut self) {
     use objc2_app_kit::NSApplicationActivationOptions;
 
+    let own_key_window = self.own_key_window.take();
     let Some(application) = self.application.take() else {
       return;
     };
@@ -521,6 +545,9 @@ impl FocusRestore {
       #[allow(deprecated)]
       let _ =
         application.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+      if let Some(window) = own_key_window {
+        window.makeKeyAndOrderFront(None);
+      }
     }
   }
 }
@@ -542,15 +569,23 @@ impl FocusRestore {
 mod macos {
   use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
   use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSPanel, NSScreen, NSStatusWindowLevel,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel, NSWindowSharingType,
-    NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSNormalWindowLevel, NSPanel, NSScreen,
+    NSScreenSaverWindowLevel, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowLevel, NSWindowOrderingMode, NSWindowSharingType, NSWindowStyleMask,
   };
   use objc2_foundation::{NSNumber, NSString};
   use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
 
-  use super::{CAPTURE_OVERLAY_TITLE, CaptureSurfaceError, DisplaySnapshot};
+  use super::{
+    CaptureSurfaceError, DisplaySnapshot, OverlayWindowReadiness, capture_overlay_title,
+  };
   use crate::capture::NativeCaptureImage;
+
+  pub(super) struct OverlayWindow {
+    window: Retained<NSWindow>,
+    title: String,
+    ready: bool,
+  }
 
   pub(super) struct FrozenImagePanel {
     panel: Retained<NSPanel>,
@@ -579,6 +614,8 @@ mod macos {
       panel.setHasShadow(false);
       panel.setIgnoresMouseEvents(true);
       panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
+      panel.setCanHide(false);
+      panel.setHidesOnDeactivate(false);
       panel.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
           | NSWindowCollectionBehavior::Stationary
@@ -624,7 +661,7 @@ mod macos {
 
     pub(super) fn present(&self) {
       self.panel.setLevel(frozen_panel_window_level());
-      self.panel.orderFrontRegardless();
+      self.panel.orderFront(None);
     }
 
     pub(super) fn hide(&self) {
@@ -645,28 +682,38 @@ mod macos {
     }
   }
 
-  pub(super) fn configure_overlay_window(display_id: u32) -> bool {
+  pub(super) fn configure_active_window_pair(
+    display: DisplaySnapshot,
+    overlay_window: &mut Option<OverlayWindow>,
+    frozen_panel: &FrozenImagePanel,
+  ) -> OverlayWindowReadiness {
     let Some(mtm) = MainThreadMarker::new() else {
-      return false;
+      return OverlayWindowReadiness::Failed;
     };
-    let Some(screen) = screen_for_display(mtm, display_id) else {
-      return false;
+    let Some(screen) = screen_for_display(mtm, display.display_id) else {
+      conceal_window_pair(overlay_window.as_mut(), frozen_panel);
+      return OverlayWindowReadiness::Failed;
     };
     let application = NSApplication::sharedApplication(mtm);
-    let Some(window) = application
-      .windows()
-      .into_iter()
-      .find(|window| window.title().to_string() == CAPTURE_OVERLAY_TITLE)
-    else {
-      return false;
+    acquire_overlay_window(mtm, display.display_id, overlay_window);
+    let Some(overlay_window) = overlay_window.as_mut() else {
+      conceal_frozen_panel(frozen_panel);
+      return OverlayWindowReadiness::Pending;
     };
+    let window = &overlay_window.window;
+    if overlay_window.ready && window_pair_is_ready(&application, &screen, window, frozen_panel) {
+      return OverlayWindowReadiness::Ready;
+    }
+    overlay_window.ready = false;
 
     window.setStyleMask(NSWindowStyleMask::Borderless);
     window.setFrame_display(screen.frame(), false);
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
     window.setHasShadow(false);
-    window.setIgnoresMouseEvents(false);
+    window.setIgnoresMouseEvents(true);
+    window.setCanHide(false);
+    window.setHidesOnDeactivate(false);
     window.setLevel(editor_overlay_window_level());
     window.setAnimationBehavior(NSWindowAnimationBehavior::None);
     window.setCollectionBehavior(
@@ -676,36 +723,183 @@ mod macos {
         | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
     window.setSharingType(NSWindowSharingType::None);
+
+    // Do not reveal the frozen image until the editor window can receive the escape/cancel input.
+    #[allow(deprecated)]
+    application.activateIgnoringOtherApps(true);
+    window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
-    true
+    if !application.isActive() || !window.isVisible() || !window.isKeyWindow() {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending;
+    }
+
+    attach_frozen_panel_below(window, frozen_panel);
+    frozen_panel.present();
+    window.makeKeyAndOrderFront(None);
+    window.orderFrontRegardless();
+
+    let ready = window_pair_is_structurally_ready(&application, &screen, window, frozen_panel);
+    if ready {
+      window.setIgnoresMouseEvents(false);
+      overlay_window.ready = true;
+      OverlayWindowReadiness::Ready
+    } else {
+      prepare_window_pair_retry(window, frozen_panel);
+      OverlayWindowReadiness::Pending
+    }
   }
 
-  pub(super) fn enforce_overlay_window_level() -> bool {
+  pub(super) fn hide_window_pair(
+    display_id: u32,
+    overlay_window: &mut Option<OverlayWindow>,
+    frozen_panel: Option<&FrozenImagePanel>,
+  ) {
     let Some(mtm) = MainThreadMarker::new() else {
-      return false;
+      return;
     };
-    let application = NSApplication::sharedApplication(mtm);
-    let Some(window) = application
-      .windows()
-      .into_iter()
-      .find(|window| window.title().to_string() == CAPTURE_OVERLAY_TITLE)
-    else {
-      return false;
-    };
-    window.setLevel(editor_overlay_window_level());
-    true
+    acquire_overlay_window(mtm, display_id, overlay_window);
+    if let Some(overlay_window) = overlay_window.as_mut() {
+      overlay_window.ready = false;
+      overlay_window.window.setIgnoresMouseEvents(true);
+      if overlay_window.window.isKeyWindow() {
+        overlay_window.window.resignKeyWindow();
+      }
+    }
+    if let Some(frozen_panel) = frozen_panel {
+      detach_frozen_panel(frozen_panel);
+      frozen_panel.hide();
+    }
+    if let Some(overlay_window) = overlay_window.as_ref() {
+      demote_overlay_window(&overlay_window.window);
+    }
   }
 
   fn frozen_panel_window_level() -> NSWindowLevel {
-    NSStatusWindowLevel + 1
+    NSScreenSaverWindowLevel
   }
 
   fn editor_overlay_window_level() -> NSWindowLevel {
-    NSStatusWindowLevel + 2
+    NSScreenSaverWindowLevel
+  }
+
+  fn inactive_overlay_window_level() -> NSWindowLevel {
+    NSNormalWindowLevel
+  }
+
+  fn attach_frozen_panel_below(window: &NSWindow, frozen_panel: &FrozenImagePanel) {
+    if frozen_panel_is_child_of(window, frozen_panel) {
+      return;
+    }
+    detach_frozen_panel(frozen_panel);
+    // Both retained windows are main-thread AppKit objects and are detached again on every exit.
+    unsafe {
+      window.addChildWindow_ordered(&frozen_panel.panel, NSWindowOrderingMode::Below);
+    }
+  }
+
+  fn detach_frozen_panel(frozen_panel: &FrozenImagePanel) {
+    if let Some(parent) = frozen_panel.panel.parentWindow() {
+      parent.removeChildWindow(&frozen_panel.panel);
+    }
+  }
+
+  fn conceal_frozen_panel(frozen_panel: &FrozenImagePanel) {
+    detach_frozen_panel(frozen_panel);
+    frozen_panel.panel.orderOut(None);
+  }
+
+  fn conceal_window_pair(
+    overlay_window: Option<&mut OverlayWindow>,
+    frozen_panel: &FrozenImagePanel,
+  ) {
+    conceal_frozen_panel(frozen_panel);
+    if let Some(overlay_window) = overlay_window {
+      overlay_window.ready = false;
+      demote_overlay_window(&overlay_window.window);
+    }
+  }
+
+  fn prepare_window_pair_retry(window: &NSWindow, frozen_panel: &FrozenImagePanel) {
+    window.setIgnoresMouseEvents(true);
+    conceal_frozen_panel(frozen_panel);
+  }
+
+  fn demote_overlay_window(window: &NSWindow) {
+    window.setIgnoresMouseEvents(true);
+    if window.isKeyWindow() {
+      window.resignKeyWindow();
+    }
+    window.setLevel(inactive_overlay_window_level());
+    window.orderBack(None);
+  }
+
+  fn frozen_panel_is_child_of(window: &NSWindow, frozen_panel: &FrozenImagePanel) -> bool {
+    frozen_panel
+      .panel
+      .parentWindow()
+      .is_some_and(|parent| Retained::as_ptr(&parent) == std::ptr::from_ref(window))
+  }
+
+  fn window_pair_is_ready(
+    application: &NSApplication,
+    screen: &NSScreen,
+    window: &NSWindow,
+    frozen_panel: &FrozenImagePanel,
+  ) -> bool {
+    window_pair_is_structurally_ready(application, screen, window, frozen_panel)
+      && !window.ignoresMouseEvents()
+  }
+
+  fn window_pair_is_structurally_ready(
+    application: &NSApplication,
+    screen: &NSScreen,
+    window: &NSWindow,
+    frozen_panel: &FrozenImagePanel,
+  ) -> bool {
+    let screen_frame = screen.frame();
+    application.isActive()
+      && frozen_panel.panel.isVisible()
+      && frozen_panel.panel.level() == frozen_panel_window_level()
+      && frozen_panel.panel.frame() == screen_frame
+      && window.isVisible()
+      && window.isKeyWindow()
+      && window.level() == editor_overlay_window_level()
+      && window.frame() == screen_frame
+      && frozen_panel_is_child_of(window, frozen_panel)
+  }
+
+  fn acquire_overlay_window(
+    mtm: MainThreadMarker,
+    display_id: u32,
+    overlay_window: &mut Option<OverlayWindow>,
+  ) {
+    let title = capture_overlay_title(display_id);
+    let windows: Vec<_> = NSApplication::sharedApplication(mtm).windows().into_iter().collect();
+    let retained_window_is_current = overlay_window.as_ref().is_some_and(|overlay_window| {
+      overlay_window.title == title
+        && windows.iter().any(|window| {
+          Retained::as_ptr(window) == Retained::as_ptr(&overlay_window.window)
+            && window.title().to_string() == title
+        })
+    });
+    if retained_window_is_current {
+      return;
+    }
+
+    if let Some(stale_window) = overlay_window.as_ref() {
+      demote_overlay_window(&stale_window.window);
+    }
+
+    *overlay_window = windows
+      .into_iter()
+      .find(|window| window.title().to_string() == title)
+      .map(|window| OverlayWindow { window, title, ready: false });
   }
 
   impl Drop for FrozenImagePanel {
     fn drop(&mut self) {
+      detach_frozen_panel(self);
       self.panel.orderOut(None);
     }
   }
@@ -724,14 +918,17 @@ mod macos {
 
   #[cfg(test)]
   mod tests {
-    use objc2_app_kit::NSStatusWindowLevel;
+    use objc2_app_kit::{NSNormalWindowLevel, NSScreenSaverWindowLevel};
 
-    use super::{editor_overlay_window_level, frozen_panel_window_level};
+    use super::{
+      editor_overlay_window_level, frozen_panel_window_level, inactive_overlay_window_level,
+    };
 
     #[test]
     fn capture_window_levels_cover_system_ui_with_the_editor_on_top() {
-      assert!(frozen_panel_window_level() > NSStatusWindowLevel);
-      assert!(editor_overlay_window_level() > frozen_panel_window_level());
+      assert_eq!(frozen_panel_window_level(), NSScreenSaverWindowLevel);
+      assert_eq!(editor_overlay_window_level(), frozen_panel_window_level());
+      assert_eq!(inactive_overlay_window_level(), NSNormalWindowLevel);
     }
   }
 }
@@ -781,6 +978,16 @@ mod tests {
     coordinator.refresh(vec![display(1, [-1920, 0, 1920, 1080]), display(2, [0, 0, 1728, 1117])]);
     assert_eq!(coordinator.display_for_point([-10, 20]), Some(1));
     assert_eq!(coordinator.display_for_point([100, 20]), Some(2));
+  }
+
+  #[test]
+  fn overlay_titles_strongly_identify_their_display_viewports() {
+    let first = display(1, [0, 0, 100, 80]).viewport_builder(SurfaceLifecycle::Hidden);
+    let second = display(2, [100, 0, 100, 80]).viewport_builder(SurfaceLifecycle::Hidden);
+
+    assert_eq!(first.title.as_deref(), Some("RS Board Capture Overlay [1]"));
+    assert_eq!(second.title.as_deref(), Some("RS Board Capture Overlay [2]"));
+    assert_ne!(first.title, second.title);
   }
 
   #[cfg(target_os = "macos")]

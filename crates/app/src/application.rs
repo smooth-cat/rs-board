@@ -13,7 +13,9 @@ use common::{
   BoardDocument, CapturedDisplay, CommandHistory, DirtyBaseline, DocumentId, Element,
   GlobalBoundsPx, SizePx,
 };
-use eframe::egui::{self, Color32, TextureHandle, TextureOptions, ViewportCommand, WindowLevel};
+use eframe::egui::{
+  self, Color32, TextureHandle, TextureOptions, ViewportCommand, ViewportId, WindowLevel,
+};
 use image::RgbaImage;
 use thiserror::Error;
 use uuid::Uuid;
@@ -25,7 +27,9 @@ use crate::{
     invalidate_capture_backend_cache, prepare_display_capture_under_cursor_at,
     prewarm_capture_backend, request_screen_recording_permission,
   },
-  capture_surface::{CaptureSurfaceCoordinator, DisplayRefreshOutcome, SurfaceLifecycle},
+  capture_surface::{
+    CaptureSurfaceCoordinator, DisplayRefreshOutcome, OverlayWindowReadiness, SurfaceLifecycle,
+  },
   draft_coordinator::{DraftCoordinator, DraftCoordinatorError, DraftResult, StashJob},
   editor::{EditorAction, EditorController, EditorTool},
   export::{copy_image, write_png_atomically},
@@ -65,6 +69,8 @@ const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
   760.0,
 );
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
+const OVERLAY_READINESS_RETRY_DELAY: Duration = Duration::from_millis(32);
+const OVERLAY_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOrigin {
@@ -248,7 +254,9 @@ pub struct RsBoardApp {
   hotkey: Option<GlobalF1Hotkey>,
   tray: Option<TrayController>,
   surface: WindowSurface,
+  return_surface_after_editor: Option<WindowSurface>,
   capture_surfaces: CaptureSurfaceCoordinator,
+  overlay_readiness_started_at: Option<Instant>,
   background_encoder: BackgroundEncodeScheduler,
   draft_coordinator: DraftCoordinator,
   post_save_coordinator: PostSaveCoordinator,
@@ -300,11 +308,11 @@ impl RsBoardApp {
     let (worker_sender, worker_receiver) = mpsc::channel();
     let draft_coordinator = DraftCoordinator::new(store.clone(), {
       let context = creation_context.egui_ctx.clone();
-      move || context.request_repaint()
+      move || request_root_repaint(&context)
     })?;
     let post_save_coordinator = PostSaveCoordinator::new(store.clone(), {
       let context = creation_context.egui_ctx.clone();
-      move || context.request_repaint()
+      move || request_root_repaint(&context)
     })?;
     let open_file_bridge = OpenFileBridge::install();
     let mut library_error = None;
@@ -317,7 +325,7 @@ impl RsBoardApp {
     };
     let hotkey = match GlobalF1Hotkey::from_shortcut_with_waker(&settings.global_hotkey, {
       let context = creation_context.egui_ctx.clone();
-      move || context.request_repaint()
+      move || request_root_repaint(&context)
     }) {
       Ok(hotkey) => Some(hotkey),
       Err(error) => {
@@ -327,7 +335,7 @@ impl RsBoardApp {
     };
     let tray = TrayController::with_waker({
       let context = creation_context.egui_ctx.clone();
-      move || context.request_repaint()
+      move || request_root_repaint(&context)
     })
     .ok();
     if let Some(tray) = &tray {
@@ -352,7 +360,9 @@ impl RsBoardApp {
       hotkey,
       tray,
       surface: WindowSurface::Hidden,
+      return_surface_after_editor: None,
       capture_surfaces,
+      overlay_readiness_started_at: None,
       background_encoder: BackgroundEncodeScheduler::new(),
       draft_coordinator,
       post_save_coordinator,
@@ -423,7 +433,7 @@ impl RsBoardApp {
       let event = work();
       lifecycle_timer.finish_ok();
       let _ = sender.send(event);
-      context.request_repaint();
+      request_root_repaint(&context);
     });
     match result {
       Ok(_) => {
@@ -453,6 +463,7 @@ impl RsBoardApp {
     let capture_sequence = next_sequence(&mut self.next_capture_sequence);
     self.capture_surfaces.remember_frontmost_application();
     self.capture_surfaces.exclude_application_windows();
+    self.enter_editor_host(context);
     let performance = PerformanceContext::capture(request_id, capture_sequence);
     PerformanceTimer::started_at(
       "capture.request.dispatch",
@@ -491,6 +502,7 @@ impl RsBoardApp {
           .finish_error(&error);
           self.phase = Phase::Idle;
           self.capture_surfaces.hide_active();
+          self.return_surface_after_editor = None;
           self.library_error = Some(error.to_string());
           self.show_library_window(context);
           return;
@@ -535,6 +547,7 @@ impl RsBoardApp {
       .finish_error(&error);
       self.phase = Phase::Idle;
       self.capture_surfaces.hide_active();
+      self.return_surface_after_editor = None;
       self.library_error = Some(format!("无法启动截图任务：{error}"));
       self.show_library_window(context);
       self.update_tray();
@@ -1228,6 +1241,7 @@ impl RsBoardApp {
               }
               self.phase = Phase::Idle;
               self.capture_surfaces.hide_active();
+              self.return_surface_after_editor = None;
               self.library_error = Some(error);
               self.show_library_window(context);
             }
@@ -1346,7 +1360,7 @@ impl RsBoardApp {
               self.preview_textures.remove(&saved.document_id);
               if self.quit_after_persist {
                 self.allow_close = true;
-                context.send_viewport_cmd(ViewportCommand::Close);
+                send_root_viewport_command(context, ViewportCommand::Close);
               } else {
                 self.hide_editor_window(context);
               }
@@ -1593,12 +1607,17 @@ impl RsBoardApp {
       .or_else(|| self.capture_surfaces.active_display_id())
       .or_else(|| self.capture_surfaces.fallback_display());
     let Some(display_id) = display_id else {
-      self.persistent_error = Some("没有可用的截图编辑窗口".into());
+      self.fail_editor_presentation(context, "没有可用的截图编辑窗口");
       return;
     };
     let Some(session_id) = self.session.as_ref().map(|session| session.session_id) else {
+      self.fail_editor_presentation(context, "没有可用的编辑会话");
       return;
     };
+    if self.session.as_ref().is_some_and(|session| session.origin != SessionOrigin::NewCapture) {
+      self.capture_surfaces.remember_frontmost_application();
+    }
+    self.enter_editor_host(context);
     let request_id = self
       .capture_presentation_trace
       .and_then(|trace| trace.performance.request_id)
@@ -1607,8 +1626,7 @@ impl RsBoardApp {
       self.session.as_ref().and_then(|session| session.native_background.as_ref())
       && let Err(error) = self.capture_surfaces.set_frozen_image(display_id, image)
     {
-      self.persistent_error = Some(error.to_string());
-      self.capture_surfaces.hide_active();
+      self.fail_editor_presentation(context, error.to_string());
       return;
     }
     let result = self
@@ -1616,39 +1634,54 @@ impl RsBoardApp {
       .present(display_id, request_id)
       .and_then(|_| self.capture_surfaces.begin_editing(display_id, session_id));
     if let Err(error) = result {
-      self.persistent_error = Some(error.to_string());
-      self.capture_surfaces.hide_active();
+      self.fail_editor_presentation(context, error.to_string());
       return;
     }
-    context.request_repaint();
+    self.overlay_readiness_started_at = Some(Instant::now());
+    request_root_repaint(context);
     if let Some(timer) = window_timer {
       timer.finish_ok();
     }
   }
 
-  fn show_library_window(&mut self, context: &egui::Context) {
+  fn configure_library_window(&mut self, context: &egui::Context, focus: bool) {
     self.surface = WindowSurface::Library;
     send_platform_fullscreen_command(context, false);
     send_platform_window_level_command(context, WindowLevel::Normal);
-    context.send_viewport_cmd(ViewportCommand::Decorations(true));
-    context.send_viewport_cmd(ViewportCommand::Resizable(true));
-    context.send_viewport_cmd(ViewportCommand::InnerSize(LIBRARY_SIZE));
-    context.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
-    context.send_viewport_cmd(ViewportCommand::Visible(true));
-    context.send_viewport_cmd(ViewportCommand::Focus);
+    send_root_viewport_command(context, ViewportCommand::Decorations(true));
+    send_root_viewport_command(context, ViewportCommand::Resizable(true));
+    send_root_viewport_command(context, ViewportCommand::InnerSize(LIBRARY_SIZE));
+    send_root_viewport_command(context, ViewportCommand::MousePassthrough(false));
+    if focus {
+      send_root_viewport_command(context, ViewportCommand::Focus);
+    }
     configure_root_window(RootWindowPresentation::Library);
   }
 
-  fn hide_library_window(&mut self, context: &egui::Context) {
+  fn configure_editor_host(&mut self, context: &egui::Context) {
     self.surface = WindowSurface::Hidden;
     send_platform_fullscreen_command(context, false);
     send_platform_window_level_command(context, WindowLevel::Normal);
-    context.send_viewport_cmd(ViewportCommand::Decorations(false));
-    context.send_viewport_cmd(ViewportCommand::Resizable(false));
-    context.send_viewport_cmd(ViewportCommand::InnerSize(TRAY_HOST_SIZE));
-    context.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
-    context.send_viewport_cmd(ViewportCommand::Visible(true));
+    send_root_viewport_command(context, ViewportCommand::Decorations(false));
+    send_root_viewport_command(context, ViewportCommand::Resizable(false));
+    send_root_viewport_command(context, ViewportCommand::InnerSize(TRAY_HOST_SIZE));
+    send_root_viewport_command(context, ViewportCommand::MousePassthrough(true));
     configure_root_window(RootWindowPresentation::CaptureHost);
+  }
+
+  fn show_library_window(&mut self, context: &egui::Context) {
+    update_editor_return_surface(&mut self.return_surface_after_editor, WindowSurface::Library);
+    self.configure_library_window(context, true);
+  }
+
+  fn hide_library_window(&mut self, context: &egui::Context) {
+    update_editor_return_surface(&mut self.return_surface_after_editor, WindowSurface::Hidden);
+    self.configure_editor_host(context);
+  }
+
+  fn enter_editor_host(&mut self, context: &egui::Context) {
+    remember_editor_return_surface(&mut self.return_surface_after_editor, self.surface);
+    self.configure_editor_host(context);
   }
 
   fn handle_root_close_request(&mut self, context: &egui::Context) {
@@ -1663,8 +1696,22 @@ impl RsBoardApp {
   }
 
   fn hide_editor_window(&mut self, context: &egui::Context) {
+    self.overlay_readiness_started_at = None;
+    match self.return_surface_after_editor.take().unwrap_or(WindowSurface::Hidden) {
+      WindowSurface::Library => self.configure_library_window(context, false),
+      WindowSurface::Hidden => self.configure_editor_host(context),
+    }
     self.capture_surfaces.hide_active();
-    context.request_repaint();
+    request_root_repaint(context);
+  }
+
+  fn fail_editor_presentation(&mut self, context: &egui::Context, error: impl Into<String>) {
+    self.overlay_readiness_started_at = None;
+    self.library_error = Some(error.into());
+    self.capture_surfaces.hide_active();
+    self.return_surface_after_editor = None;
+    self.configure_library_window(context, true);
+    request_root_repaint(context);
   }
 
   fn poll_external_events(&mut self, context: &egui::Context) {
@@ -1737,7 +1784,7 @@ impl RsBoardApp {
             self.start_stash(context);
             if self.phase == Phase::Idle {
               self.allow_close = true;
-              context.send_viewport_cmd(ViewportCommand::Close);
+              send_root_viewport_command(context, ViewportCommand::Close);
             }
           }
           SessionOrigin::ExistingDocument if session.is_dirty() => {
@@ -1746,13 +1793,13 @@ impl RsBoardApp {
           }
           SessionOrigin::ExistingDocument => {
             self.allow_close = true;
-            context.send_viewport_cmd(ViewportCommand::Close);
+            send_root_viewport_command(context, ViewportCommand::Close);
           }
         }
       }
       _ => {
         self.allow_close = true;
-        context.send_viewport_cmd(ViewportCommand::Close);
+        send_root_viewport_command(context, ViewportCommand::Close);
       }
     }
   }
@@ -2224,7 +2271,7 @@ impl RsBoardApp {
         Some(ExitChoice::Discard) => {
           self.exit_dialog = false;
           self.allow_close = true;
-          context.send_viewport_cmd(ViewportCommand::Close);
+          send_root_viewport_command(context, ViewportCommand::Close);
         }
         Some(ExitChoice::Save) => {
           self.exit_dialog = false;
@@ -2438,7 +2485,7 @@ impl RsBoardApp {
       } else {
         GlobalF1Hotkey::from_shortcut_with_waker(&next.global_hotkey, {
           let context = context.clone();
-          move || context.request_repaint()
+          move || request_root_repaint(&context)
         })
         .map(|hotkey| self.hotkey = Some(hotkey))
       };
@@ -2499,34 +2546,48 @@ impl RsBoardApp {
     for viewport in self.capture_surfaces.viewport_specs_for_frame() {
       let lifecycle = viewport.lifecycle;
       let is_active = viewport.is_active();
-      context.show_viewport_immediate(
-        viewport.viewport_id,
-        viewport.builder,
-        |ui, _viewport_class| {
-          if !is_active {
+      let viewport_id = viewport.viewport_id;
+      context.show_viewport_immediate(viewport_id, viewport.builder, |ui, _viewport_class| {
+        if !is_active {
+          return;
+        }
+
+        let viewport_context = ui.ctx().clone();
+        match self.capture_surfaces.configure_active_overlay_window() {
+          OverlayWindowReadiness::Ready => self.overlay_readiness_started_at = None,
+          OverlayWindowReadiness::Pending => {
+            if overlay_readiness_can_retry(&mut self.overlay_readiness_started_at, Instant::now()) {
+              request_immediate_viewport_retry(&viewport_context, viewport_id);
+            } else {
+              self.fail_editor_presentation(
+                &viewport_context,
+                "截图编辑窗口激活超时，请重新打开或重新截图",
+              );
+            }
             return;
           }
-
-          self.capture_surfaces.configure_active_overlay_window();
-          let viewport_context = ui.ctx().clone();
-          if viewport_context.input(|input| input.viewport().close_requested())
-            && self.phase.has_active_session()
-          {
-            viewport_context.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.close_editor(&viewport_context);
+          OverlayWindowReadiness::Failed => {
+            self.fail_editor_presentation(&viewport_context, "无法创建截图编辑窗口，请重试");
+            return;
           }
-          if matches!(
-            lifecycle,
-            SurfaceLifecycle::Presenting { .. } | SurfaceLifecycle::Editing { .. }
-          ) && self.session.is_some()
-          {
-            self.show_editor_ui(ui, &viewport_context);
-            self.show_dialogs(&viewport_context);
-            self.show_toast(&viewport_context);
-            self.finish_capture_presentation_trace();
-          }
-        },
-      );
+        }
+        if viewport_context.input(|input| input.viewport().close_requested())
+          && self.phase.has_active_session()
+        {
+          viewport_context.send_viewport_cmd(ViewportCommand::CancelClose);
+          self.close_editor(&viewport_context);
+        }
+        if matches!(
+          lifecycle,
+          SurfaceLifecycle::Presenting { .. } | SurfaceLifecycle::Editing { .. }
+        ) && self.session.is_some()
+        {
+          self.show_editor_ui(ui, &viewport_context);
+          self.show_dialogs(&viewport_context);
+          self.show_toast(&viewport_context);
+          self.finish_capture_presentation_trace();
+        }
+      });
     }
   }
 
@@ -2672,6 +2733,22 @@ fn root_close_action(surface: WindowSurface, phase: Phase) -> RootCloseAction {
   }
 }
 
+fn remember_editor_return_surface(
+  return_surface: &mut Option<WindowSurface>,
+  current_surface: WindowSurface,
+) {
+  return_surface.get_or_insert(current_surface);
+}
+
+fn update_editor_return_surface(
+  return_surface: &mut Option<WindowSurface>,
+  requested_surface: WindowSurface,
+) {
+  if return_surface.is_some() {
+    *return_surface = Some(requested_surface);
+  }
+}
+
 fn performance_from_persistence_context(context: PersistenceContext) -> PerformanceContext {
   PerformanceContext {
     request_id: Some(context.request_id),
@@ -2745,9 +2822,32 @@ fn library_document_description_height(ui: &egui::Ui) -> f32 {
     + ui.text_style_height(&egui::TextStyle::Small)
 }
 
+fn send_root_viewport_command(context: &egui::Context, command: ViewportCommand) {
+  context.send_viewport_cmd_to(ViewportId::ROOT, command);
+}
+
+fn request_root_repaint(context: &egui::Context) {
+  context.request_repaint_of(ViewportId::ROOT);
+}
+
+fn immediate_viewport_retry_targets(viewport_id: ViewportId) -> [ViewportId; 2] {
+  [viewport_id, ViewportId::ROOT]
+}
+
+fn request_immediate_viewport_retry(context: &egui::Context, viewport_id: ViewportId) {
+  for target in immediate_viewport_retry_targets(viewport_id) {
+    context.request_repaint_after_for(OVERLAY_READINESS_RETRY_DELAY, target);
+  }
+}
+
+fn overlay_readiness_can_retry(started_at: &mut Option<Instant>, now: Instant) -> bool {
+  let started_at = *started_at.get_or_insert(now);
+  now.saturating_duration_since(started_at) < OVERLAY_READINESS_TIMEOUT
+}
+
 #[cfg(not(target_os = "macos"))]
 fn send_platform_fullscreen_command(context: &egui::Context, fullscreen: bool) {
-  context.send_viewport_cmd(ViewportCommand::Fullscreen(fullscreen));
+  send_root_viewport_command(context, ViewportCommand::Fullscreen(fullscreen));
 }
 
 #[cfg(target_os = "macos")]
@@ -2755,7 +2855,7 @@ fn send_platform_fullscreen_command(_context: &egui::Context, _fullscreen: bool)
 
 #[cfg(not(target_os = "macos"))]
 fn send_platform_window_level_command(context: &egui::Context, level: WindowLevel) {
-  context.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+  send_root_viewport_command(context, ViewportCommand::WindowLevel(level));
 }
 
 #[cfg(target_os = "macos")]
@@ -2837,6 +2937,77 @@ mod tests {
 
     assert_eq!(root_close_action(WindowSurface::Hidden, phase), RootCloseAction::RequestQuit);
     assert_eq!(root_close_action(WindowSurface::Hidden, Phase::Idle), RootCloseAction::HideLibrary);
+  }
+
+  #[test]
+  fn editor_host_remembers_and_restores_the_callers_root_surface() {
+    let mut return_surface = None;
+
+    remember_editor_return_surface(&mut return_surface, WindowSurface::Library);
+    remember_editor_return_surface(&mut return_surface, WindowSurface::Hidden);
+    assert_eq!(return_surface, Some(WindowSurface::Library));
+
+    update_editor_return_surface(&mut return_surface, WindowSurface::Hidden);
+    assert_eq!(return_surface, Some(WindowSurface::Hidden));
+
+    let mut inactive_return_surface = None;
+    update_editor_return_surface(&mut inactive_return_surface, WindowSurface::Library);
+    assert_eq!(inactive_return_surface, None);
+  }
+
+  #[test]
+  fn root_window_commands_do_not_follow_the_current_child_viewport() {
+    let context = egui::Context::default();
+    let child_viewport = ViewportId::from_hash_of("capture-child");
+    let mut input = egui::RawInput { viewport_id: child_viewport, ..Default::default() };
+    input.viewports.insert(child_viewport, Default::default());
+    let output = context.run_ui(input, |_| {
+      send_root_viewport_command(&context, ViewportCommand::MousePassthrough(false))
+    });
+
+    let root_received_command = output.viewport_output[&ViewportId::ROOT]
+      .commands
+      .iter()
+      .any(|command| matches!(command, ViewportCommand::MousePassthrough(false)));
+    let child_received_command = output.viewport_output[&child_viewport]
+      .commands
+      .iter()
+      .any(|command| matches!(command, ViewportCommand::MousePassthrough(false)));
+    output.drop_without_applying_deltas();
+
+    assert!(root_received_command);
+    assert!(!child_received_command);
+  }
+
+  #[test]
+  fn immediate_viewport_retry_wakes_the_child_and_root() {
+    let context = egui::Context::default();
+    let child_viewport = ViewportId::from_hash_of("capture-child");
+    assert_eq!(
+      immediate_viewport_retry_targets(child_viewport),
+      [child_viewport, ViewportId::ROOT]
+    );
+
+    request_immediate_viewport_retry(&context, child_viewport);
+
+    assert!(context.has_requested_repaint_for(&child_viewport));
+    assert!(context.has_requested_repaint_for(&ViewportId::ROOT));
+  }
+
+  #[test]
+  fn overlay_readiness_retry_is_bounded() {
+    let started_at = Instant::now();
+    let mut retry_started_at = None;
+
+    assert!(overlay_readiness_can_retry(&mut retry_started_at, started_at));
+    assert!(overlay_readiness_can_retry(
+      &mut retry_started_at,
+      started_at + OVERLAY_READINESS_TIMEOUT - Duration::from_millis(1),
+    ));
+    assert!(!overlay_readiness_can_retry(
+      &mut retry_started_at,
+      started_at + OVERLAY_READINESS_TIMEOUT,
+    ));
   }
 
   #[test]
