@@ -69,20 +69,24 @@ fn native_egui_context() -> eframe::egui::Context {
 }
 
 fn native_options(initially_visible: bool) -> eframe::NativeOptions {
-  let mut options = eframe::NativeOptions {
-    viewport: eframe::egui::ViewportBuilder::default()
-      .with_title(APP_NAME)
-      .with_app_id(APP_ID)
-      .with_inner_size([1120.0, 760.0])
-      // Glow reuses the root OpenGL pixel format for child viewports. The capture overlay
-      // needs an alpha channel even though the library paints an opaque background.
-      .with_transparent(true)
-      .with_visible(initially_visible)
-      .with_active(initially_visible),
-    centered: true,
-    persist_window: false,
-    ..Default::default()
+  let viewport = eframe::egui::ViewportBuilder::default()
+    .with_title(APP_NAME)
+    .with_app_id(APP_ID)
+    .with_inner_size([1120.0, 760.0])
+    // Glow reuses the root OpenGL pixel format for child viewports. The capture overlay
+    // needs an alpha channel even though the library paints an opaque background.
+    .with_transparent(true)
+    .with_visible(true)
+    .with_active(initially_visible);
+  let viewport = if initially_visible {
+    viewport.with_decorations(true).with_resizable(true).with_mouse_passthrough(false)
+  } else {
+    // Immediate viewports are only created while their parent is renderable. Keep an invisible
+    // host alive in tray mode; RsBoardApp shrinks it to one transparent point after startup.
+    viewport.with_decorations(false).with_resizable(false).with_mouse_passthrough(true)
   };
+  let mut options =
+    eframe::NativeOptions { viewport, centered: true, persist_window: false, ..Default::default() };
 
   #[cfg(target_os = "macos")]
   {
@@ -188,5 +192,14 @@ mod tests {
   #[test]
   fn native_context_creates_capture_overlays_as_native_viewports() {
     assert!(!native_egui_context().embed_viewports());
+  }
+
+  #[test]
+  fn tray_mode_keeps_a_transparent_mouse_passthrough_viewport_renderable() {
+    let viewport = native_options(false).viewport;
+    assert_eq!(viewport.visible, Some(true));
+    assert_eq!(viewport.transparent, Some(true));
+    assert_eq!(viewport.decorations, Some(false));
+    assert_eq!(viewport.mouse_passthrough, Some(true));
   }
 }

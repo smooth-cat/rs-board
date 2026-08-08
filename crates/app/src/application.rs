@@ -33,7 +33,10 @@ use crate::{
   performance::{
     PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
   },
-  platform::{GlobalF1Hotkey, OpenFileBridge, global_cursor_position, set_launch_at_login},
+  platform::{
+    GlobalF1Hotkey, OpenFileBridge, RootWindowPresentation, configure_root_window,
+    global_cursor_position, set_launch_at_login,
+  },
   post_save::{PostSaveCoordinator, PostSaveCoordinatorError, PostSaveJob, PostSaveResult},
   recent::RecentDocuments,
   renderer::render_document_to_image,
@@ -53,6 +56,7 @@ const LIBRARY_CARD_INNER_MARGIN: f32 = 8.0;
 const LIBRARY_CARD_CONTENT_GAP: f32 = 7.0;
 const LIBRARY_CARD_ACTION_WIDTH: f32 = 40.0;
 const LIBRARY_PREVIEW_SIZE: egui::Vec2 = egui::vec2(144.0, 81.0);
+const TRAY_HOST_SIZE: egui::Vec2 = egui::vec2(1.0, 1.0);
 const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
   2.0 * LIBRARY_CARD_WIDTH
     + LIBRARY_GRID_GAP
@@ -198,6 +202,12 @@ enum RetryKind {
 enum WindowSurface {
   Hidden,
   Library,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootCloseAction {
+  HideLibrary,
+  RequestQuit,
 }
 
 #[derive(Clone, Copy)]
@@ -374,7 +384,7 @@ impl RsBoardApp {
     if starts_with_library {
       app.show_library_window(&creation_context.egui_ctx);
     } else {
-      creation_context.egui_ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+      app.hide_library_window(&creation_context.egui_ctx);
     }
     for path in startup_files {
       app.start_import(path, &creation_context.egui_ctx);
@@ -1623,17 +1633,33 @@ impl RsBoardApp {
     context.send_viewport_cmd(ViewportCommand::Decorations(true));
     context.send_viewport_cmd(ViewportCommand::Resizable(true));
     context.send_viewport_cmd(ViewportCommand::InnerSize(LIBRARY_SIZE));
+    context.send_viewport_cmd(ViewportCommand::MousePassthrough(false));
     context.send_viewport_cmd(ViewportCommand::Visible(true));
     context.send_viewport_cmd(ViewportCommand::Focus);
+    configure_root_window(RootWindowPresentation::Library);
   }
 
   fn hide_library_window(&mut self, context: &egui::Context) {
     self.surface = WindowSurface::Hidden;
     send_platform_fullscreen_command(context, false);
     send_platform_window_level_command(context, WindowLevel::Normal);
-    context.send_viewport_cmd(ViewportCommand::Decorations(true));
-    context.send_viewport_cmd(ViewportCommand::Resizable(true));
-    context.send_viewport_cmd(ViewportCommand::Visible(false));
+    context.send_viewport_cmd(ViewportCommand::Decorations(false));
+    context.send_viewport_cmd(ViewportCommand::Resizable(false));
+    context.send_viewport_cmd(ViewportCommand::InnerSize(TRAY_HOST_SIZE));
+    context.send_viewport_cmd(ViewportCommand::MousePassthrough(true));
+    context.send_viewport_cmd(ViewportCommand::Visible(true));
+    configure_root_window(RootWindowPresentation::CaptureHost);
+  }
+
+  fn handle_root_close_request(&mut self, context: &egui::Context) {
+    if !context.input(|input| input.viewport().close_requested()) || self.allow_close {
+      return;
+    }
+    context.send_viewport_cmd(ViewportCommand::CancelClose);
+    match root_close_action(self.surface, self.phase) {
+      RootCloseAction::HideLibrary => self.hide_library_window(context),
+      RootCloseAction::RequestQuit => self.request_quit(context),
+    }
   }
 
   fn hide_editor_window(&mut self, context: &egui::Context) {
@@ -2540,6 +2566,10 @@ impl RsBoardApp {
 
 impl eframe::App for RsBoardApp {
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    if self.surface == WindowSurface::Hidden {
+      configure_root_window(RootWindowPresentation::CaptureHost);
+    }
+    self.handle_root_close_request(context);
     self.handle_draft_results(context);
     self.handle_post_save_results();
     self.handle_worker_events(context);
@@ -2562,15 +2592,6 @@ impl eframe::App for RsBoardApp {
 
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     let context = ui.ctx().clone();
-
-    if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
-      context.send_viewport_cmd(ViewportCommand::CancelClose);
-      if self.surface == WindowSurface::Library || self.phase == Phase::Idle {
-        self.hide_library_window(&context);
-      } else {
-        self.request_quit(&context);
-      }
-    }
 
     match self.surface {
       WindowSurface::Library => self.show_library_ui(ui, &context),
@@ -2641,6 +2662,14 @@ fn load_rgba_texture(
 fn next_sequence(sequence: &mut u64) -> u64 {
   *sequence = sequence.checked_add(1).expect("performance sequence exhausted");
   *sequence
+}
+
+fn root_close_action(surface: WindowSurface, phase: Phase) -> RootCloseAction {
+  if surface == WindowSurface::Library || phase == Phase::Idle {
+    RootCloseAction::HideLibrary
+  } else {
+    RootCloseAction::RequestQuit
+  }
 }
 
 fn performance_from_persistence_context(context: PersistenceContext) -> PerformanceContext {
@@ -2801,6 +2830,14 @@ mod tests {
   use std::cell::Cell;
 
   use super::*;
+
+  #[test]
+  fn root_close_request_hides_idle_window_and_quits_active_session() {
+    let phase = Phase::Capturing { request_id: Uuid::new_v4(), capture_sequence: 1, display_id: 7 };
+
+    assert_eq!(root_close_action(WindowSurface::Hidden, phase), RootCloseAction::RequestQuit);
+    assert_eq!(root_close_action(WindowSurface::Hidden, Phase::Idle), RootCloseAction::HideLibrary);
+  }
 
   #[test]
   fn library_header_and_document_row_center_contents_vertically() {

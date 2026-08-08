@@ -68,7 +68,7 @@ impl DisplaySnapshot {
   fn viewport_builder(self, lifecycle: SurfaceLifecycle) -> ViewportBuilder {
     let [x, y, width, height] = self.bounds_global;
     let visible = !matches!(lifecycle, SurfaceLifecycle::Hidden);
-    ViewportBuilder::default()
+    let builder = ViewportBuilder::default()
       .with_title(CAPTURE_OVERLAY_TITLE)
       .with_app_id("com.linjiajian.rs-board.capture-overlay")
       .with_position(egui::pos2(x as f32, y as f32))
@@ -83,10 +83,14 @@ impl DisplaySnapshot {
       .with_close_button(false)
       .with_minimize_button(false)
       .with_maximize_button(false)
-      .with_window_level(WindowLevel::AlwaysOnTop)
       .with_mouse_passthrough(!visible)
       .with_active(visible)
-      .with_visible(visible)
+      .with_visible(visible);
+    if cfg!(target_os = "macos") {
+      builder
+    } else {
+      builder.with_window_level(WindowLevel::AlwaysOnTop)
+    }
   }
 }
 
@@ -422,11 +426,12 @@ impl CaptureSurfaceCoordinator {
 
   pub fn configure_active_overlay_window(&mut self) {
     #[cfg(target_os = "macos")]
-    if let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get_mut(&id))
-      && !surface.overlay_window_configured
-      && macos::configure_overlay_window(surface.display.display_id)
-    {
-      surface.overlay_window_configured = true;
+    if let Some(surface) = self.active_display_id.and_then(|id| self.surfaces.get_mut(&id)) {
+      surface.overlay_window_configured = if surface.overlay_window_configured {
+        macos::enforce_overlay_window_level()
+      } else {
+        macos::configure_overlay_window(surface.display.display_id)
+      };
     }
   }
 }
@@ -573,7 +578,6 @@ mod macos {
       panel.setBackgroundColor(Some(&NSColor::blackColor()));
       panel.setHasShadow(false);
       panel.setIgnoresMouseEvents(true);
-      panel.setLevel(frozen_panel_window_level());
       panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
       panel.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -585,6 +589,7 @@ mod macos {
       unsafe { panel.setReleasedWhenClosed(false) };
       panel.setFloatingPanel(false);
       panel.setBecomesKeyOnlyIfNeeded(true);
+      panel.setLevel(frozen_panel_window_level());
 
       let view = panel
         .contentView()
@@ -618,6 +623,7 @@ mod macos {
     }
 
     pub(super) fn present(&self) {
+      self.panel.setLevel(frozen_panel_window_level());
       self.panel.orderFrontRegardless();
     }
 
@@ -671,6 +677,22 @@ mod macos {
     );
     window.setSharingType(NSWindowSharingType::None);
     window.orderFrontRegardless();
+    true
+  }
+
+  pub(super) fn enforce_overlay_window_level() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+      return false;
+    };
+    let application = NSApplication::sharedApplication(mtm);
+    let Some(window) = application
+      .windows()
+      .into_iter()
+      .find(|window| window.title().to_string() == CAPTURE_OVERLAY_TITLE)
+    else {
+      return false;
+    };
+    window.setLevel(editor_overlay_window_level());
     true
   }
 
@@ -759,6 +781,15 @@ mod tests {
     coordinator.refresh(vec![display(1, [-1920, 0, 1920, 1080]), display(2, [0, 0, 1728, 1117])]);
     assert_eq!(coordinator.display_for_point([-10, 20]), Some(1));
     assert_eq!(coordinator.display_for_point([100, 20]), Some(2));
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn macos_overlay_builder_leaves_window_level_to_appkit() {
+    let builder = display(1, [0, 0, 1920, 1080])
+      .viewport_builder(SurfaceLifecycle::Editing { session_id: Uuid::new_v4() });
+
+    assert_eq!(builder.window_level, None);
   }
 
   #[test]

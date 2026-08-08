@@ -12,6 +12,11 @@ use objc2::{
   DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, rc::Retained, runtime::AnyObject, sel,
 };
 #[cfg(target_os = "macos")]
+use objc2_app_kit::{
+  NSApplication, NSNormalWindowLevel, NSStatusWindowLevel, NSWindowCollectionBehavior,
+  NSWindowLevel,
+};
+#[cfg(target_os = "macos")]
 use objc2_core_services::{
   kAEOpenDocuments as OPEN_DOCUMENTS_EVENT_ID, kCoreEventClass as CORE_EVENT_CLASS,
   keyDirectObject as DIRECT_OBJECT_KEYWORD,
@@ -24,6 +29,12 @@ use objc2_foundation::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformEvent {
   CaptureRequested { received_at: Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootWindowPresentation {
+  Library,
+  CaptureHost,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +155,53 @@ fn map_hotkey_event(
 ) -> Option<PlatformEvent> {
   (event.id == hotkey_id && event.state == HotKeyState::Pressed)
     .then_some(PlatformEvent::CaptureRequested { received_at })
+}
+
+#[cfg(target_os = "macos")]
+pub fn configure_root_window(presentation: RootWindowPresentation) {
+  const ROOT_WINDOW_TITLE: &str = "RS Board";
+
+  let Some(mtm) = MainThreadMarker::new() else {
+    return;
+  };
+  let application = NSApplication::sharedApplication(mtm);
+  let Some(window) = application
+    .windows()
+    .into_iter()
+    .find(|window| window.title().to_string() == ROOT_WINDOW_TITLE)
+  else {
+    return;
+  };
+
+  match presentation {
+    RootWindowPresentation::Library => {
+      window.setLevel(NSNormalWindowLevel);
+      window.setIgnoresMouseEvents(false);
+      window.setCollectionBehavior(NSWindowCollectionBehavior::Default);
+    }
+    RootWindowPresentation::CaptureHost => {
+      window.setLevel(root_capture_host_window_level());
+      window.setIgnoresMouseEvents(true);
+      window.setCollectionBehavior(root_capture_host_collection_behavior());
+      window.orderFrontRegardless();
+    }
+  }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn configure_root_window(_presentation: RootWindowPresentation) {}
+
+#[cfg(target_os = "macos")]
+fn root_capture_host_window_level() -> NSWindowLevel {
+  NSStatusWindowLevel
+}
+
+#[cfg(target_os = "macos")]
+fn root_capture_host_collection_behavior() -> NSWindowCollectionBehavior {
+  NSWindowCollectionBehavior::CanJoinAllSpaces
+    | NSWindowCollectionBehavior::Stationary
+    | NSWindowCollectionBehavior::IgnoresCycle
+    | NSWindowCollectionBehavior::FullScreenAuxiliary
 }
 
 /// Returns `[x, y]` in the global display coordinate space on macOS.
@@ -327,5 +385,15 @@ mod tests {
     assert_eq!(global_coordinate_to_i32(12.9), Some(12));
     assert_eq!(global_coordinate_to_i32(-0.1), Some(-1));
     assert_eq!(global_coordinate_to_i32(f64::NAN), None);
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn capture_host_stays_above_normal_apps_and_on_every_space() {
+    assert_eq!(root_capture_host_window_level(), NSStatusWindowLevel);
+    let behavior = root_capture_host_collection_behavior();
+    assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
+    assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
+    assert!(behavior.contains(NSWindowCollectionBehavior::IgnoresCycle));
   }
 }
