@@ -537,8 +537,9 @@ impl FocusRestore {
 mod macos {
   use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
   use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSPanel, NSScreen,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSColor, NSPanel, NSScreen, NSStatusWindowLevel,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel, NSWindowSharingType,
+    NSWindowStyleMask,
   };
   use objc2_foundation::{NSNumber, NSString};
   use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
@@ -572,7 +573,7 @@ mod macos {
       panel.setBackgroundColor(Some(&NSColor::blackColor()));
       panel.setHasShadow(false);
       panel.setIgnoresMouseEvents(true);
-      panel.setLevel(NSFloatingWindowLevel - 1);
+      panel.setLevel(frozen_panel_window_level());
       panel.setAnimationBehavior(NSWindowAnimationBehavior::None);
       panel.setCollectionBehavior(
         NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -660,7 +661,7 @@ mod macos {
     window.setBackgroundColor(Some(&NSColor::clearColor()));
     window.setHasShadow(false);
     window.setIgnoresMouseEvents(false);
-    window.setLevel(NSFloatingWindowLevel);
+    window.setLevel(editor_overlay_window_level());
     window.setAnimationBehavior(NSWindowAnimationBehavior::None);
     window.setCollectionBehavior(
       NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -671,6 +672,14 @@ mod macos {
     window.setSharingType(NSWindowSharingType::None);
     window.orderFrontRegardless();
     true
+  }
+
+  fn frozen_panel_window_level() -> NSWindowLevel {
+    NSStatusWindowLevel + 1
+  }
+
+  fn editor_overlay_window_level() -> NSWindowLevel {
+    NSStatusWindowLevel + 2
   }
 
   impl Drop for FrozenImagePanel {
@@ -689,6 +698,19 @@ mod macos {
       }
     }
     None
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use objc2_app_kit::NSStatusWindowLevel;
+
+    use super::{editor_overlay_window_level, frozen_panel_window_level};
+
+    #[test]
+    fn capture_window_levels_cover_system_ui_with_the_editor_on_top() {
+      assert!(frozen_panel_window_level() > NSStatusWindowLevel);
+      assert!(editor_overlay_window_level() > frozen_panel_window_level());
+    }
   }
 }
 
