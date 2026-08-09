@@ -1,5 +1,6 @@
 use std::{
   collections::HashMap,
+  ops::Range,
   path::PathBuf,
   sync::{
     Arc,
@@ -34,6 +35,7 @@ use crate::{
   editor::{EditorAction, EditorController, EditorTool},
   export::{copy_image, write_png_atomically},
   instance::InstanceBridge,
+  library_index::{LibraryIndexCoordinator, LibraryIndexCoordinatorError, LibraryIndexEvent},
   performance::{
     PerformanceContext, PerformanceDetails, PerformanceOutcome, PerformanceTimer, record,
   },
@@ -42,12 +44,13 @@ use crate::{
     global_cursor_position, set_launch_at_login,
   },
   post_save::{PostSaveCoordinator, PostSaveCoordinatorError, PostSaveJob, PostSaveResult},
+  preview_loader::{PreviewKey, PreviewLoader, PreviewLoaderError, PreviewRequestToken},
   recent::RecentDocuments,
   renderer::render_document_to_image,
   settings::{Settings, SettingsError},
   storage::{
-    GenerationId, ImportRequest, ImportedDocument, LoadedDocument, LoadedDraft, LocalStore,
-    PersistenceContext, SaveRequest, SavedDocument, StorageError, StorePaths,
+    DocumentSummary, GenerationId, ImportRequest, ImportedDocument, LoadedDocument, LoadedDraft,
+    LocalStore, PersistenceContext, SaveRequest, SavedDocument, StorageError, StorePaths,
   },
   tray::{TrayAction, TrayController},
 };
@@ -60,6 +63,11 @@ const LIBRARY_CARD_INNER_MARGIN: f32 = 8.0;
 const LIBRARY_CARD_CONTENT_GAP: f32 = 7.0;
 const LIBRARY_CARD_ACTION_WIDTH: f32 = 40.0;
 const LIBRARY_PREVIEW_SIZE: egui::Vec2 = egui::vec2(144.0, 81.0);
+const LIBRARY_CARD_HEIGHT: f32 = LIBRARY_PREVIEW_SIZE.y + 2.0 * LIBRARY_CARD_INNER_MARGIN;
+const MAX_PREVIEW_TEXTURES: usize = 64;
+const MAX_PREVIEW_TEXTURE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PREVIEW_FAILURES: usize = 256;
+const MAX_PREVIEW_UPLOADS_PER_FRAME: usize = 4;
 const TRAY_HOST_SIZE: egui::Vec2 = egui::vec2(1.0, 1.0);
 const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
   2.0 * LIBRARY_CARD_WIDTH
@@ -174,17 +182,30 @@ enum WorkerEvent {
     request_id: Uuid,
     context: PersistenceContext,
     completed_at: Instant,
-    result: Result<SavedDocument, String>,
+    result: Box<Result<SavedDocument, String>>,
     post_save_job: Option<PostSaveJob>,
   },
   Import(Result<ImportedDocument, String>),
-  LibraryChanged(Result<Option<DocumentId>, String>),
+  LibraryChanged(Result<LibraryMutation, String>),
   Auxiliary(Result<String, String>),
+}
+
+enum LibraryMutation {
+  Upsert(DocumentSummary),
+  Remove(DocumentId),
+}
+
+#[derive(Clone)]
+struct LibraryCardData {
+  document_id: DocumentId,
+  summary: Option<DocumentSummary>,
+  metadata_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LibraryAction {
   Open(DocumentId),
+  RetryPreview(DocumentId),
   Rename(DocumentId),
   CopyImage(DocumentId),
   ExportPng(DocumentId),
@@ -244,6 +265,160 @@ struct PersistenceUiTrace {
   pixel_size: [u32; 2],
 }
 
+struct CachedPreviewTexture {
+  key: PreviewKey,
+  texture: TextureHandle,
+}
+
+struct PreviewTextureBudgetEntry {
+  byte_count: usize,
+  last_used: u64,
+}
+
+#[derive(Default)]
+struct PreviewTextureBudget {
+  entries: HashMap<DocumentId, PreviewTextureBudgetEntry>,
+  byte_count: usize,
+  clock: u64,
+}
+
+impl PreviewTextureBudget {
+  fn touch(&mut self, document_id: DocumentId) {
+    let Some(entry) = self.entries.get_mut(&document_id) else {
+      return;
+    };
+    self.clock = self.clock.wrapping_add(1);
+    entry.last_used = self.clock;
+  }
+
+  fn insert(&mut self, document_id: DocumentId, byte_count: usize) -> Vec<DocumentId> {
+    self.remove(document_id);
+    self.clock = self.clock.wrapping_add(1);
+    self.byte_count = self.byte_count.saturating_add(byte_count);
+    self
+      .entries
+      .insert(document_id, PreviewTextureBudgetEntry { byte_count, last_used: self.clock });
+    let mut evicted = Vec::new();
+    while self.entries.len() > MAX_PREVIEW_TEXTURES || self.byte_count > MAX_PREVIEW_TEXTURE_BYTES {
+      let Some(oldest) = self
+        .entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(document_id, _)| *document_id)
+      else {
+        break;
+      };
+      self.remove(oldest);
+      evicted.push(oldest);
+    }
+    evicted
+  }
+
+  fn remove(&mut self, document_id: DocumentId) {
+    if let Some(removed) = self.entries.remove(&document_id) {
+      self.byte_count = self.byte_count.saturating_sub(removed.byte_count);
+    }
+  }
+
+  fn clear(&mut self) {
+    self.entries.clear();
+    self.byte_count = 0;
+  }
+}
+
+#[derive(Default)]
+struct PreviewTextureCache {
+  entries: HashMap<DocumentId, CachedPreviewTexture>,
+  budget: PreviewTextureBudget,
+}
+
+impl PreviewTextureCache {
+  fn contains(&self, key: &PreviewKey) -> bool {
+    self.entries.get(&key.document_id).is_some_and(|entry| entry.key == *key)
+  }
+
+  fn get(&mut self, key: &PreviewKey) -> Option<TextureHandle> {
+    let entry = self.entries.get(&key.document_id)?;
+    if entry.key != *key {
+      return None;
+    }
+    let texture = entry.texture.clone();
+    self.budget.touch(key.document_id);
+    Some(texture)
+  }
+
+  fn insert(&mut self, key: PreviewKey, texture: TextureHandle, byte_count: usize) {
+    let document_id = key.document_id;
+    self.entries.insert(document_id, CachedPreviewTexture { key, texture });
+    for evicted in self.budget.insert(document_id, byte_count) {
+      self.entries.remove(&evicted);
+    }
+  }
+
+  fn remove(&mut self, document_id: DocumentId) {
+    self.entries.remove(&document_id);
+    self.budget.remove(document_id);
+  }
+
+  fn clear(&mut self) {
+    self.entries.clear();
+    self.budget.clear();
+  }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PreviewFailureKey {
+  document_id: DocumentId,
+  revision: u64,
+  path: PathBuf,
+}
+
+impl From<&PreviewKey> for PreviewFailureKey {
+  fn from(key: &PreviewKey) -> Self {
+    Self { document_id: key.document_id, revision: key.revision, path: key.path.clone() }
+  }
+}
+
+#[derive(Default)]
+struct PreviewFailureCache {
+  entries: HashMap<PreviewFailureKey, u64>,
+  clock: u64,
+}
+
+impl PreviewFailureCache {
+  fn contains(&mut self, key: &PreviewKey) -> bool {
+    let key = PreviewFailureKey::from(key);
+    let Some(last_used) = self.entries.get_mut(&key) else {
+      return false;
+    };
+    self.clock = self.clock.wrapping_add(1);
+    *last_used = self.clock;
+    true
+  }
+
+  fn insert(&mut self, key: PreviewKey) {
+    let key = PreviewFailureKey::from(&key);
+    self.clock = self.clock.wrapping_add(1);
+    self.entries.insert(key, self.clock);
+    while self.entries.len() > MAX_PREVIEW_FAILURES {
+      let Some(oldest) =
+        self.entries.iter().min_by_key(|(_, used)| *used).map(|(key, _)| key.clone())
+      else {
+        break;
+      };
+      self.entries.remove(&oldest);
+    }
+  }
+
+  fn remove_document(&mut self, document_id: DocumentId) {
+    self.entries.retain(|key, _| key.document_id != document_id);
+  }
+
+  fn clear(&mut self) {
+    self.entries.clear();
+  }
+}
+
 pub struct RsBoardApp {
   store: LocalStore,
   settings_path: PathBuf,
@@ -260,6 +435,8 @@ pub struct RsBoardApp {
   background_encoder: BackgroundEncodeScheduler,
   draft_coordinator: DraftCoordinator,
   post_save_coordinator: PostSaveCoordinator,
+  library_index_coordinator: LibraryIndexCoordinator,
+  preview_loader: PreviewLoader,
   phase: Phase,
   next_capture_sequence: u64,
   next_stash_sequence: u64,
@@ -271,7 +448,11 @@ pub struct RsBoardApp {
   last_tool: Option<EditorTool>,
   worker_sender: Sender<WorkerEvent>,
   worker_receiver: Receiver<WorkerEvent>,
-  preview_textures: HashMap<DocumentId, (PathBuf, TextureHandle)>,
+  preview_textures: PreviewTextureCache,
+  preview_failures: PreviewFailureCache,
+  desired_preview_tickets: HashMap<PreviewKey, PreviewRequestToken>,
+  last_library_priority: Vec<DocumentId>,
+  library_bootstrapped: bool,
   show_settings: bool,
   rename_dialog: Option<(DocumentId, String)>,
   delete_document_dialog: Option<DocumentId>,
@@ -298,13 +479,8 @@ impl RsBoardApp {
     let settings = Settings::load_or_default(&settings_path)?;
     let paths = StorePaths::for_current_user()?;
     let (store, _) = LocalStore::open(paths)?;
-    let mut recent = RecentDocuments::default();
-    recent.refresh(&store)?;
+    let recent = RecentDocuments::default();
     let draft_available = store.paths().latest_draft().exists();
-    let startup_permission_error = request_screen_recording_permission().err();
-    if startup_permission_error.is_none() {
-      prewarm_capture_backend();
-    }
     let (worker_sender, worker_receiver) = mpsc::channel();
     let draft_coordinator = DraftCoordinator::new(store.clone(), {
       let context = creation_context.egui_ctx.clone();
@@ -314,6 +490,18 @@ impl RsBoardApp {
       let context = creation_context.egui_ctx.clone();
       move || request_root_repaint(&context)
     })?;
+    let library_index_coordinator = LibraryIndexCoordinator::new(store.clone(), {
+      let context = creation_context.egui_ctx.clone();
+      move || request_root_repaint(&context)
+    })?;
+    let preview_loader = PreviewLoader::new({
+      let context = creation_context.egui_ctx.clone();
+      move || request_root_repaint(&context)
+    })?;
+    let startup_permission_error = request_screen_recording_permission().err();
+    if startup_permission_error.is_none() {
+      prewarm_capture_backend();
+    }
     let open_file_bridge = OpenFileBridge::install();
     let mut library_error = None;
     let capture_surfaces = match CaptureSurfaceCoordinator::discover() {
@@ -366,6 +554,8 @@ impl RsBoardApp {
       background_encoder: BackgroundEncodeScheduler::new(),
       draft_coordinator,
       post_save_coordinator,
+      library_index_coordinator,
+      preview_loader,
       phase: Phase::Idle,
       next_capture_sequence: 0,
       next_stash_sequence: 0,
@@ -377,7 +567,11 @@ impl RsBoardApp {
       last_tool: None,
       worker_sender,
       worker_receiver,
-      preview_textures: HashMap::new(),
+      preview_textures: PreviewTextureCache::default(),
+      preview_failures: PreviewFailureCache::default(),
+      desired_preview_tickets: HashMap::new(),
+      last_library_priority: Vec::new(),
+      library_bootstrapped: false,
       show_settings: false,
       rename_dialog: None,
       delete_document_dialog: None,
@@ -681,7 +875,7 @@ impl RsBoardApp {
         request_id,
         context: persistence_context,
         completed_at,
-        result,
+        result: Box::new(result),
         post_save_job,
       }
     });
@@ -1056,8 +1250,15 @@ impl RsBoardApp {
         DraftResult::ClearAll { result } => match result {
           Ok(()) => {
             self.draft_available = false;
-            let _ = self.recent.refresh(&self.store);
+            self.recent.clear();
+            if let Err(error) = self.library_index_coordinator.clear() {
+              eprintln!("library_index_clear_failed error={error}");
+            }
             self.preview_textures.clear();
+            self.preview_failures.clear();
+            self.desired_preview_tickets.clear();
+            self.preview_loader.update_desired(std::iter::empty());
+            self.last_library_priority.clear();
           }
           Err(error) => {
             eprintln!("clear_all_content_failed error={error}");
@@ -1076,15 +1277,19 @@ impl RsBoardApp {
   fn handle_post_save_results(&mut self) {
     while let Some(event) = self.post_save_coordinator.try_recv() {
       match event {
-        PostSaveResult::ImageTasks { document_id, revision, preview_installed, warnings } => {
-          if preview_installed {
-            self.preview_textures.remove(&document_id);
-          }
-          if warnings.is_empty() {
-            if self.has_visible_window() {
-              self.set_toast("讲义已保存");
+        PostSaveResult::ImageTasks { document_id, revision, preview_path, warnings } => {
+          if let Some(preview_path) = preview_path
+            && self.recent.mark_preview_ready(document_id, revision, preview_path)
+          {
+            self.preview_textures.remove(document_id);
+            self.preview_failures.remove_document(document_id);
+            if let Err(error) = self.library_index_coordinator.refresh(document_id, revision) {
+              eprintln!(
+                "library_index_preview_refresh_failed document_id={document_id} revision={revision} error={error}"
+              );
             }
-          } else {
+          }
+          if !warnings.is_empty() {
             let warning = warnings.join("；");
             eprintln!(
               "post_save_image_tasks_failed document_id={document_id} revision={revision} error={warning}"
@@ -1094,18 +1299,119 @@ impl RsBoardApp {
             }
           }
         }
-        PostSaveResult::RecentRefresh { performance, result } => match result {
-          Ok(scan) => self.recent.apply_scan(scan),
-          Err(error) => {
-            eprintln!(
-              "post_save_recent_refresh_failed document_id={:?} revision={:?} error={error}",
-              performance.document_id, performance.revision
-            );
-            if self.has_visible_window() {
-              self.set_toast("最近讲义刷新失败");
-            }
+      }
+    }
+  }
+
+  fn handle_library_index_results(&mut self) {
+    while let Some(event) = self.library_index_coordinator.try_recv() {
+      match event {
+        LibraryIndexEvent::Bootstrap {
+          generation,
+          skeletons,
+          cached_summaries,
+          failures,
+          warning,
+        } => {
+          self.library_bootstrapped = true;
+          self.recent.begin_scan(generation, &skeletons, failures);
+          for summary in cached_summaries {
+            self.recent.apply_cached_summary(generation, summary);
           }
-        },
+          if let Some(warning) = warning {
+            eprintln!("library_index_rebuild_required error={warning}");
+          }
+        }
+        LibraryIndexEvent::MetadataBatch { generation, summaries, failures } => {
+          for summary in summaries {
+            self.recent.apply_hydrated_summary(generation, summary);
+          }
+          for (document_id, error) in failures {
+            self.recent.fail_hydration(generation, document_id, error);
+          }
+        }
+        LibraryIndexEvent::Reconciled { generation } => {
+          eprintln!(
+            "library_index_reconciled generation={generation} entries={}",
+            self.recent.len()
+          );
+        }
+      }
+    }
+  }
+
+  fn handle_preview_results(&mut self, context: &egui::Context) {
+    for _ in 0..MAX_PREVIEW_UPLOADS_PER_FRAME {
+      let Some(result) = self.preview_loader.try_recv() else {
+        break;
+      };
+      let key = result.ticket.key;
+      let is_desired =
+        self.desired_preview_tickets.get(&key).is_some_and(|token| *token == result.ticket.token);
+      self.desired_preview_tickets.remove(&key);
+      let is_current = self.recent.summary(key.document_id).is_some_and(|summary| {
+        summary.revision == key.revision && summary.preview_path.as_ref() == Some(&key.path)
+      });
+      if !is_desired || !is_current {
+        continue;
+      }
+      match result.image {
+        Ok(image) => {
+          let byte_count = image.rgba.len();
+          let upload_timer = PerformanceTimer::start(
+            "library.preview_upload",
+            PerformanceContext {
+              document_id: Some(key.document_id.as_uuid()),
+              revision: Some(key.revision),
+              ..PerformanceContext::default()
+            },
+            PerformanceDetails::default()
+              .pixel_size([image.width_px, image.height_px])
+              .byte_count(byte_count),
+          );
+          let texture = context.load_texture(
+            format!("preview-{}-{}-{}", key.document_id, key.revision, result.ticket.token.get()),
+            egui::ColorImage::from_rgba_unmultiplied(
+              [image.width_px as usize, image.height_px as usize],
+              &image.rgba,
+            ),
+            TextureOptions::LINEAR,
+          );
+          upload_timer.finish_ok();
+          self.preview_textures.insert(key, texture, byte_count);
+        }
+        Err(error) => {
+          eprintln!(
+            "library_preview_decode_failed document_id={} revision={} error={error}",
+            key.document_id, key.revision
+          );
+          self.preview_failures.insert(key);
+        }
+      }
+    }
+  }
+
+  fn update_desired_previews(&mut self, document_ids: &[DocumentId], context: &egui::Context) {
+    let target_size_px = library_preview_target_size(context);
+    let mut keys = Vec::with_capacity(document_ids.len());
+    for document_id in document_ids {
+      let Some(summary) = self.recent.summary(*document_id) else {
+        continue;
+      };
+      let Some(path) = summary.preview_path.clone() else {
+        continue;
+      };
+      let key = PreviewKey::new(summary.document_id, summary.revision, path, target_size_px);
+      if self.preview_textures.contains(&key) || self.preview_failures.contains(&key) {
+        continue;
+      }
+      keys.push(key);
+    }
+    let outcomes = self.preview_loader.update_desired(keys);
+    self.desired_preview_tickets.clear();
+    for outcome in outcomes {
+      if let Some(ticket) = outcome.ticket() {
+        self.desired_preview_tickets.insert(ticket.key.clone(), ticket.token);
       }
     }
   }
@@ -1331,6 +1637,7 @@ impl RsBoardApp {
             self.finish_persistence_trace_stale(request_id);
             continue;
           }
+          let result = *result;
           if let Some(trace) = self.persistence_trace_for(request_id) {
             PerformanceTimer::started_at(
               "persistence.worker_to_ui",
@@ -1356,8 +1663,24 @@ impl RsBoardApp {
                   None
                 }
               });
+              let commit_visible_timer = PerformanceTimer::started_at(
+                "library.commit_to_visible",
+                performance_from_persistence_context(saved.context),
+                PerformanceDetails::default(),
+                completed_at,
+              );
+              self.recent.upsert(saved.summary.clone());
+              if let Err(error) = self.library_index_coordinator.upsert(saved.summary.clone()) {
+                eprintln!(
+                  "library_index_upsert_failed document_id={} revision={} error={error}",
+                  saved.document_id, saved.revision
+                );
+              }
+              commit_visible_timer.finish_ok();
               self.phase = Phase::Idle;
-              self.preview_textures.remove(&saved.document_id);
+              self.preview_textures.remove(saved.document_id);
+              self.preview_failures.remove_document(saved.document_id);
+              self.set_toast("讲义已保存");
               if self.quit_after_persist {
                 self.allow_close = true;
                 send_root_viewport_command(context, ViewportCommand::Close);
@@ -1439,9 +1762,16 @@ impl RsBoardApp {
         WorkerEvent::Import(result) => match result {
           Ok(imported) => {
             let document_id = imported.saved.document_id;
-            let _ = self.recent.refresh(&self.store);
+            let summary = imported.saved.summary;
+            self.recent.upsert(summary.clone());
+            if let Err(error) = self.library_index_coordinator.upsert(summary) {
+              eprintln!(
+                "library_index_import_upsert_failed document_id={document_id} error={error}"
+              );
+            }
             self.recent.highlight(document_id);
-            self.preview_textures.remove(&document_id);
+            self.preview_textures.remove(document_id);
+            self.preview_failures.remove_document(document_id);
             if self.phase == Phase::Idle {
               self.show_library_window(context);
             }
@@ -1450,21 +1780,30 @@ impl RsBoardApp {
           Err(error) => self.library_error = Some(error),
         },
         WorkerEvent::LibraryChanged(result) => match result {
-          Ok(highlighted) => {
-            let _ = self.recent.refresh(&self.store);
-            self.recent.highlighted = highlighted;
-            self.draft_available = self.store.paths().latest_draft().exists();
-            self.preview_textures.retain(|id, _| {
-              self.recent.documents.iter().any(|document| document.document_id == *id)
-            });
+          Ok(LibraryMutation::Upsert(summary)) => {
+            let document_id = summary.document_id;
+            self.recent.upsert(summary.clone());
+            self.recent.highlight(document_id);
+            if let Err(error) = self.library_index_coordinator.upsert(summary) {
+              eprintln!(
+                "library_index_mutation_upsert_failed document_id={document_id} error={error}"
+              );
+            }
+            self.preview_textures.remove(document_id);
+            self.preview_failures.remove_document(document_id);
+          }
+          Ok(LibraryMutation::Remove(document_id)) => {
+            self.recent.remove(document_id);
+            if let Err(error) = self.library_index_coordinator.remove(document_id) {
+              eprintln!("library_index_remove_failed document_id={document_id} error={error}");
+            }
+            self.preview_textures.remove(document_id);
+            self.preview_failures.remove_document(document_id);
           }
           Err(error) => self.library_error = Some(error),
         },
         WorkerEvent::Auxiliary(result) => match result {
-          Ok(message) => {
-            let _ = self.recent.refresh(&self.store);
-            self.set_toast(message);
-          }
+          Ok(message) => self.set_toast(message),
           Err(error) => self.set_toast(error),
         },
         _ => {}
@@ -1883,7 +2222,6 @@ impl RsBoardApp {
   }
 
   fn show_library_ui(&mut self, root_ui: &mut egui::Ui, context: &egui::Context) {
-    let documents: Vec<_> = self.recent.visible_documents().cloned().collect();
     let mut action = None;
     egui::Panel::top("library-header")
       .frame(egui::Frame::new().fill(Color32::from_rgb(29, 29, 31)).inner_margin(16.0))
@@ -1926,6 +2264,18 @@ impl RsBoardApp {
           });
         });
       });
+
+    let search_started_at = Instant::now();
+    if self.recent.prepare_view() {
+      PerformanceTimer::started_at(
+        "library.search",
+        PerformanceContext::default(),
+        PerformanceDetails::default(),
+        search_started_at,
+      )
+      .finish_ok();
+    }
+    let document_count = self.recent.visible_count();
 
     egui::CentralPanel::default()
       .frame(
@@ -1970,9 +2320,12 @@ impl RsBoardApp {
           ui.add_space(10.0);
         }
 
-        if documents.is_empty() {
+        if document_count == 0 {
+          self.update_desired_previews(&[], context);
           ui.centered_and_justified(|ui| {
-            ui.label(if self.recent.query.trim().is_empty() {
+            ui.label(if !self.library_bootstrapped {
+              "正在加载讲义..."
+            } else if self.recent.query.trim().is_empty() {
               "暂无讲义"
             } else {
               "没有匹配的讲义"
@@ -1981,131 +2334,63 @@ impl RsBoardApp {
           return;
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
-          let card_width = library_document_card_width();
-          egui::Grid::new("recent-grid")
-            .num_columns(2)
-            .spacing([LIBRARY_GRID_GAP, LIBRARY_GRID_GAP])
-            .show(ui, |ui| {
-              for (index, document) in documents.iter().enumerate() {
-                let preview = self.preview_texture(document, context);
-                let highlighted = self.recent.highlighted == Some(document.document_id);
-                let frame = egui::Frame::new()
-                  .fill(if highlighted {
-                    Color32::from_rgb(58, 42, 41)
-                  } else {
-                    Color32::from_rgb(38, 38, 40)
-                  })
-                  .stroke(egui::Stroke::new(
-                    1.0,
-                    if highlighted {
-                      Color32::from_rgb(230, 76, 70)
-                    } else {
-                      Color32::from_gray(64)
-                    },
-                  ))
-                  .corner_radius(6.0)
-                  .inner_margin(LIBRARY_CARD_INNER_MARGIN);
-                let response = frame.show(ui, |ui| {
-                  ui.set_width(card_width - 2.0 * LIBRARY_CARD_INNER_MARGIN);
-                  let preview_size = LIBRARY_PREVIEW_SIZE;
-                  fixed_height_centered_row(ui, preview_size.y, |ui| {
-                    let (preview_rect, preview_response) =
-                      ui.allocate_exact_size(preview_size, egui::Sense::click());
-                    ui.painter().rect_filled(preview_rect, 3.0, Color32::BLACK);
-                    if let Some(texture) = preview {
-                      ui.painter().image(
-                        texture.id(),
-                        fit_image_rect(texture.size_vec2(), preview_rect),
-                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                      );
-                    } else {
-                      ui.painter().text(
-                        preview_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "预览生成中",
-                        egui::FontId::proportional(13.0),
-                        Color32::from_gray(130),
-                      );
-                    }
-                    ui.add_space(LIBRARY_CARD_CONTENT_GAP);
-                    let description_width = library_document_description_width(ui);
-                    let description_height = library_document_description_height(ui);
-                    centered_vertical_slot(
-                      ui,
-                      egui::vec2(description_width, preview_size.y),
-                      description_height,
-                      |ui| {
-                        ui.add(
-                          egui::Label::new(egui::RichText::new(&document.title).strong())
-                            .truncate(),
-                        )
-                        .on_hover_text(&document.title);
-                        ui.label(
-                          egui::RichText::new(
-                            document
-                              .updated_at
-                              .with_timezone(&chrono::Local)
-                              .format("%Y-%m-%d %H:%M")
-                              .to_string(),
-                          )
-                          .small()
-                          .color(Color32::from_gray(150)),
-                        );
-                      },
-                    );
-                    let action_height = ui.text_style_height(&egui::TextStyle::Button)
-                      + 2.0 * ui.spacing().button_padding.y;
-                    centered_vertical_slot(
-                      ui,
-                      egui::vec2(LIBRARY_CARD_ACTION_WIDTH, preview_size.y),
-                      action_height,
-                      |ui| {
-                        ui.menu_button("⋯", |ui| {
-                          if ui.button("重命名").clicked() {
-                            action = Some(LibraryAction::Rename(document.document_id));
-                            ui.close();
-                          }
-                          if ui.button("复制图片").clicked() {
-                            action = Some(LibraryAction::CopyImage(document.document_id));
-                            ui.close();
-                          }
-                          if ui.button("导出 PNG").clicked() {
-                            action = Some(LibraryAction::ExportPng(document.document_id));
-                            ui.close();
-                          }
-                          if ui.button("导出讲义").clicked() {
-                            action = Some(LibraryAction::ExportBundle(document.document_id));
-                            ui.close();
-                          }
-                          ui.separator();
-                          if ui
-                            .button(
-                              egui::RichText::new("删除").color(Color32::from_rgb(255, 100, 95)),
-                            )
-                            .clicked()
-                          {
-                            action = Some(LibraryAction::Delete(document.document_id));
-                            ui.close();
-                          }
-                        });
-                      },
-                    );
-                    preview_response
-                  })
-                  .inner
-                });
-                if (response.inner.double_clicked() || response.response.double_clicked())
-                  && self.phase == Phase::Idle
+        let row_count = document_count.div_ceil(2);
+        ui.scope(|ui| {
+          ui.spacing_mut().item_spacing.y = LIBRARY_GRID_GAP;
+          egui::ScrollArea::vertical().show_rows(
+            ui,
+            LIBRARY_CARD_HEIGHT,
+            row_count,
+            |ui, row_range| {
+              let visible_rows_timer = PerformanceTimer::start(
+                "library.visible_rows",
+                PerformanceContext::default(),
+                PerformanceDetails::default(),
+              );
+              let prefetch_range = library_prefetch_row_range(row_range.clone(), row_count);
+              let priority_ids = self.recent.visible_ids(
+                prefetch_range.start.saturating_mul(2)..prefetch_range.end.saturating_mul(2),
+              );
+              if priority_ids != self.last_library_priority {
+                if let Err(error) = self.library_index_coordinator.prioritize(priority_ids.clone())
                 {
-                  action = Some(LibraryAction::Open(document.document_id));
+                  eprintln!("library_index_prioritize_failed error={error}");
                 }
-                if (index + 1) % 2 == 0 {
-                  ui.end_row();
-                }
+                self.last_library_priority.clone_from(&priority_ids);
               }
-            });
+              self.update_desired_previews(&priority_ids, context);
+
+              for row in row_range {
+                ui.allocate_ui_with_layout(
+                  egui::vec2(ui.available_width(), LIBRARY_CARD_HEIGHT),
+                  egui::Layout::left_to_right(egui::Align::Min),
+                  |ui| {
+                    for column in 0..2 {
+                      if column == 1 {
+                        ui.add_space(LIBRARY_GRID_GAP);
+                      }
+                      let index = row.saturating_mul(2).saturating_add(column);
+                      let Some(document_id) = self.recent.visible_id(index) else {
+                        break;
+                      };
+                      let Some(entry) = self.recent.entry(document_id) else {
+                        continue;
+                      };
+                      let card = LibraryCardData {
+                        document_id,
+                        summary: entry.summary.clone(),
+                        metadata_error: entry.metadata_error.is_some(),
+                      };
+                      ui.push_id(document_id, |ui| {
+                        self.show_library_card(ui, &card, context, &mut action);
+                      });
+                    }
+                  },
+                );
+              }
+              visible_rows_timer.finish_ok();
+            },
+          );
         });
       });
 
@@ -2114,37 +2399,169 @@ impl RsBoardApp {
     }
   }
 
-  fn preview_texture(
+  fn show_library_card(
     &mut self,
-    document: &crate::storage::DocumentSummary,
+    ui: &mut egui::Ui,
+    card: &LibraryCardData,
     context: &egui::Context,
-  ) -> Option<TextureHandle> {
-    let path = document.preview_path.as_ref()?;
-    if let Some((cached_path, texture)) = self.preview_textures.get(&document.document_id)
-      && cached_path == path
+    action: &mut Option<LibraryAction>,
+  ) {
+    let preview_key = card.summary.as_ref().and_then(|document| {
+      document.preview_path.as_ref().map(|path| {
+        PreviewKey::new(
+          document.document_id,
+          document.revision,
+          path.clone(),
+          library_preview_target_size(context),
+        )
+      })
+    });
+    let preview_failed =
+      preview_key.as_ref().is_some_and(|key| self.preview_failures.contains(key));
+    let preview = preview_key.as_ref().and_then(|key| self.preview_textures.get(key));
+    let highlighted = self.recent.highlighted == Some(card.document_id);
+    let frame = egui::Frame::new()
+      .fill(if highlighted { Color32::from_rgb(58, 42, 41) } else { Color32::from_rgb(38, 38, 40) })
+      .stroke(egui::Stroke::new(
+        1.0,
+        if highlighted { Color32::from_rgb(230, 76, 70) } else { Color32::from_gray(64) },
+      ))
+      .corner_radius(6.0)
+      .inner_margin(LIBRARY_CARD_INNER_MARGIN);
+    let response = frame.show(ui, |ui| {
+      ui.set_width(library_document_card_width() - 2.0 * LIBRARY_CARD_INNER_MARGIN);
+      fixed_height_centered_row(ui, LIBRARY_PREVIEW_SIZE.y, |ui| {
+        let (preview_rect, preview_response) =
+          ui.allocate_exact_size(LIBRARY_PREVIEW_SIZE, egui::Sense::click());
+        ui.painter().rect_filled(preview_rect, 3.0, Color32::BLACK);
+        if let Some(texture) = preview {
+          ui.painter().image(
+            texture.id(),
+            fit_image_rect(texture.size_vec2(), preview_rect),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+          );
+        } else {
+          let status = if card.summary.is_none() {
+            "读取中"
+          } else if preview_failed {
+            "预览不可用"
+          } else if preview_key.is_some() {
+            "正在加载预览"
+          } else {
+            "预览生成中"
+          };
+          ui.painter().text(
+            preview_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            status,
+            egui::FontId::proportional(13.0),
+            Color32::from_gray(130),
+          );
+        }
+        ui.add_space(LIBRARY_CARD_CONTENT_GAP);
+        let description_height = library_document_description_height(ui);
+        centered_vertical_slot(
+          ui,
+          egui::vec2(library_document_description_width(ui), LIBRARY_PREVIEW_SIZE.y),
+          description_height,
+          |ui| match &card.summary {
+            Some(document) => {
+              ui.add(egui::Label::new(egui::RichText::new(&document.title).strong()).truncate())
+                .on_hover_text(&document.title);
+              ui.label(
+                egui::RichText::new(
+                  document
+                    .updated_at
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string(),
+                )
+                .small()
+                .color(Color32::from_gray(150)),
+              );
+            }
+            None => {
+              ui.label(
+                egui::RichText::new(if card.metadata_error {
+                  "讲义元信息不可用"
+                } else {
+                  "正在读取讲义..."
+                })
+                .strong()
+                .color(Color32::from_gray(155)),
+              );
+              ui.label(
+                egui::RichText::new(card.document_id.to_string())
+                  .small()
+                  .color(Color32::from_gray(110)),
+              );
+            }
+          },
+        );
+        let action_height =
+          ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
+        centered_vertical_slot(
+          ui,
+          egui::vec2(LIBRARY_CARD_ACTION_WIDTH, LIBRARY_PREVIEW_SIZE.y),
+          action_height,
+          |ui| {
+            ui.menu_button("⋯", |ui| {
+              if preview_failed && ui.button("重试预览").clicked() {
+                *action = Some(LibraryAction::RetryPreview(card.document_id));
+                ui.close();
+              }
+              if card.summary.is_some() {
+                if ui.button("重命名").clicked() {
+                  *action = Some(LibraryAction::Rename(card.document_id));
+                  ui.close();
+                }
+                if ui.button("复制图片").clicked() {
+                  *action = Some(LibraryAction::CopyImage(card.document_id));
+                  ui.close();
+                }
+                if ui.button("导出 PNG").clicked() {
+                  *action = Some(LibraryAction::ExportPng(card.document_id));
+                  ui.close();
+                }
+                if ui.button("导出讲义").clicked() {
+                  *action = Some(LibraryAction::ExportBundle(card.document_id));
+                  ui.close();
+                }
+                ui.separator();
+              }
+              if ui
+                .button(egui::RichText::new("删除").color(Color32::from_rgb(255, 100, 95)))
+                .clicked()
+              {
+                *action = Some(LibraryAction::Delete(card.document_id));
+                ui.close();
+              }
+            });
+          },
+        );
+        preview_response
+      })
+      .inner
+    });
+    if card.summary.is_some()
+      && (response.inner.double_clicked() || response.response.double_clicked())
+      && self.phase == Phase::Idle
     {
-      return Some(texture.clone());
+      *action = Some(LibraryAction::Open(card.document_id));
     }
-    let image = image::open(path).ok()?.into_rgba8();
-    let texture = context.load_texture(
-      format!("preview-{}-{}", document.document_id, document.revision),
-      egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.as_raw(),
-      ),
-      TextureOptions::LINEAR,
-    );
-    self.preview_textures.insert(document.document_id, (path.clone(), texture.clone()));
-    Some(texture)
   }
 
   fn handle_library_action(&mut self, action: LibraryAction, context: &egui::Context) {
     match action {
       LibraryAction::Open(document_id) => self.start_open_document(document_id, context),
+      LibraryAction::RetryPreview(document_id) => {
+        self.preview_failures.remove_document(document_id);
+        self.preview_textures.remove(document_id);
+        context.request_repaint();
+      }
       LibraryAction::Rename(document_id) => {
-        if let Some(document) =
-          self.recent.documents.iter().find(|item| item.document_id == document_id)
-        {
+        if let Some(document) = self.recent.summary(document_id) {
           self.rename_dialog = Some((document_id, document.title.clone()));
         }
       }
@@ -2154,9 +2571,7 @@ impl RsBoardApp {
       LibraryAction::ExportPng(document_id) => {
         let title = self
           .recent
-          .documents
-          .iter()
-          .find(|item| item.document_id == document_id)
+          .summary(document_id)
           .map(|item| sanitized_file_stem(&item.title))
           .unwrap_or_else(|| "讲义".into());
         if let Some(path) = rfd::FileDialog::new()
@@ -2365,7 +2780,7 @@ impl RsBoardApp {
           WorkerEvent::LibraryChanged(
             store
               .rename_document(document_id, title)
-              .map(|_| Some(document_id))
+              .map(LibraryMutation::Upsert)
               .map_err(|error| error.to_string()),
           )
         }) {
@@ -2398,7 +2813,10 @@ impl RsBoardApp {
         let store = self.store.clone();
         if let Err(error) = self.spawn_worker(context, move || {
           WorkerEvent::LibraryChanged(
-            store.delete_document(document_id).map(|_| None).map_err(|error| error.to_string()),
+            store
+              .delete_document(document_id)
+              .map(|_| LibraryMutation::Remove(document_id))
+              .map_err(|error| error.to_string()),
           )
         }) {
           self.library_error = Some(format!("无法启动讲义删除任务：{error}"));
@@ -2633,6 +3051,8 @@ impl eframe::App for RsBoardApp {
     self.handle_root_close_request(context);
     self.handle_draft_results(context);
     self.handle_post_save_results();
+    self.handle_library_index_results();
+    self.handle_preview_results(context);
     self.handle_worker_events(context);
     if self.capture_surfaces.should_refresh() {
       match self.capture_surfaces.refresh_available_displays() {
@@ -2694,6 +3114,10 @@ pub enum ApplicationError {
   DraftCoordinator(#[from] DraftCoordinatorError),
   #[error(transparent)]
   PostSaveCoordinator(#[from] PostSaveCoordinatorError),
+  #[error(transparent)]
+  LibraryIndexCoordinator(#[from] LibraryIndexCoordinatorError),
+  #[error(transparent)]
+  PreviewLoader(#[from] PreviewLoaderError),
   #[error(transparent)]
   Document(#[from] common::DocumentError),
   #[error("背景纹理无效")]
@@ -2796,8 +3220,22 @@ fn library_header_row_height(ui: &egui::Ui) -> f32 {
   button_height.max(ui.text_style_height(&egui::TextStyle::Heading)).max(30.0)
 }
 
+fn library_prefetch_row_range(visible_rows: Range<usize>, row_count: usize) -> Range<usize> {
+  let prefetch_rows = visible_rows.len().max(1);
+  visible_rows.start.saturating_sub(prefetch_rows)
+    ..visible_rows.end.saturating_add(prefetch_rows).min(row_count)
+}
+
 fn library_document_card_width() -> f32 {
   LIBRARY_CARD_WIDTH
+}
+
+fn library_preview_target_size(context: &egui::Context) -> [u32; 2] {
+  let pixels_per_point = context.pixels_per_point().max(1.0);
+  [
+    (LIBRARY_PREVIEW_SIZE.x * pixels_per_point).ceil().min(480.0) as u32,
+    (LIBRARY_PREVIEW_SIZE.y * pixels_per_point).ceil().min(480.0) as u32,
+  ]
 }
 
 fn library_document_description_width(ui: &egui::Ui) -> f32 {
@@ -2930,6 +3368,104 @@ mod tests {
   use std::cell::Cell;
 
   use super::*;
+
+  fn preview_key(
+    document_id: DocumentId,
+    revision: u64,
+    path: impl Into<PathBuf>,
+    target_size_px: [u32; 2],
+  ) -> PreviewKey {
+    PreviewKey::new(document_id, revision, path, target_size_px)
+  }
+
+  #[test]
+  fn preview_texture_budget_enforces_64_item_lru_limit() {
+    let mut budget = PreviewTextureBudget::default();
+    let document_ids: Vec<_> = (0..=MAX_PREVIEW_TEXTURES).map(|_| DocumentId::new()).collect();
+    for document_id in document_ids.iter().take(MAX_PREVIEW_TEXTURES) {
+      assert!(budget.insert(*document_id, 1).is_empty());
+    }
+    budget.touch(document_ids[0]);
+
+    let evicted = budget.insert(document_ids[MAX_PREVIEW_TEXTURES], 1);
+
+    assert_eq!(evicted, vec![document_ids[1]]);
+    assert_eq!(budget.entries.len(), MAX_PREVIEW_TEXTURES);
+    assert_eq!(budget.byte_count, MAX_PREVIEW_TEXTURES);
+    assert!(budget.entries.contains_key(&document_ids[0]));
+    assert!(!budget.entries.contains_key(&document_ids[1]));
+    assert!(budget.entries.contains_key(&document_ids[MAX_PREVIEW_TEXTURES]));
+  }
+
+  #[test]
+  fn preview_texture_budget_enforces_32_mib_limit() {
+    let mut budget = PreviewTextureBudget::default();
+    let first = DocumentId::new();
+    let second = DocumentId::new();
+    let third = DocumentId::new();
+    let half_budget = MAX_PREVIEW_TEXTURE_BYTES / 2;
+    assert!(budget.insert(first, half_budget).is_empty());
+    assert!(budget.insert(second, half_budget).is_empty());
+    budget.touch(first);
+
+    let evicted = budget.insert(third, 1);
+
+    assert_eq!(evicted, vec![second]);
+    assert_eq!(budget.byte_count, half_budget + 1);
+    assert!(budget.entries.contains_key(&first));
+    assert!(!budget.entries.contains_key(&second));
+    assert!(budget.entries.contains_key(&third));
+
+    let oversized = DocumentId::new();
+    let evicted = budget.insert(oversized, MAX_PREVIEW_TEXTURE_BYTES + 1);
+    assert!(evicted.contains(&oversized));
+    assert!(budget.entries.is_empty());
+    assert_eq!(budget.byte_count, 0);
+  }
+
+  #[test]
+  fn preview_failure_identity_ignores_target_size_but_not_revision_or_path() {
+    let mut cache = PreviewFailureCache::default();
+    let document_id = DocumentId::new();
+    let original = preview_key(document_id, 7, "preview.png", [144, 81]);
+    cache.insert(original.clone());
+
+    let high_dpi = preview_key(document_id, 7, "preview.png", [288, 162]);
+    let new_revision = preview_key(document_id, 8, "preview.png", [144, 81]);
+    let new_path = preview_key(document_id, 7, "replacement.png", [144, 81]);
+    assert!(cache.contains(&high_dpi));
+    assert!(!cache.contains(&new_revision));
+    assert!(!cache.contains(&new_path));
+    assert_eq!(cache.entries.len(), 1);
+
+    cache.insert(new_revision.clone());
+    cache.insert(new_path.clone());
+    assert!(cache.contains(&new_revision));
+    assert!(cache.contains(&new_path));
+    assert_eq!(cache.entries.len(), 3);
+    cache.remove_document(document_id);
+    assert!(cache.entries.is_empty());
+  }
+
+  #[test]
+  fn preview_failure_cache_enforces_256_item_lru_limit() {
+    let mut cache = PreviewFailureCache::default();
+    let keys: Vec<_> = (0..MAX_PREVIEW_FAILURES)
+      .map(|index| preview_key(DocumentId::new(), 1, format!("preview-{index}.png"), [144, 81]))
+      .collect();
+    for key in &keys {
+      cache.insert(key.clone());
+    }
+    assert!(cache.contains(&keys[0]));
+    let newest = preview_key(DocumentId::new(), 1, "newest.png", [144, 81]);
+
+    cache.insert(newest.clone());
+
+    assert_eq!(cache.entries.len(), MAX_PREVIEW_FAILURES);
+    assert!(cache.contains(&keys[0]));
+    assert!(!cache.contains(&keys[1]));
+    assert!(cache.contains(&newest));
+  }
 
   #[test]
   fn root_close_request_hides_idle_window_and_quits_active_session() {
@@ -3108,6 +3644,43 @@ mod tests {
     assert!(
       second_card.right() <= LIBRARY_SIZE.x - LIBRARY_PANEL_MARGIN - LIBRARY_SCROLLBAR_RESERVE
     );
+  }
+
+  #[test]
+  fn ten_thousand_item_scroll_only_constructs_visible_rows_and_one_screen_of_prefetch() {
+    let context = egui::Context::default();
+    configure_egui(&context);
+    let constructed_rows = Cell::new(0usize);
+    let visible_rows = Cell::new(0..0);
+
+    context
+      .run_ui(
+        egui::RawInput {
+          screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+          ..Default::default()
+        },
+        |ui| {
+          egui::ScrollArea::vertical().max_height(500.0).show_rows(
+            ui,
+            LIBRARY_CARD_HEIGHT,
+            10_000usize.div_ceil(2),
+            |_ui, row_range| {
+              constructed_rows.set(constructed_rows.get() + row_range.len());
+              visible_rows.set(row_range);
+            },
+          );
+        },
+      )
+      .drop_without_applying_deltas();
+
+    let visible_rows = visible_rows.into_inner();
+    assert!(!visible_rows.is_empty());
+    assert_eq!(constructed_rows.get(), visible_rows.len());
+    assert!(constructed_rows.get() < 100);
+    let prefetch = library_prefetch_row_range(visible_rows.clone(), 5_000);
+    assert!(prefetch.len() <= visible_rows.len() * 3);
+    assert!(prefetch.start <= visible_rows.start);
+    assert!(prefetch.end >= visible_rows.end);
   }
 
   fn assert_same_center<const N: usize>(centers: [f32; N]) {

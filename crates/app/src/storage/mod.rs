@@ -8,13 +8,14 @@ mod paths;
 mod resource;
 mod store;
 
+pub(crate) use atomic::write_file_atomically;
 pub use error::{StorageError, StorageResult};
 pub use image_data::BackgroundData;
 pub use metadata::GenerationId;
 pub use paths::StorePaths;
 pub use resource::{ResourceName, open_regular_file, open_regular_path};
 pub use store::{
-  DocumentSummary, ExportedBundle, ImportRequest, ImportedDocument, LatestDraft, LoadedDocument,
-  LoadedDraft, LocalStore, PersistenceContext, RecoveryReport, SaveRequest, SavedDocument,
-  ScanFailure, ScanResult, StashRequest,
+  DocumentSkeleton, DocumentSummary, ExportedBundle, ImportRequest, ImportedDocument, LatestDraft,
+  LoadedDocument, LoadedDraft, LocalStore, ManifestFingerprint, PersistenceContext, RecoveryReport,
+  SaveRequest, SavedDocument, ScanFailure, ScanResult, SkeletonScanResult, StashRequest,
 };

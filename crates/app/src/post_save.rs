@@ -1,5 +1,6 @@
 use std::{
   collections::{HashMap, VecDeque},
+  path::PathBuf,
   sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
   thread::{self, JoinHandle},
   time::Instant,
@@ -14,7 +15,7 @@ use crate::{
   export::{copy_image, encode_png, make_preview},
   performance::{PerformanceContext, PerformanceDetails, PerformanceTimer},
   renderer::render_document_to_image,
-  storage::{LocalStore, ScanResult},
+  storage::LocalStore,
 };
 
 const MAX_PENDING_RENDERS: usize = 16;
@@ -41,12 +42,8 @@ pub enum PostSaveResult {
   ImageTasks {
     document_id: DocumentId,
     revision: Revision,
-    preview_installed: bool,
+    preview_path: Option<PathBuf>,
     warnings: Vec<String>,
-  },
-  RecentRefresh {
-    performance: PerformanceContext,
-    result: Result<ScanResult, String>,
   },
 }
 
@@ -74,13 +71,11 @@ struct CoordinatorState {
   render_order: VecDeque<DocumentId>,
   latest_render_by_document: HashMap<DocumentId, Arc<PostSaveJob>>,
   clipboard_queue: VecDeque<Arc<PostSaveJob>>,
-  recent_refresh: Option<PerformanceContext>,
   abandon: bool,
 }
 
 enum Work {
   Image { job: Arc<PostSaveJob>, install_preview: bool, copy_to_clipboard: bool },
-  RecentRefresh(PerformanceContext),
 }
 
 impl CoordinatorState {
@@ -111,7 +106,6 @@ impl CoordinatorState {
         self.clipboard_queue.push_back(Arc::clone(&job));
       }
     }
-    self.recent_refresh = Some(job.performance);
     outcome
   }
 
@@ -133,13 +127,11 @@ impl CoordinatorState {
         return Some(Work::Image { job, install_preview: true, copy_to_clipboard: false });
       }
     }
-    self.recent_refresh.take().map(Work::RecentRefresh)
+    None
   }
 
   fn has_work(&self) -> bool {
-    !self.clipboard_queue.is_empty()
-      || !self.latest_render_by_document.is_empty()
-      || self.recent_refresh.is_some()
+    !self.clipboard_queue.is_empty() || !self.latest_render_by_document.is_empty()
   }
 }
 
@@ -194,7 +186,6 @@ impl Drop for PostSaveCoordinator {
       state.render_order.clear();
       state.latest_render_by_document.clear();
       state.clipboard_queue.clear();
-      state.recent_refresh = None;
       self.shared.changed.notify_all();
     }
     self.worker.take();
@@ -226,19 +217,6 @@ fn run_worker(
     let result = match work {
       Work::Image { job, install_preview, copy_to_clipboard } => {
         process_image_tasks(&store, &job, install_preview, copy_to_clipboard)
-      }
-      Work::RecentRefresh(performance) => {
-        let timer = PerformanceTimer::start(
-          "post_save.recent_refresh",
-          performance,
-          PerformanceDetails::default().workflow("save"),
-        );
-        let result = store.scan_documents().map_err(|error| error.to_string());
-        match &result {
-          Ok(_) => timer.finish_ok(),
-          Err(_) => timer.finish_error_code("post_save.recent_refresh_failed"),
-        }
-        PostSaveResult::RecentRefresh { performance, result }
       }
     };
     if results.send(result).is_err() {
@@ -284,7 +262,7 @@ fn process_image_tasks(
       return PostSaveResult::ImageTasks {
         document_id: job.document_id,
         revision: job.revision,
-        preview_installed: false,
+        preview_path: None,
         warnings,
       };
     }
@@ -294,7 +272,7 @@ fn process_image_tasks(
   let image = render_document_to_image(job.snapshot.as_ref(), &background);
   render_timer.finish_ok();
 
-  let mut preview_installed = false;
+  let mut preview_path = None;
   if install_preview {
     let preview_timer = PerformanceTimer::start(
       "post_save.preview_resize",
@@ -326,7 +304,7 @@ fn process_image_tasks(
           Err(error) => install_timer.finish_error(error),
         }
         match result {
-          Ok(installed) => preview_installed = installed,
+          Ok(installed) => preview_path = installed,
           Err(error) => warnings.push(format!("预览生成失败: {error}")),
         }
       }
@@ -358,7 +336,7 @@ fn process_image_tasks(
   PostSaveResult::ImageTasks {
     document_id: job.document_id,
     revision: job.revision,
-    preview_installed,
+    preview_path,
     warnings,
   }
 }
@@ -450,16 +428,16 @@ mod tests {
   }
 
   #[test]
-  fn recent_refresh_requests_merge_to_the_latest_context() {
-    let mut first = job(DocumentId::new(), 1, false);
-    first.performance.revision = Some(1);
-    let mut second = job(DocumentId::new(), 2, false);
-    second.performance.revision = Some(2);
+  fn enqueue_does_not_schedule_a_full_library_refresh() {
+    let document_id = DocumentId::new();
+    let first = job(document_id, 1, false);
+    let second = job(document_id, 2, false);
     let mut state = CoordinatorState::default();
     state.enqueue(first);
     state.enqueue(second);
 
-    assert_eq!(state.recent_refresh.unwrap().revision, Some(2));
+    assert!(matches!(state.next_work(), Some(Work::Image { .. })));
+    assert!(!state.has_work());
   }
 
   #[test]

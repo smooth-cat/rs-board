@@ -1,12 +1,17 @@
 use std::{
+  fs::File,
   path::{Path, PathBuf},
   sync::{Arc, Mutex, MutexGuard},
+  time::SystemTime,
 };
 
 use chrono::{DateTime, Utc};
 use common::{
   document::{BoardDocument, DocumentId, DocumentSnapshot, Revision},
-  format::{FormatError, decode_document, encode_document, encode_snapshot},
+  format::{
+    DocumentManifestSummary, FormatError, decode_document, decode_document_summary,
+    encode_document, encode_snapshot,
+  },
 };
 use uuid::Uuid;
 
@@ -18,13 +23,13 @@ use super::{
     write_file_atomically_traced, write_new_file, write_new_file_traced,
   },
   bundle_name::choose_available_bundle_names,
-  image_data::MAX_ENCODED_IMAGE_BYTES,
+  image_data::{MAX_ENCODED_IMAGE_BYTES, inspect_png_dimensions},
   io::{
-    MAX_MANIFEST_BYTES, MAX_METADATA_BYTES, read_named_file, read_regular_path,
+    MAX_MANIFEST_BYTES, MAX_METADATA_BYTES, read_bounded, read_named_file, read_regular_path,
     reject_managed_destination, require_plain_directory,
   },
   metadata::{COMMIT_MARKER_FILE_NAME, CommitKind, CommitMarker, SLOT_FILE_NAME, SlotMetadata},
-  open_regular_file,
+  open_regular_file, open_regular_path,
 };
 use crate::performance::{PerformanceContext, PerformanceDetails, PerformanceTimer};
 
@@ -120,12 +125,25 @@ pub struct SavedDocument {
   pub manifest_path: PathBuf,
   pub background_path: PathBuf,
   pub preview_path: Option<PathBuf>,
+  pub summary: DocumentSummary,
+}
+
+impl SavedDocument {
+  pub fn committed_summary(&self) -> &DocumentSummary {
+    &self.summary
+  }
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportedDocument {
   pub source_manifest: PathBuf,
   pub saved: SavedDocument,
+}
+
+impl ImportedDocument {
+  pub fn committed_summary(&self) -> &DocumentSummary {
+    self.saved.committed_summary()
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -142,7 +160,27 @@ pub struct DocumentSummary {
   pub title: String,
   pub revision: Revision,
   pub updated_at: DateTime<Utc>,
+  pub preview_revision: Option<Revision>,
   pub preview_path: Option<PathBuf>,
+  pub manifest_fingerprint: ManifestFingerprint,
+}
+
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ManifestFingerprint {
+  pub byte_len: u64,
+  pub modified_at: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentSkeleton {
+  pub document_id: DocumentId,
+  pub manifest_fingerprint: ManifestFingerprint,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SkeletonScanResult {
+  pub skeletons: Vec<DocumentSkeleton>,
+  pub failures: Vec<ScanFailure>,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +206,12 @@ pub struct RecoveryReport {
 pub struct LocalStore {
   paths: StorePaths,
   gate: Arc<Mutex<()>>,
+}
+
+struct LoadedManifest {
+  document: BoardDocument,
+  directory_path: PathBuf,
+  manifest_path: PathBuf,
 }
 
 impl LocalStore {
@@ -408,9 +452,48 @@ impl LocalStore {
     self.open_document_locked(document_id)
   }
 
+  pub fn scan_document_skeletons(&self) -> StorageResult<SkeletonScanResult> {
+    // Directory commits are atomic and staging entries are hidden. Avoid holding the
+    // store gate while walking a large library so an in-progress bootstrap cannot
+    // delay a save; per-entry races are reported and reconciled by the index worker.
+    self.scan_document_skeletons_unlocked()
+  }
+
+  pub fn load_document_summary(
+    &self,
+    skeleton: &DocumentSkeleton,
+  ) -> StorageResult<DocumentSummary> {
+    let _guard = self.lock()?;
+    self.load_document_summary_locked(skeleton.document_id)
+  }
+
+  pub fn load_document_summary_by_id(
+    &self,
+    document_id: DocumentId,
+  ) -> StorageResult<DocumentSummary> {
+    let _guard = self.lock()?;
+    self.load_document_summary_locked(document_id)
+  }
+
   pub fn scan_documents(&self) -> StorageResult<ScanResult> {
     let _guard = self.lock()?;
-    let mut result = ScanResult::default();
+    let skeleton_scan = self.scan_document_skeletons_unlocked()?;
+    let mut result = ScanResult { documents: Vec::new(), failures: skeleton_scan.failures };
+    for skeleton in skeleton_scan.skeletons {
+      match self.load_document_summary_locked(skeleton.document_id) {
+        Ok(summary) => result.documents.push(summary),
+        Err(error) => result.failures.push(ScanFailure {
+          entry_name: skeleton.document_id.to_string(),
+          message: error.to_string(),
+        }),
+      }
+    }
+    sort_document_summaries(&mut result.documents);
+    Ok(result)
+  }
+
+  fn scan_document_skeletons_unlocked(&self) -> StorageResult<SkeletonScanResult> {
+    let mut result = SkeletonScanResult::default();
     let entries = std::fs::read_dir(self.paths.documents_root())
       .map_err(|error| StorageError::io("scanning documents", error))?;
     for entry in entries {
@@ -434,23 +517,43 @@ impl LocalStore {
         });
         continue;
       };
-      match self.open_document_locked(document_id) {
-        Ok(loaded) => result.documents.push(DocumentSummary {
-          document_id,
-          title: loaded.document.title,
-          revision: loaded.document.revision,
-          updated_at: loaded.document.updated_at,
-          preview_path: loaded.preview_path,
-        }),
+      if name != document_id.to_string() {
+        result.failures.push(ScanFailure {
+          entry_name: name,
+          message: "directory name is not a canonical document ID".into(),
+        });
+        continue;
+      }
+      let file_type = match entry.file_type() {
+        Ok(file_type) => file_type,
+        Err(error) => {
+          result.failures.push(ScanFailure { entry_name: name, message: error.to_string() });
+          continue;
+        }
+      };
+      if !file_type.is_dir() || file_type.is_symlink() {
+        result.failures.push(ScanFailure {
+          entry_name: name,
+          message: "document entry is not a plain directory".into(),
+        });
+        continue;
+      }
+      let manifest_name = managed_manifest_name(document_id)?;
+      match open_regular_file(&entry.path(), &manifest_name).and_then(|file| {
+        manifest_fingerprint(&file)
+          .map(|manifest_fingerprint| DocumentSkeleton { document_id, manifest_fingerprint })
+      }) {
+        Ok(skeleton) => result.skeletons.push(skeleton),
         Err(error) => {
           result.failures.push(ScanFailure { entry_name: name, message: error.to_string() })
         }
       }
     }
-    result.documents.sort_by(|left, right| {
+    result.skeletons.sort_by(|left, right| {
       right
-        .updated_at
-        .cmp(&left.updated_at)
+        .manifest_fingerprint
+        .modified_at
+        .cmp(&left.manifest_fingerprint.modified_at)
         .then_with(|| left.document_id.to_string().cmp(&right.document_id.to_string()))
     });
     Ok(result)
@@ -479,19 +582,18 @@ impl LocalStore {
         "document title must contain 1 to 512 characters".into(),
       ));
     }
-    let mut loaded = self.open_document_locked(document_id)?;
+    let directory = self.paths.document_dir(document_id);
+    if !directory.exists() {
+      return Err(StorageError::DocumentNotFound(document_id.to_string()));
+    }
+    let mut loaded = self.load_managed_manifest(&directory, &document_id.to_string(), None)?;
     loaded.document.title = title;
     loaded.document.updated_at = Utc::now().max(loaded.document.updated_at);
     loaded.document.validate().map_err(invalid_manifest)?;
     let manifest = encode_document(&loaded.document).map_err(format_error)?;
     write_file_atomically(&loaded.manifest_path, &manifest)?;
-    Ok(DocumentSummary {
-      document_id,
-      title: loaded.document.title,
-      revision: loaded.document.revision,
-      updated_at: loaded.document.updated_at,
-      preview_path: loaded.preview_path,
-    })
+    let fingerprint = manifest_fingerprint_at(&loaded.manifest_path, manifest.len() as u64);
+    Ok(document_summary_from_document(&loaded.document, &loaded.directory_path, fingerprint))
   }
 
   pub fn install_preview_if_current(
@@ -499,30 +601,31 @@ impl LocalStore {
     document_id: DocumentId,
     revision: Revision,
     png_bytes: impl Into<Arc<[u8]>>,
-  ) -> StorageResult<bool> {
+  ) -> StorageResult<Option<PathBuf>> {
     let _guard = self.lock()?;
-    let preview = BackgroundData::encoded_png(png_bytes)?;
-    let (width_px, height_px, _) = preview.decode_rgba8()?;
+    let directory = self.paths.document_dir(document_id);
+    if !directory.exists() {
+      return Err(StorageError::DocumentNotFound(document_id.to_string()));
+    }
+    let mut loaded = self.load_managed_manifest(&directory, &document_id.to_string(), None)?;
+    if loaded.document.revision != revision {
+      return Ok(None);
+    }
+    let png_bytes = png_bytes.into();
+    let (width_px, height_px) = inspect_png_dimensions(&png_bytes)?;
     if width_px.max(height_px) > 480 {
       return Err(StorageError::InvalidImage("preview long edge exceeds 480px".into()));
-    }
-    let mut loaded = self.open_document_locked(document_id)?;
-    if loaded.document.revision != revision {
-      return Ok(false);
     }
     loaded.document.preview_revision = Some(revision);
     loaded.document.validate().map_err(invalid_manifest)?;
     let manifest = encode_document(&loaded.document).map_err(format_error)?;
     let preview_name = ResourceName::new(loaded.document.preview_file.clone())?;
-    let png_bytes = match preview {
-      BackgroundData::EncodedPng(bytes) => bytes,
-      BackgroundData::Rgba8 { .. } => unreachable!(),
-    };
+    let preview_path = loaded.directory_path.join(preview_name.as_os_str());
     // Replacing the image before the manifest is conservative: a crash can leave
     // an unconfirmed image, but never a manifest that confirms a missing image.
-    write_file_atomically(&loaded.directory_path.join(preview_name.as_os_str()), &png_bytes)?;
+    write_file_atomically(&preview_path, &png_bytes)?;
     write_file_atomically(&loaded.manifest_path, &manifest)?;
-    Ok(true)
+    Ok(Some(preview_path))
   }
 
   pub fn import_document(&self, request: ImportRequest) -> StorageResult<ImportedDocument> {
@@ -759,15 +862,24 @@ impl LocalStore {
       commit_result?;
     }
 
-    let preview_path = valid_preview_path(&directory, &request.snapshot.to_document());
+    let committed_document = request.snapshot.to_document();
+    let preview_path = valid_preview_path(&directory, &committed_document);
+    let manifest_path = directory.join(manifest_name.as_os_str());
+    let mut summary = document_summary_from_document(
+      &committed_document,
+      &directory,
+      manifest_fingerprint_at(&manifest_path, manifest.len() as u64),
+    );
+    summary.preview_path = preview_path.clone();
     Ok(SavedDocument {
       context: request.context,
       document_id,
       revision,
       directory_path: directory.clone(),
-      manifest_path: directory.join(manifest_name.as_os_str()),
+      manifest_path,
       background_path: directory.join(background_name.as_os_str()),
       preview_path,
+      summary,
     })
   }
 
@@ -779,16 +891,35 @@ impl LocalStore {
     self.load_managed_package(&directory, &document_id.to_string(), None)
   }
 
-  fn load_managed_package(
+  fn load_document_summary_locked(
+    &self,
+    document_id: DocumentId,
+  ) -> StorageResult<DocumentSummary> {
+    let directory = self.paths.document_dir(document_id);
+    if !directory.exists() {
+      return Err(StorageError::DocumentNotFound(document_id.to_string()));
+    }
+    require_plain_directory(&directory)?;
+    let manifest_name = managed_manifest_name(document_id)?;
+    let file = open_regular_file(&directory, &manifest_name)?;
+    let manifest_fingerprint = manifest_fingerprint(&file)?;
+    let manifest_bytes = read_bounded(file, MAX_MANIFEST_BYTES)?;
+    let summary = decode_document_summary(&manifest_bytes).map_err(format_error)?;
+    validate_managed_summary(document_id, &summary)?;
+    Ok(document_summary_from_manifest(summary, &directory, manifest_fingerprint))
+  }
+
+  fn load_managed_manifest(
     &self,
     directory: &Path,
     expected_document_id: &str,
     expected_revision: Option<Revision>,
-  ) -> StorageResult<LoadedDocument> {
+  ) -> StorageResult<LoadedManifest> {
     require_plain_directory(directory)?;
     let document_id = parse_document_id(expected_document_id)
       .ok_or_else(|| StorageError::InvalidManifest("document ID is not a UUID".into()))?;
     let manifest_name = managed_manifest_name(document_id)?;
+    let manifest_path = directory.join(manifest_name.as_os_str());
     let manifest_bytes = read_named_file(directory, &manifest_name, MAX_MANIFEST_BYTES)?;
     let document = decode_document(&manifest_bytes).map_err(format_error)?;
     if document.document_id != document_id {
@@ -800,6 +931,17 @@ impl LocalStore {
       ));
     }
     validate_managed_names(&document)?;
+    Ok(LoadedManifest { document, directory_path: directory.to_path_buf(), manifest_path })
+  }
+
+  fn load_managed_package(
+    &self,
+    directory: &Path,
+    expected_document_id: &str,
+    expected_revision: Option<Revision>,
+  ) -> StorageResult<LoadedDocument> {
+    let loaded = self.load_managed_manifest(directory, expected_document_id, expected_revision)?;
+    let document = loaded.document;
     let background_name = ResourceName::new(document.background.file.clone())?;
     let background_bytes = read_named_file(directory, &background_name, MAX_ENCODED_IMAGE_BYTES)?;
     let background = BackgroundData::encoded_png(background_bytes)?;
@@ -812,9 +954,9 @@ impl LocalStore {
     }
     let preview_path = valid_preview_path(directory, &document);
     Ok(LoadedDocument {
-      manifest_path: directory.join(manifest_name.as_os_str()),
+      manifest_path: loaded.manifest_path,
       background_path: directory.join(background_name.as_os_str()),
-      directory_path: directory.to_path_buf(),
+      directory_path: loaded.directory_path,
       document,
       background,
       preview_path,
@@ -992,17 +1134,110 @@ fn validate_managed_names(document: &BoardDocument) -> StorageResult<()> {
   Ok(())
 }
 
+fn validate_managed_summary(
+  expected_document_id: DocumentId,
+  summary: &DocumentManifestSummary,
+) -> StorageResult<()> {
+  if summary.document_id != expected_document_id {
+    return Err(StorageError::InvalidManifest("document ID does not match its package".into()));
+  }
+  if summary.preview_file != format!("{expected_document_id}.preview.png") {
+    return Err(StorageError::InvalidManifest(
+      "managed document resources must use the document ID as their base name".into(),
+    ));
+  }
+  Ok(())
+}
+
 fn managed_manifest_name(document_id: DocumentId) -> StorageResult<ResourceName> {
   ResourceName::new(format!("{document_id}.rsboard"))
 }
 
 fn valid_preview_path(directory: &Path, document: &BoardDocument) -> Option<PathBuf> {
-  if document.preview_revision != Some(document.revision) {
+  let path = declared_preview_path(
+    directory,
+    &document.preview_file,
+    document.preview_revision,
+    document.revision,
+  )?;
+  open_regular_path(&path).ok()?;
+  Some(path)
+}
+
+fn declared_preview_path(
+  directory: &Path,
+  preview_file: &str,
+  preview_revision: Option<Revision>,
+  revision: Revision,
+) -> Option<PathBuf> {
+  if preview_revision != Some(revision) {
     return None;
   }
-  let name = ResourceName::new(document.preview_file.clone()).ok()?;
-  open_regular_file(directory, &name).ok()?;
+  let name = ResourceName::new(preview_file.to_owned()).ok()?;
   Some(directory.join(name.as_os_str()))
+}
+
+fn document_summary_from_manifest(
+  summary: DocumentManifestSummary,
+  directory: &Path,
+  manifest_fingerprint: ManifestFingerprint,
+) -> DocumentSummary {
+  DocumentSummary {
+    document_id: summary.document_id,
+    title: summary.title,
+    revision: summary.revision,
+    updated_at: summary.updated_at,
+    preview_revision: summary.preview_revision,
+    preview_path: declared_preview_path(
+      directory,
+      &summary.preview_file,
+      summary.preview_revision,
+      summary.revision,
+    ),
+    manifest_fingerprint,
+  }
+}
+
+fn document_summary_from_document(
+  document: &BoardDocument,
+  directory: &Path,
+  manifest_fingerprint: ManifestFingerprint,
+) -> DocumentSummary {
+  DocumentSummary {
+    document_id: document.document_id,
+    title: document.title.clone(),
+    revision: document.revision,
+    updated_at: document.updated_at,
+    preview_revision: document.preview_revision,
+    preview_path: declared_preview_path(
+      directory,
+      &document.preview_file,
+      document.preview_revision,
+      document.revision,
+    ),
+    manifest_fingerprint,
+  }
+}
+
+fn manifest_fingerprint(file: &File) -> StorageResult<ManifestFingerprint> {
+  let metadata =
+    file.metadata().map_err(|error| StorageError::io("inspecting a manifest", error))?;
+  Ok(ManifestFingerprint { byte_len: metadata.len(), modified_at: metadata.modified().ok() })
+}
+
+fn manifest_fingerprint_at(path: &Path, fallback_byte_len: u64) -> ManifestFingerprint {
+  open_regular_path(path)
+    .and_then(|file| manifest_fingerprint(&file))
+    .unwrap_or(ManifestFingerprint { byte_len: fallback_byte_len, modified_at: None })
+}
+
+fn sort_document_summaries(documents: &mut [DocumentSummary]) {
+  documents.sort_by(|left, right| {
+    right
+      .updated_at
+      .cmp(&left.updated_at)
+      .then_with(|| left.document_id.to_string().cmp(&right.document_id.to_string()))
+  });
 }
 
 fn parse_document_id(value: &str) -> Option<DocumentId> {
@@ -1217,6 +1452,12 @@ mod tests {
     let saved = store.save_document(request).unwrap();
     assert_eq!(saved.context, expected_context);
     assert_eq!(saved.revision, document.revision);
+    assert_eq!(saved.summary.document_id, document.document_id);
+    assert_eq!(saved.summary.title, document.title);
+    assert_eq!(saved.summary.revision, document.revision);
+    assert_eq!(saved.summary.updated_at, document.updated_at);
+    assert_eq!(saved.summary.preview_revision, None);
+    assert_eq!(saved.summary.preview_path, None);
 
     let opened = store.open_document(document.document_id).unwrap();
     assert_eq!(opened.document, document);
@@ -1270,21 +1511,32 @@ mod tests {
   fn stale_preview_result_is_ignored() {
     let (_root, store) = store("preview-revision");
     let document = document(DocumentId::new());
-    store.save_document(save_request(&document, 1)).unwrap();
+    let saved = store.save_document(save_request(&document, 1)).unwrap();
     let preview = background(42).normalized_png(2, 2).unwrap();
 
-    assert!(
-      !store
-        .install_preview_if_current(document.document_id, document.revision + 1, preview.clone())
-        .unwrap()
+    assert_eq!(
+      store
+        .install_preview_if_current(
+          document.document_id,
+          document.revision + 1,
+          Arc::<[u8]>::from(&b"not a png"[..]),
+        )
+        .unwrap(),
+      None
     );
-    assert!(
-      store.install_preview_if_current(document.document_id, document.revision, preview).unwrap()
-    );
+    std::fs::write(&saved.background_path, b"not a png").unwrap();
+    let preview_path = store
+      .install_preview_if_current(document.document_id, document.revision, preview)
+      .unwrap()
+      .expect("current preview should be installed without decoding the background");
+    assert_eq!(preview_path, saved.directory_path.join(&document.preview_file));
 
-    let loaded = store.open_document(document.document_id).unwrap();
-    assert_eq!(loaded.document.preview_revision, Some(document.revision));
-    assert!(loaded.preview_path.is_some());
+    let manifest = decode_document(&std::fs::read(&saved.manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest.preview_revision, Some(document.revision));
+    assert!(matches!(
+      store.open_document(document.document_id),
+      Err(StorageError::InvalidImage(_))
+    ));
   }
 
   #[test]
@@ -1304,6 +1556,7 @@ mod tests {
       .import_document(ImportRequest { context: context(), manifest_path: first.manifest_path })
       .unwrap();
     assert_ne!(imported.saved.document_id, document.document_id);
+    assert_eq!(imported.committed_summary().document_id, imported.saved.document_id);
     let loaded = store.open_document(imported.saved.document_id).unwrap();
     assert_eq!(loaded.document.background.file, format!("{}.png", imported.saved.document_id));
     assert_eq!(store.scan_documents().unwrap().documents.len(), 2);
@@ -1398,6 +1651,104 @@ mod tests {
       store.open_document(document.document_id),
       Err(StorageError::InvalidImage(_))
     ));
+  }
+
+  #[test]
+  fn summaries_and_compatible_scan_do_not_read_a_corrupt_background() {
+    let (_root, store) = store("summary-corrupt-background");
+    let document = document(DocumentId::new());
+    let saved = store.save_document(save_request(&document, 1)).unwrap();
+    std::fs::write(&saved.background_path, b"not a png").unwrap();
+
+    let skeletons = store.scan_document_skeletons().unwrap();
+    assert_eq!(skeletons.skeletons.len(), 1);
+    assert!(skeletons.failures.is_empty());
+    let summary = store.load_document_summary(&skeletons.skeletons[0]).unwrap();
+    assert_eq!(summary.document_id, document.document_id);
+    assert_eq!(summary.manifest_fingerprint, skeletons.skeletons[0].manifest_fingerprint);
+
+    let scan = store.scan_documents().unwrap();
+    assert_eq!(scan.documents.len(), 1);
+    assert!(scan.failures.is_empty());
+    assert!(matches!(
+      store.open_document(document.document_id),
+      Err(StorageError::InvalidImage(_))
+    ));
+  }
+
+  #[test]
+  fn skeleton_scan_does_not_wait_for_the_store_gate() {
+    let (_root, store) = store("unlocked-skeleton-scan");
+    let guard = store.gate.lock().unwrap();
+    let scanning_store = store.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+      let _ = sender.send(scanning_store.scan_document_skeletons());
+    });
+
+    let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+    drop(guard);
+    worker.join().unwrap();
+
+    assert!(result.expect("skeleton scan was blocked by the store gate").is_ok());
+  }
+
+  #[test]
+  fn summary_does_not_open_a_declared_preview() {
+    let (_root, store) = store("summary-missing-preview");
+    let document = document(DocumentId::new());
+    let saved = store.save_document(save_request(&document, 1)).unwrap();
+    let preview = background(42).normalized_png(2, 2).unwrap();
+    let preview_path = store
+      .install_preview_if_current(document.document_id, document.revision, preview)
+      .unwrap()
+      .unwrap();
+    std::fs::remove_file(&preview_path).unwrap();
+
+    let summary = store.load_document_summary_by_id(document.document_id).unwrap();
+    assert_eq!(summary.preview_revision, Some(document.revision));
+    assert_eq!(summary.preview_path, Some(preview_path));
+    assert_eq!(store.open_document(document.document_id).unwrap().preview_path, None);
+    assert!(saved.background_path.exists());
+  }
+
+  #[test]
+  fn rename_only_needs_a_valid_manifest() {
+    let (_root, store) = store("rename-corrupt-background");
+    let document = document(DocumentId::new());
+    let saved = store.save_document(save_request(&document, 1)).unwrap();
+    std::fs::write(&saved.background_path, b"not a png").unwrap();
+
+    let renamed = store.rename_document(document.document_id, "仍可重命名").unwrap();
+    assert_eq!(renamed.title, "仍可重命名");
+    assert!(matches!(
+      store.open_document(document.document_id),
+      Err(StorageError::InvalidImage(_))
+    ));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn skeleton_scan_skips_hidden_entries_and_rejects_invalid_and_symlink_entries() {
+    use std::os::unix::fs::symlink;
+
+    let (_root, store) = store("skeleton-filtering");
+    let document = document(DocumentId::new());
+    let saved = store.save_document(save_request(&document, 1)).unwrap();
+    std::fs::create_dir(store.paths().documents_root().join(".hidden")).unwrap();
+    std::fs::create_dir(store.paths().documents_root().join("not-a-document-id")).unwrap();
+    let symlink_id = DocumentId::new();
+    symlink(&saved.directory_path, store.paths().documents_root().join(symlink_id.to_string()))
+      .unwrap();
+
+    let scan = store.scan_document_skeletons().unwrap();
+
+    assert_eq!(scan.skeletons.len(), 1);
+    assert_eq!(scan.skeletons[0].document_id, document.document_id);
+    assert_eq!(scan.failures.len(), 2);
+    assert!(scan.failures.iter().any(|failure| failure.entry_name == "not-a-document-id"));
+    assert!(scan.failures.iter().any(|failure| failure.entry_name == symlink_id.to_string()));
+    assert!(!scan.failures.iter().any(|failure| failure.entry_name == ".hidden"));
   }
 
   #[test]

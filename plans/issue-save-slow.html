@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RS Board · 保存链路慢在哪里：保存步骤与讲义列表更新图解</title>
+<style>
+  :root {
+    --bg: #141517;
+    --panel: #1d1f23;
+    --panel-2: #22252a;
+    --border: #2f3238;
+    --text: #e7e9ec;
+    --muted: #9aa1ab;
+    --faint: #6b7280;
+    --ui: #66bb6a;        /* UI 线程（egui） */
+    --preenc: #ba68c8;    /* 截图时的预编码线程 */
+    --saveworker: #4fc3f7;/* 保存 worker */
+    --postsave: #ffb74d;  /* post-save-coordinator */
+    --orig: #4fc3f7;      /* 原图（全分辨率截图） */
+    --prev: #ffb74d;      /* 预览图（≤480px） */
+    --encode: #7cb342;    /* 编码 */
+    --decode: #ef5350;    /* 解码 */
+    --clip: #f06292;      /* 剪贴板 */
+    --warn: #ffca28;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.65;
+    padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; }
+  h1 { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  h2 {
+    font-size: 19px; margin: 44px 0 6px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  h2 .idx {
+    display: inline-block; min-width: 26px; height: 26px; line-height: 26px;
+    text-align: center; border-radius: 6px; background: var(--panel-2);
+    border: 1px solid var(--border); font-size: 13px; margin-right: 10px;
+    color: var(--muted); vertical-align: 2px;
+  }
+  h3 { font-size: 15px; margin: 22px 0 10px; color: var(--text); }
+  p { margin: 8px 0; }
+  .lead { color: var(--muted); font-size: 13.5px; margin-bottom: 16px; }
+  .tldr {
+    background: linear-gradient(135deg, #262a1f, #1d1f23 60%);
+    border: 1px solid #4a4a2a; border-left: 4px solid var(--warn);
+    border-radius: 10px; padding: 16px 18px; margin: 18px 0 8px;
+  }
+  .tldr b { color: var(--warn); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px 20px; margin: 14px 0;
+  }
+  .muted { color: var(--muted); }
+  .small { font-size: 12.5px; }
+  .ref {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11.5px; color: var(--faint);
+  }
+  .chip {
+    display: inline-block; padding: 1px 9px; border-radius: 999px;
+    font-size: 11.5px; border: 1px solid; margin-right: 6px; white-space: nowrap;
+  }
+  .chip.ui      { color: var(--ui); border-color: var(--ui); }
+  .chip.preenc  { color: var(--preenc); border-color: var(--preenc); }
+  .chip.sworker { color: var(--saveworker); border-color: var(--saveworker); }
+  .chip.psave   { color: var(--postsave); border-color: var(--postsave); }
+  .chip.orig    { color: var(--orig); border-color: var(--orig); }
+  .chip.prev    { color: var(--prev); border-color: var(--prev); }
+  .chip.enc     { color: var(--encode); border-color: var(--encode); }
+  .chip.dec     { color: var(--decode); border-color: var(--decode); }
+  .chip.clip    { color: var(--clip); border-color: var(--clip); }
+
+  .code-block {
+    white-space: pre;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.55;
+    background: #0f1013; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; margin: 12px 0; color: #d6dae0;
+  }
+  .code-block .c { color: #7c828c; }   /* 注释 */
+  .code-block .k { color: #82aaff; }   /* 关键字/标识符强调 */
+  .code-block .s { color: #c3e88d; }   /* 字符串/路径 */
+
+  /* ===== 步骤序列图 ===== */
+  .seq { margin: 16px 0; }
+  .step {
+    display: grid; grid-template-columns: 44px 1fr; gap: 14px;
+    position: relative;
+  }
+  .step .rail { display: flex; flex-direction: column; align-items: center; }
+  .step .num {
+    width: 34px; height: 34px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; background: var(--panel-2);
+    border: 2px solid var(--border); color: var(--text);
+  }
+  .step .line { flex: 1; width: 2px; background: var(--border); margin: 4px 0; }
+  .step .body {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 14px;
+  }
+  .step .body .title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+  .step .body .desc { font-size: 13px; color: var(--muted); }
+  .step[data-lane="ui"] .num      { border-color: var(--ui); color: var(--ui); }
+  .step[data-lane="preenc"] .num  { border-color: var(--preenc); color: var(--preenc); }
+  .step[data-lane="sworker"] .num { border-color: var(--saveworker); color: var(--saveworker); }
+  .step[data-lane="psave"] .num   { border-color: var(--postsave); color: var(--postsave); }
+  .step.warn .body { border-color: #6d5a1e; background: #23221a; }
+  .step.warn .title { color: var(--warn); }
+  .marker {
+    display: flex; align-items: center; gap: 10px; margin: 2px 0 14px 48px;
+    font-size: 12.5px; color: var(--warn);
+  }
+  .marker::before, .marker::after {
+    content: ""; height: 1px; background: #5a521f; flex: 1;
+  }
+
+  /* ===== 编解码轨道图 ===== */
+  .tracks { display: grid; grid-template-columns: 1fr; gap: 16px; margin: 16px 0; }
+  .track {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: var(--panel); padding: 16px 18px;
+  }
+  .track.orig { border-left: 4px solid var(--orig); }
+  .track.prev { border-left: 4px solid var(--prev); }
+  .track.clip { border-left: 4px solid var(--clip); }
+  .track .head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+  .track .head .name { font-weight: 700; font-size: 15px; }
+  .track.orig .head .name { color: var(--orig); }
+  .track.prev .head .name { color: var(--prev); }
+  .track.clip .head .name { color: var(--clip); }
+  .track .head .file {
+    font-family: "SF Mono", Menlo, monospace; font-size: 12px;
+    color: var(--muted); background: #0f1013; padding: 2px 8px; border-radius: 6px;
+  }
+  .ops { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; align-items: stretch; }
+  .op {
+    flex: 1 1 200px; min-width: 200px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 9px; padding: 10px 12px; font-size: 12.5px; position: relative;
+  }
+  .op .op-tag {
+    position: absolute; top: -9px; left: 10px; font-size: 10.5px;
+    padding: 0 7px; border-radius: 4px; border: 1px solid;
+    background: var(--bg);
+  }
+  .op.enc .op-tag { color: var(--encode); border-color: var(--encode); }
+  .op.dec .op-tag { color: var(--decode); border-color: var(--decode); }
+  .op.io  .op-tag { color: var(--muted); border-color: var(--faint); }
+  .op .op-title { font-weight: 600; margin: 4px 0 3px; font-size: 13px; }
+  .op .op-desc { color: var(--muted); font-size: 12px; }
+  .op .op-ref { display: block; margin-top: 6px; }
+  .op .op-thread { display: block; margin-top: 7px; }
+  .th {
+    display: inline-block; padding: 0 8px; border-radius: 4px;
+    font-size: 10.5px; border: 1px solid; white-space: nowrap; margin-right: 4px;
+  }
+  .th.main { color: #ef5350; border-color: #ef5350; background: rgba(239,83,80,.08); }
+  .th.bg   { color: #81c784; border-color: #4c6e4f; }
+  .cost { color: var(--decode); font-weight: 600; }
+  .free { color: var(--encode); font-weight: 600; }
+
+  /* ===== 磁盘布局 ===== */
+  .fs .dir { color: #82aaff; }
+  .fs .orig-file { color: var(--orig); }
+  .fs .prev-file { color: var(--prev); }
+  .fs .mani { color: #c3e88d; }
+
+  /* ===== 时间线 ===== */
+  .timeline { margin: 18px 0 6px; }
+  .tl-row {
+    display: grid; grid-template-columns: 190px 1fr; gap: 12px;
+    align-items: center; margin-bottom: 10px; font-size: 12.5px;
+  }
+  .tl-label { color: var(--muted); text-align: right; }
+  .tl-track { position: relative; height: 30px; background: #17181b; border-radius: 6px; border: 1px solid var(--border); }
+  .tl-bar {
+    position: absolute; top: 4px; bottom: 4px; border-radius: 5px;
+    display: flex; align-items: center; padding: 0 8px;
+    font-size: 11px; white-space: nowrap; overflow: hidden;
+  }
+  .tl-bar.a { background: rgba(102,187,106,.22); border: 1px solid var(--ui); color: #a5d6a7; }
+  .tl-bar.c { background: rgba(255,183,77,.18); border: 1px solid var(--postsave); color: #ffcc80; }
+  .tl-mark { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--warn); }
+  .tl-mark-label {
+    position: absolute; top: 34px; transform: translateX(-50%);
+    font-size: 11px; color: var(--warn); white-space: nowrap; text-align: center;
+  }
+  .tl-scale { display: grid; grid-template-columns: 190px 1fr; gap: 12px; margin-top: 44px; }
+  .tl-scale .ticks { display: flex; justify-content: space-between; color: var(--faint); font-size: 11px; font-family: monospace; }
+
+  /* ===== 表格 ===== */
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--panel-2); font-weight: 600; }
+  tr.hl td { background: #262318; }
+
+  .note {
+    border: 1px dashed var(--border); border-radius: 10px;
+    padding: 12px 16px; font-size: 13px; color: var(--muted); margin: 14px 0;
+  }
+  .note b { color: var(--text); }
+  ul.tight { margin: 8px 0 8px 22px; }
+  ul.tight li { margin: 6px 0; font-size: 13.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+  footer { margin-top: 56px; color: var(--faint); font-size: 12px; border-top: 1px solid var(--border); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>保存截图后，为什么讲义列表要等约 4 秒才出现新条目？</h1>
+  <div class="subtitle">RS Board 保存链路图解 · 原图 / 预览图的编解码路径 · 讲义列表更新逻辑 &nbsp;（依据当前代码，行号均指向 crates/app/src/）</div>
+
+  <div class="tldr">
+    <b>一句话结论：</b>点保存后，截图文件（原图 PNG + manifest）在几百毫秒内就已落盘，UI 也已切回讲义窗口；
+    但讲义列表读的是内存缓存 <span class="ref">recent.documents</span>，而这次缓存刷新被排在
+    <b>post-save 串行任务链的最后</b>——必须等「解码原图 → 全分辨率合成 → 缩出预览图 → 编码预览 → 安装预览 → 全库扫描」
+    全部跑完才执行。高分辨率（4K/8K）下这条链要约 4 秒，列表在新条目出现前一直显示旧数据。
+  </div>
+
+  <!-- ============ 角色 ============ -->
+  <h2><span class="idx">0</span>参与保存的线程角色</h2>
+  <div class="card">
+    <div class="legend">
+      <span class="chip ui">UI 线程（egui）</span>
+      <span class="chip preenc">background-png-encode 预编码线程</span>
+      <span class="chip sworker">save worker（保存工作线程）</span>
+      <span class="chip psave">post-save-coordinator（单线程，串行）</span>
+    </div>
+    <p class="small muted">
+      前三个各自独立；post-save-coordinator 是保存完成后唯一的后台通道，剪贴板复制、预览图生成、列表刷新全部挤在它一条线程上排队执行
+      <span class="ref">（post_save.rs:146-249，单 worker 循环取任务）</span>。
+    </p>
+  </div>
+
+  <!-- ============ 全流程 ============ -->
+  <h2><span class="idx">1</span>一次保存的完整步骤</h2>
+  <p class="lead">按执行顺序编号 ①–⑫。注意分界点：文件落盘、UI 切回讲义窗口之后，列表刷新还排在 post-save 链的队尾。</p>
+
+  <div class="seq">
+
+    <div class="step" data-lane="preenc">
+      <div class="rail"><div class="num">①</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">截图完成时：原图开始预编码 PNG（与编辑并行）</div>
+        <div class="desc">
+          <span class="chip preenc">预编码线程</span><span class="chip orig">原图</span><span class="chip enc">编码</span><br>
+          <span class="ref">session_from_capture</span> 把原生截图 RGBA 提交给
+          <span class="ref">BackgroundEncodeScheduler</span>，后台线程
+          <span class="ref">background-png-encode</span> 把<b>原图</b>（全分辨率）编码成 PNG 字节，
+          存进 <span class="ref">PreparedBackground</span>。最多 2 个并行编码，更新的截图会顶掉旧的。
+          用户标注期间编码通常早已完成。
+          <span class="ref">application.rs:822 → background_encode.rs:257-281, 304-316</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="ui">
+      <div class="rail"><div class="num">②</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">点击保存：做文档快照</div>
+        <div class="desc">
+          <span class="chip ui">UI 线程</span><br>
+          <span class="ref">start_save</span>：对当前文档做深快照
+          <span class="ref">document.snapshot(revision)</span>（标题、标注元素、画布尺寸等，不含像素），
+          若 ① 的预编码失败则用内存里的原图重新提交一次编码。
+          <span class="ref">application.rs:594, 611, 629-639</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="ui">
+      <div class="rail"><div class="num">③</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">进入 Saving 阶段，spawn 保存 worker，UI 不阻塞</div>
+        <div class="desc">
+          <span class="chip ui">UI 线程</span><br>
+          <span class="ref">phase = Phase::Saving</span>，把快照 + 预编码句柄交给新线程；同时记下
+          <span class="ref">copy_image_after_save</span> 设置（保存后是否复制到剪贴板）。
+          <span class="ref">application.rs:643-650</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="sworker">
+      <div class="rail"><div class="num">④</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">save worker：等待预编码完成，拿到原图 PNG 字节</div>
+        <div class="desc">
+          <span class="chip sworker">save worker</span><span class="chip orig">原图</span><br>
+          <span class="ref">prepared_background.wait()</span> —— 由于 ① 已在编辑期间跑完，这里通常瞬间返回。
+          拿到的就是<b>原图</b>的编码产物 <span class="ref">BackgroundData::EncodedPng</span>。
+          <span class="ref">application.rs:656</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="sworker">
+      <div class="rail"><div class="num">⑤</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">store.save_document：原图字节直接落盘（零重新编码）</div>
+        <div class="desc">
+          <span class="chip sworker">save worker</span><span class="chip orig">原图</span><br>
+          持存储锁：编码 manifest → 新文档先在 <span class="ref">tmp-document</span> 暂存目录写入
+          <b>原图 PNG</b>（就是 ① 编码好的字节，<span class="ref">normalized_png</span> 对已编码数据原样返回，不重编）
+          + manifest + commit marker，再<b>原子重命名</b>成正式目录；已有文档则校验背景后原子重写 manifest。
+          <span class="ref">store.rs:374, 635-772；image_data.rs:78（EncodedPng 原样返回）</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="ui">
+      <div class="rail"><div class="num">⑥</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">UI 收到保存成功：切回讲义窗口，把保存后任务入队</div>
+        <div class="desc">
+          <span class="chip ui">UI 线程</span><br>
+          处理 <span class="ref">WorkerEvent::Save</span>：<span class="ref">phase → Idle</span>、
+          隐藏编辑器、按来路返回讲义窗口，然后构造 <span class="ref">PostSaveJob</span>
+          （快照 + 原图句柄 + 是否复制剪贴板）入队 post-save-coordinator。
+          <span class="ref">application.rs:1313-1403</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="marker">⚠ 分界点：此刻原图 PNG 与 manifest 已在磁盘上，但讲义列表仍是旧缓存 —— 既没有刷新列表，也没有弹「讲义已保存」</div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑦</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">（可选，且优先级最高）剪贴板复制：全分辨率合成图编码 PNG+TIFF</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><span class="chip clip">剪贴板</span><span class="chip enc">编码 ×2</span><br>
+          若设置开启，剪贴板任务排在一切之前：它需要先把 ⑧⑨ 做完（解码原图 + 全分辨率合成），
+          再把全分辨率合成图<b>同时编码成 PNG 和 TIFF</b> 两种格式写入 NSPasteboard。
+          <span class="ref">post_save.rs:118-128（优先级）, 337-351；export.rs:67-87</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑧</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">post_save.background_decode：把刚落盘的原图 PNG 再解码回 RGBA</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><span class="chip orig">原图</span><span class="chip dec">解码 ①</span><br>
+          为了生成预览图和剪贴板图，把<b>原图</b> PNG 完整解码成像素。
+          4K ≈ 830 万像素 / 33MB RGBA，8K ≈ 3300 万像素 / 133MB RGBA，这一步在大分辨率下是重头之一。
+          <span class="ref">post_save.rs:264-291</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑨</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">post_save.render：全分辨率合成标注层</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><br>
+          <span class="ref">render_document_to_image</span> 在解码后的原图上按元素顺序绘制全部标注，
+          得到<b>全分辨率合成图</b>。注意：这张合成图只存在于内存，供预览/剪贴板使用，<b>从不写入磁盘</b>
+          （磁盘上保存的是「原图 PNG + manifest 里的元素数据」，打开文档时再由编辑器实时合成）。
+          <span class="ref">post_save.rs:293-295；renderer.rs:43-51</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑩</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">生成预览图：缩到 ≤480px → PNG 编码</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><span class="chip prev">预览图</span><span class="chip enc">编码</span><br>
+          <span class="ref">make_preview(&amp;image, 480)</span>：Lanczos3 把全分辨率合成图缩到长边 480px，
+          得到<b>预览图</b> RGBA；再 <span class="ref">encode_png</span> 编码成预览 PNG 字节。
+          <span class="ref">post_save.rs:299-315；export.rs:89-98</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑪</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">安装预览：又把原图解码了一遍</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><span class="chip orig">原图</span><span class="chip dec">解码 ②</span><span class="chip prev">预览图</span><span class="chip dec">解码</span><br>
+          <span class="ref">install_preview_if_current</span>：持存储锁 → 先解码预览 PNG 校验长边 ≤480 →
+          <b>重新 open_document</b> 校验 revision 是否还是最新的 —— 这次打开会把<b>原图</b> PNG 从磁盘读回并整体再解码一遍
+          （只为了拿 revision）→ 写 <span class="ref">&lt;uuid&gt;.preview.png</span> → 重写 manifest（记 preview_revision）。
+          <span class="ref">store.rs:497-526；其中 store.rs:509 → 774 → 804-806 解码原图</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="psave">
+      <div class="rail"><div class="num">⑫</div><div class="line"></div></div>
+      <div class="body">
+        <div class="title">recent_refresh：全库扫描，每份讲义的原图再各解码一遍</div>
+        <div class="desc">
+          <span class="chip psave">post-save</span><span class="chip orig">原图</span><span class="chip dec">解码 ③ ×N</span><br>
+          图片任务全部完成后才轮到 <span class="ref">Work::RecentRefresh</span>：
+          <span class="ref">scan_documents()</span> 遍历 <span class="ref">documents/</span> 下每个文档目录，
+          逐个读取 manifest 并把该文档的<b>原图</b> PNG 读盘 + 完整解码
+          （仅为取标题/时间/预览路径这些元信息）。库里有 N 份讲义就解码 N 次原图。
+          <span class="ref">post_save.rs:230-242；store.rs:411-449, 782-812（806 行 decode_rgba8）</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="step" data-lane="ui">
+      <div class="rail"><div class="num">✓</div></div>
+      <div class="body">
+        <div class="title">UI 收到结果：列表终于出现新条目，toast 才弹出</div>
+        <div class="desc">
+          <span class="chip ui">UI 线程</span><br>
+          <span class="ref">PostSaveResult::RecentRefresh → recent.apply_scan(scan)</span>，讲义列表此刻更新；
+          <span class="ref">PostSaveResult::ImageTasks</span> 到达时才显示「讲义已保存」toast
+          （即 toast 也被预览链路拖后了）。
+          <span class="ref">application.rs:1076-1110（toast 在 1085，apply_scan 在 1098）</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============ 时间线 ============ -->
+  <h2><span class="idx">2</span>时间线：这 4 秒花在哪一段</h2>
+  <p class="lead">条形长度仅为示意（按高分辨率下的相对耗时）。绿色段结束 = 文件已在磁盘；橙色段全部发生在用户已经回到讲义窗口之后。</p>
+
+  <div class="card timeline">
+    <div class="tl-row">
+      <div class="tl-label">保存请求 → 落盘<br><span class="ref">②③④⑤</span></div>
+      <div class="tl-track">
+        <div class="tl-bar a" style="left: 0%; width: 14%;">快照 + 写原图/manifest（快）</div>
+        <div class="tl-mark" style="left: 14%;"></div>
+        <div class="tl-mark-label" style="left: 14%;">文件已落盘 · UI 切回讲义窗口<br>列表 = 旧缓存</div>
+      </div>
+    </div>
+    <div class="tl-row">
+      <div class="tl-label">post-save 串行链<br><span class="ref">⑦⑧⑨⑩⑪⑫</span></div>
+      <div class="tl-track">
+        <div class="tl-bar c" style="left: 14%; width: 78%;">
+          [剪贴板 PNG+TIFF 编码] → 解码原图 → 全分辨率合成 → 缩 480px → 预览编码 → 安装(再解码原图) → scan(全库原图解码)
+        </div>
+        <div class="tl-mark" style="left: 92%;"></div>
+        <div class="tl-mark-label" style="left: 92%;">apply_scan<br>列表才出现新条目</div>
+      </div>
+    </div>
+    <div class="tl-scale">
+      <div></div>
+      <div class="ticks"><span>t=0 点击保存</span><span>≈0.3–0.8s 落盘</span><span></span><span></span><span>≈4s 列表可见</span></div>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>三层叠加的瓶颈：</b>
+    ① <b>排队</b>——列表刷新 <span class="ref">recent_refresh</span> 被定义为 post-save 链的最后一项
+    <span class="ref">（post_save.rs:136：next_work() 剪贴板 → 渲染 → 最后才是 refresh）</span>；
+    ② <b>重复解码原图</b>——同一次保存里原图 PNG 被完整解码 2 次（⑧、⑪），扫描时第 3 次；
+    ③ <b>扫描代价随库增长</b>——<span class="ref">scan_documents</span> 对每份讲义都读盘 + 完整解码原图，讲义越多越慢。
+    若开启「保存后复制到剪贴板」，还会在链首再加两次全分辨率编码（PNG + TIFF）。
+  </div>
+
+  <!-- ============ 编解码 ============ -->
+  <h2><span class="idx">3</span>编解码全景：哪份是原图，哪份是预览图</h2>
+  <p class="lead">系统里一共有三种图像数据：<b style="color:var(--orig)">原图</b>（全分辨率截图，落盘）、<b style="color:var(--prev)">预览图</b>（长边 ≤480px 的合成缩略图，落盘）、全分辨率合成图（带标注，只在内存）。下面按数据分轨道列出每一次编码 / 解码。</p>
+
+  <div class="tracks">
+
+    <div class="track orig">
+      <div class="head">
+        <span class="name">原图 · 全分辨率截图背景</span>
+        <span class="file">documents/&lt;uuid&gt;/&lt;uuid&gt;.png</span>
+        <span class="ref">document.rs:117（background.file = "&lt;uuid&gt;.png"）</span>
+      </div>
+      <p class="small muted">就是屏幕截图本身的像素，不带标注。保存时作为文档背景写入磁盘；编辑器和导出流程需要它时才解码。</p>
+      <div class="ops">
+        <div class="op enc">
+          <span class="op-tag">编码 ×1</span>
+          <div class="op-title">编辑期间预编码</div>
+          <div class="op-desc">截图刚完成时由 <span class="ref">background-png-encode</span> 线程把 CGImage RGBA 编码成 PNG，编辑期间并行完成。<span class="free">唯一的编码点。</span></div>
+          <span class="op-thread"><span class="th bg">background-png-encode 线程 · 不阻塞主线程</span></span>
+          <span class="ref op-ref">background_encode.rs:304-316</span>
+        </div>
+        <div class="op io">
+          <span class="op-tag">落盘</span>
+          <div class="op-title">保存 = 字节搬运</div>
+          <div class="op-desc">保存时直接把预编码好的 PNG 字节写入暂存目录再原子改名，<span class="free">零重新编码</span>（EncodedPng 走 normalized_png 原样返回）。</div>
+          <span class="op-thread"><span class="th bg">save worker · 不阻塞主线程</span></span>
+          <span class="ref op-ref">store.rs:719-754；image_data.rs:78</span>
+        </div>
+        <div class="op dec">
+          <span class="op-tag">解码 ①</span>
+          <div class="op-title">生成预览/剪贴板前</div>
+          <div class="op-desc">post_save.background_decode：把原图 PNG 完整解码回 RGBA，供全分辨率合成。<span class="cost">高分辨率重头。</span></div>
+          <span class="op-thread"><span class="th bg">post-save 线程 · 不阻塞主线程</span></span>
+          <span class="ref op-ref">post_save.rs:264-291</span>
+        </div>
+        <div class="op dec">
+          <span class="op-tag">解码 ②</span>
+          <div class="op-title">安装预览时校验 revision</div>
+          <div class="op-desc">install_preview_if_current 重新打开文档，顺带把原图整张解码——只为读 manifest 里的 revision。</div>
+          <span class="op-thread"><span class="th bg">post-save 线程 · 不阻塞主线程</span></span>
+          <span class="ref op-ref">store.rs:509 → 774 → 804-806</span>
+        </div>
+        <div class="op dec">
+          <span class="op-tag">解码 ③ ×N</span>
+          <div class="op-title">列表扫描</div>
+          <div class="op-desc">scan_documents 对库中<b>每一份</b>讲义读取并完整解码原图 PNG，仅为汇总元信息。<span class="cost">讲义越多越慢。</span></div>
+          <span class="op-thread"><span class="th bg">保存后：post-save 线程</span><span class="th main">启动/导入/改名/删除/清空：UI 线程 ⚠</span></span>
+          <span class="ref op-ref">store.rs:411-449, 804-806</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="track prev">
+      <div class="head">
+        <span class="name">预览图 · 讲义列表缩略图</span>
+        <span class="file">documents/&lt;uuid&gt;/&lt;uuid&gt;.preview.png</span>
+        <span class="ref">document.rs:121（preview_file = "&lt;uuid&gt;.preview.png"）；长边 ≤480px（store.rs:506）</span>
+      </div>
+      <p class="small muted">注意：预览图的内容是<b>带标注的合成图</b>缩小版，不是原图缩小版。它只在保存之后的 post-save 链里生成，所以新讲义刚保存时并没有预览文件。</p>
+      <div class="ops">
+        <div class="op enc">
+          <span class="op-tag">生成</span>
+          <div class="op-title">合成 → 缩小 → 编码</div>
+          <div class="op-desc">全分辨率合成图（内存）→ <span class="ref">make_preview(…, 480)</span> Lanczos3 缩到长边 480px → <span class="ref">encode_png</span> 编码。</div>
+          <span class="op-thread"><span class="th bg">post-save 线程 · 不阻塞主线程</span></span>
+          <span class="ref op-ref">post_save.rs:293-315；export.rs:89-98</span>
+        </div>
+        <div class="op dec">
+          <span class="op-tag">解码 ×1</span>
+          <div class="op-title">安装前校验尺寸</div>
+          <div class="op-desc">install_preview_if_current 先解码预览 PNG，确认长边 ≤480px 才允许写入。</div>
+          <span class="op-thread"><span class="th bg">post-save 线程 · 不阻塞主线程</span></span>
+          <span class="ref op-ref">store.rs:504-508</span>
+        </div>
+        <div class="op io">
+          <span class="op-tag">消费</span>
+          <div class="op-title">讲义列表缩略图</div>
+          <div class="op-desc">列表渲染时 <span class="ref">preview_texture</span> 用 image::open 从磁盘加载（带纹理缓存）。<b>缩略图来源是预览图，不是原图</b>。</div>
+          <span class="op-thread"><span class="th main">UI 线程 ⚠ 阻塞主线程（≤480px 小图 + 缓存未命中才解码，代价低）</span></span>
+          <span class="ref op-ref">application.rs:2117-2139</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="track clip">
+      <div class="head">
+        <span class="name">剪贴板图 · 全分辨率合成图（可选）</span>
+        <span class="file">不落盘，仅内存 → NSPasteboard</span>
+        <span class="ref">设置项 copy_image_after_save；application.rs:643</span>
+      </div>
+      <p class="small muted">开启「保存后复制到剪贴板」时额外产生：把全分辨率合成图<b>同时编码为 PNG 和 TIFF</b> 两种表示写入系统剪贴板，即两次全分辨率编码。且剪贴板任务在 post-save 链中优先级最高，会排在预览生成之前执行。</p>
+      <div class="ops">
+        <div class="op enc">
+          <span class="op-tag">编码 ×2</span>
+          <div class="op-title">PNG + TIFF 双编码</div>
+          <div class="op-desc">macOS 剪贴板要求两种表示：<span class="ref">encode_png(&amp;image)</span> + <span class="ref">encode_tiff(&amp;image)</span>，均为全分辨率。<span class="cost">开启该设置时这是链首大开销。</span></div>
+          <span class="op-thread"><span class="th bg">保存后：post-save 线程；讲义库复制/导出：spawn 的导出 worker · 均不阻塞主线程</span></span>
+          <span class="ref op-ref">export.rs:67-87；post_save.rs:337-351；application.rs:2197-2218</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <h3>磁盘布局与三种图像的关系</h3>
+  <div class="code-block fs"><span class="dir">~/Library/Application Support/com.linjiajian.RS Board/</span>
+├── <span class="dir">draft/latest/</span>                        <span class="c"># 草稿（未保存的编辑会话）</span>
+└── <span class="dir">documents/&lt;uuid&gt;/</span>                    <span class="c"># 每份正式讲义一个目录</span>
+    ├── <span class="mani">&lt;uuid&gt;.rsboard</span>                  <span class="c"># manifest：标题/元素/revision/preview_revision</span>
+    ├── <span class="orig-file">&lt;uuid&gt;.png</span>                      <span class="c"># ← 原图：全分辨率截图 PNG（保存时落盘，零重编码）</span>
+    └── <span class="prev-file">&lt;uuid&gt;.preview.png</span>              <span class="c"># ← 预览图：≤480px 合成缩略图（保存后由 post-save 链生成）</span></div>
+  <p class="small muted">
+    列表里一条讲义显示缩略图的前提是 manifest 中 <span class="ref">preview_revision == revision</span>
+    <span class="ref">（store.rs:999-1006）</span>。当前顺序是「先装预览、后扫列表」，所以列表刷新时预览必然就位；
+    如果未来把列表刷新提前，需要处理缩略图暂时缺失的情况。
+  </p>
+
+  <h3>哪些编解码阻塞主线程（UI 线程）</h3>
+  <p class="lead">
+    <b style="color:#81c784">保存路径全程不阻塞主线程</b>——预编码、落盘、post-save 链（解码原图 / 合成 / 预览 / 剪贴板 / 保存后的扫描）都在后台线程，
+    代价只是「列表更新晚 4 秒」，界面不会卡。真正卡界面的是下面三处与「打开 / 显示 / 扫库」相关的同步解码：
+  </p>
+  <table>
+    <tr><th>编解码操作</th><th>数据</th><th>触发场景</th><th>执行线程</th><th>阻塞主线程</th></tr>
+    <tr class="hl">
+      <td>打开讲义 / 恢复草稿时的 <span class="ref">from_encoded_png</span>（CGImageSource 解码）</td>
+      <td><span class="chip orig">原图</span></td>
+      <td>双击打开讲义、恢复草稿（worker 返回后在 UI 线程建会话）</td>
+      <td>UI 线程 <span class="ref">application.rs:847（1255 / 1283 触发）</span></td>
+      <td><span class="cost">⚠ 是 · 全分辨率一次</span></td>
+    </tr>
+    <tr class="hl">
+      <td><span class="ref">scan_documents</span> 逐份解码原图</td>
+      <td><span class="chip orig">原图</span> ×N</td>
+      <td>应用启动；导入 / 重命名 / 删除 / 导出 / 清空之后的 <span class="ref">recent.refresh</span></td>
+      <td>UI 线程 <span class="ref">application.rs:302, 1059, 1442, 1454, 1465 → store.rs:806</span></td>
+      <td><span class="cost">⚠ 是 · N 份全分辨率，随库增长</span></td>
+    </tr>
+    <tr class="hl">
+      <td>列表缩略图 <span class="ref">preview_texture</span>（image::open）</td>
+      <td><span class="chip prev">预览图</span></td>
+      <td>讲义列表渲染、纹理缓存未命中时</td>
+      <td>UI 线程 <span class="ref">application.rs:2128</span></td>
+      <td><span class="cost">⚠ 是 · 但 ≤480px 且有缓存，代价低</span></td>
+    </tr>
+    <tr>
+      <td>同一 scan_documents</td>
+      <td><span class="chip orig">原图</span> ×N</td>
+      <td>保存之后（post-save 链队尾）</td>
+      <td>post-save 线程 <span class="ref">post_save.rs:230-242</span></td>
+      <td>否（只延迟列表更新）</td>
+    </tr>
+    <tr>
+      <td>原图预编码</td>
+      <td><span class="chip orig">原图</span></td>
+      <td>截图完成后</td>
+      <td>background-png-encode 线程 <span class="ref">background_encode.rs:257-281</span></td>
+      <td>否</td>
+    </tr>
+    <tr>
+      <td>保存：manifest 编码、原图字节落盘</td>
+      <td><span class="chip orig">原图</span></td>
+      <td>点击保存</td>
+      <td>save worker <span class="ref">application.rs:650-687；store.rs:635-772</span></td>
+      <td>否</td>
+    </tr>
+    <tr>
+      <td>post-save 链：解码原图 / 全分辨率合成 / 缩 480px / 预览编码 / 安装 / 剪贴板 PNG+TIFF</td>
+      <td><span class="chip orig">原图</span><span class="chip prev">预览图</span></td>
+      <td>保存完成后</td>
+      <td>post-save 线程 <span class="ref">post_save.rs:251-364</span></td>
+      <td>否</td>
+    </tr>
+    <tr>
+      <td>讲义库「复制图片 / 导出 PNG」：解码原图 + 合成 + PNG/TIFF 编码</td>
+      <td><span class="chip orig">原图</span></td>
+      <td>讲义列表右键操作</td>
+      <td>spawn 的导出 worker <span class="ref">application.rs:2197-2218</span></td>
+      <td>否</td>
+    </tr>
+    <tr>
+      <td>屏幕捕获本身（CGImage，不做 RGBA 化）</td>
+      <td><span class="chip orig">原图</span></td>
+      <td>截图热键 / 托盘</td>
+      <td>capture worker <span class="ref">application.rs:521-538</span></td>
+      <td>否</td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <b>三处主线程解码的细节：</b><br>
+    ① <b>打开讲义双重解码</b>——worker 线程加载文档时已把原图整体解码过一次（仅为校验尺寸，store.rs:806），
+    结果回到 UI 线程后 <span class="ref">session_from_loaded</span> 又用 CGImageSource 把同一份 PNG 解码成 CGImage（application.rs:847）。
+    打开一份讲义 = 原图解码两次，其中一次在主线程。编辑器背景展示本身不再耗 CPU：
+    CGImage 直接挂到 CALayer 呈现（capture_surface.rs:654-657），开销集中在构建 CGImage 那一刻。<br>
+    ② <b>库操作后的全库扫描在主线程</b>——只有「保存后」那次扫描走 post-save 线程；启动（application.rs:302）
+    与导入/改名/删除/导出/清空之后的 <span class="ref">recent.refresh</span>（1059, 1442, 1454, 1465）
+    都是在 UI 线程同步调用 <span class="ref">scan_documents</span>：库里 N 份讲义就在主线程解码 N 张全分辨率原图，讲义越多窗口冻结越久。<br>
+    ③ <b>缩略图解码</b>——每份讲义首次出现（或预览路径变化）时在 UI 线程解码一次 ≤480px 预览图并上传纹理，之后命中缓存，影响很小。
+  </div>
+
+  <!-- ============ 列表更新逻辑 ============ -->
+  <h2><span class="idx">4</span>讲义列表的更新逻辑</h2>
+
+  <h3>数据来源：纯内存缓存，不是实时目录扫描</h3>
+  <p>
+    讲义列表 UI 每一帧直接读 <span class="ref">RecentDocuments</span> 内存缓存里的
+    <span class="ref">visible_documents()</span>（按查询词过滤），<b>打开讲义窗口本身不触发任何刷新</b>。
+    缓存只在下列时机被整体替换：
+  </p>
+  <table>
+    <tr><th>时机</th><th>入口</th><th>执行线程</th><th>代码位置</th></tr>
+    <tr>
+      <td>应用启动</td>
+      <td><span class="ref">recent.refresh(&amp;store)</span></td>
+      <td><span class="cost">UI 线程（同步全库扫描）</span></td>
+      <td><span class="ref">application.rs:302</span></td>
+    </tr>
+    <tr class="hl">
+      <td><b>保存之后</b>（本问题路径）</td>
+      <td>post-save worker 完成全部图片任务后执行 <span class="ref">scan_documents</span>，结果经 <span class="ref">RecentRefresh → apply_scan</span> 回 UI。<b>排在预览生成之后</b></td>
+      <td>post-save 线程（不阻塞 UI，但延迟列表）</td>
+      <td><span class="ref">post_save.rs:136, 230-242；application.rs:1097-1098</span></td>
+    </tr>
+    <tr>
+      <td>导入讲义后</td>
+      <td><span class="ref">WorkerEvent::Import</span></td>
+      <td><span class="cost">UI 线程（同步全库扫描）</span></td>
+      <td><span class="ref">application.rs:1442</span></td>
+    </tr>
+    <tr>
+      <td>重命名 / 删除后</td>
+      <td><span class="ref">WorkerEvent::LibraryChanged</span></td>
+      <td><span class="cost">UI 线程（同步全库扫描）</span></td>
+      <td><span class="ref">application.rs:1452-1455</span></td>
+    </tr>
+    <tr>
+      <td>导出等辅助操作后</td>
+      <td><span class="ref">WorkerEvent::Auxiliary</span></td>
+      <td><span class="cost">UI 线程（同步全库扫描）</span></td>
+      <td><span class="ref">application.rs:1463-1466</span></td>
+    </tr>
+    <tr>
+      <td>清除全部内容后</td>
+      <td><span class="ref">DraftResult::ClearAll</span></td>
+      <td><span class="cost">UI 线程（同步全库扫描）</span></td>
+      <td><span class="ref">application.rs:1056-1060</span></td>
+    </tr>
+  </table>
+
+  <div class="note">
+    <b>关键缺口：</b>
+    ① 保存落盘成功（步骤 ⑥）与列表刷新（步骤 ⑫）之间没有中间态 —— 落盘事件里不做任何列表 upsert；
+    ② <span class="ref">show_library_window</span> / 托盘「最近讲义」只负责显示窗口，不刷新数据
+    <span class="ref">（application.rs:1672-1675, 1727-1731）</span>；
+    ③ 「讲义已保存」toast 也挂在 <span class="ref">ImageTasks</span> 结果上（application.rs:1085），
+    所以用户感知到的「保存完成」信号本身就被预览链路延迟了。
+  </div>
+
+  <h3>保存路径的等待链（当前实现的因果图）</h3>
+  <div class="code-block"><span class="c"># 用户感知的等待 = 下列所有步骤串行完成</span>
+点击保存
+  └→ 快照 + 落盘（原图 PNG 字节搬运 + manifest）          <span class="c">← 此刻文件已可用</span>
+      └→ UI 切回讲义窗口（显示旧缓存）
+          └→ post-save 单线程，按 next_work() 优先级取任务：
+              1. 剪贴板队列（若开启：需先解码原图+全分辨率合成，再 PNG+TIFF 双编码）
+              2. 渲染/预览：解码原图 → 全分辨率合成 → 缩 480px → 编码预览 → 安装（再解码原图）
+              3. <span class="k">recent_refresh：scan_documents（逐份解码原图）</span>   <span class="c">← 列表数据此刻才产生</span>
+                  └→ apply_scan → <span class="k">讲义列表出现新条目（≈点击后 4s）</span></div>
+
+  <!-- ============ 改进方向 ============ -->
+  <h2><span class="idx">5</span>可优化的方向（供讨论）</h2>
+  <ul class="tight">
+    <li><b>落盘即更新列表（收益最大、改动最小）</b>：在 <span class="ref">WorkerEvent::Save</span> 成功分支直接用本次保存的 snapshot 信息对 <span class="ref">recent.documents</span> 做 upsert（新条目先占位、无缩略图），不再等 post-save 链。需处理 preview_path 暂缺（缩略图后补）。<span class="ref">application.rs:1344-1414</span></li>
+    <li><b>解耦列表刷新与图片任务</b>：让 <span class="ref">recent_refresh</span> 不等预览生成（并行或提前），预览装好后单独补一次缩略图纹理刷新。<span class="ref">post_save.rs:118-137</span></li>
+    <li><b>让扫描不再解码原图</b>：<span class="ref">scan_documents</span> 只读 manifest（标题/时间/preview_revision + 预览文件存在性检查即可），去掉 <span class="ref">load_managed_package</span> 里对背景 PNG 的读取与 <span class="ref">decode_rgba8()</span>。<span class="ref">store.rs:804-806</span></li>
+    <li><b>去掉重复解码</b>：<span class="ref">install_preview_if_current</span> 校验 revision 只需读 manifest，不必 open_document 全量加载。<span class="ref">store.rs:509</span></li>
+    <li><b>把库操作后的扫描移出主线程</b>：启动 / 导入 / 改名 / 删除 / 清空之后的 <span class="ref">recent.refresh</span> 目前都在 UI 线程同步解码全库原图（见第 3 节线程表），可仿照保存后的做法改由 worker 执行再回传 <span class="ref">apply_scan</span>。若「扫描只读 manifest」落地，这条的紧迫性随之下降。<span class="ref">application.rs:302, 1059, 1442, 1454, 1465</span></li>
+  </ul>
+
+  <footer>
+    生成于 2026-08-09（同日增补：编解码的线程归属与主线程阻塞点）· 基于工作区当前代码（crates/app/src/ 下行号）· 配套性能指标见 README「性能基线」：
+    persistence.request_to_ui_complete（保存 UI 完成边界）、post_save.total、post_save.recent_refresh。
+  </footer>
+
+</div>
+</body>
+</html>

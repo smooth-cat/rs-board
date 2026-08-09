@@ -1,9 +1,22 @@
 use std::path::{Component, Path};
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::document::{BoardDocument, CURRENT_SCHEMA_VERSION, DocumentError, DocumentSnapshot};
+use crate::document::{
+  BoardDocument, CURRENT_SCHEMA_VERSION, DocumentError, DocumentId, DocumentSnapshot, Revision,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentManifestSummary {
+  pub document_id: DocumentId,
+  pub title: String,
+  pub revision: Revision,
+  pub updated_at: DateTime<Utc>,
+  pub preview_file: String,
+  pub preview_revision: Option<Revision>,
+}
 
 pub fn encode_document(document: &BoardDocument) -> Result<Vec<u8>, FormatError> {
   document.validate()?;
@@ -31,6 +44,53 @@ pub fn decode_document(bytes: &[u8]) -> Result<BoardDocument, FormatError> {
 
 pub fn decode_snapshot(bytes: &[u8]) -> Result<DocumentSnapshot, FormatError> {
   decode_document(bytes).map(|document| DocumentSnapshot::from(&document))
+}
+
+pub fn decode_document_summary(bytes: &[u8]) -> Result<DocumentManifestSummary, FormatError> {
+  #[derive(Deserialize)]
+  struct SummaryEnvelope {
+    schema_version: u32,
+    document_id: DocumentId,
+    title: String,
+    preview_file: String,
+    preview_revision: Option<Revision>,
+    revision: Revision,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+  }
+
+  let envelope: SummaryEnvelope =
+    serde_json::from_slice(bytes).map_err(|error| FormatError::Json(error.to_string()))?;
+  if envelope.schema_version != CURRENT_SCHEMA_VERSION {
+    return Err(FormatError::UnsupportedSchema {
+      found: envelope.schema_version,
+      supported: CURRENT_SCHEMA_VERSION,
+    });
+  }
+  if envelope.title.trim().is_empty() {
+    return Err(DocumentError::EmptyTitle.into());
+  }
+  validate_resource_name(&envelope.preview_file).map_err(|source| {
+    FormatError::InvalidDocument(DocumentError::InvalidResourceName {
+      field: "preview_file",
+      source,
+    })
+  })?;
+  if envelope.preview_revision.is_some_and(|preview| preview > envelope.revision) {
+    return Err(DocumentError::PreviewRevisionAhead.into());
+  }
+  if envelope.updated_at < envelope.created_at {
+    return Err(DocumentError::UpdatedBeforeCreated.into());
+  }
+
+  Ok(DocumentManifestSummary {
+    document_id: envelope.document_id,
+    title: envelope.title,
+    revision: envelope.revision,
+    updated_at: envelope.updated_at,
+    preview_file: envelope.preview_file,
+    preview_revision: envelope.preview_revision,
+  })
 }
 
 pub fn validate_resource_name(name: &str) -> Result<(), ResourceNameError> {
@@ -264,6 +324,21 @@ mod tests {
     assert!(json.contains("\"document_id\": \"00000000-0000-0000-0000-000000000000\""));
     assert!(!json.contains("history"));
     assert!(!json.contains("selection"));
+  }
+
+  #[test]
+  fn summary_decode_reads_only_list_metadata() {
+    let document = document_with_all_elements();
+    let mut value = serde_json::to_value(&document).unwrap();
+    value["elements"] = serde_json::json!([{"unsupported_future_element": true}]);
+    let summary = decode_document_summary(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(summary.document_id, document.document_id);
+    assert_eq!(summary.title, document.title);
+    assert_eq!(summary.revision, document.revision);
+    assert_eq!(summary.updated_at, document.updated_at);
+    assert_eq!(summary.preview_file, document.preview_file);
+    assert_eq!(summary.preview_revision, document.preview_revision);
+    assert!(decode_document(&serde_json::to_vec(&value).unwrap()).is_err());
   }
 
   #[test]
