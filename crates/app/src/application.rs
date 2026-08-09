@@ -79,6 +79,9 @@ const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
 const OVERLAY_READINESS_RETRY_DELAY: Duration = Duration::from_millis(32);
 const OVERLAY_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const SAVE_SUCCESS_TOAST_DURATION: Duration = Duration::from_millis(1_300);
+const SAVE_SUCCESS_TOAST_MESSAGE: &str = "保存成功！";
+const SAVE_SUCCESS_TOAST_SHADOW_OFFSET: [i8; 2] = [2, 3];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionOrigin {
@@ -151,6 +154,7 @@ enum Phase {
   Capturing { request_id: Uuid, capture_sequence: u64, display_id: u32 },
   Editing,
   Saving { request_id: Uuid },
+  ShowingSaveSuccess { closes_at: Instant },
   Opening { request_id: Uuid, document_id: DocumentId },
   Restoring { request_id: Uuid },
   ConfirmingDiscard,
@@ -158,7 +162,24 @@ enum Phase {
 
 impl Phase {
   fn has_active_session(self) -> bool {
-    matches!(self, Self::Editing | Self::Saving { .. } | Self::ConfirmingDiscard)
+    matches!(
+      self,
+      Self::Editing
+        | Self::Saving { .. }
+        | Self::ShowingSaveSuccess { .. }
+        | Self::ConfirmingDiscard
+    )
+  }
+
+  fn showing_save_success(succeeded_at: Instant) -> Self {
+    Self::ShowingSaveSuccess { closes_at: succeeded_at + SAVE_SUCCESS_TOAST_DURATION }
+  }
+
+  fn save_success_close_delay(self, now: Instant) -> Option<Duration> {
+    let Self::ShowingSaveSuccess { closes_at } = self else {
+      return None;
+    };
+    Some(closes_at.saturating_duration_since(now))
   }
 }
 
@@ -650,7 +671,9 @@ impl RsBoardApp {
         trigger.received_at,
       )
       .finish_rejected();
-      self.set_toast("正在处理当前任务");
+      if !matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
+        self.set_toast("正在处理当前任务");
+      }
       return;
     }
     let request_id = Uuid::new_v4();
@@ -970,7 +993,9 @@ impl RsBoardApp {
 
   fn start_import(&mut self, path: PathBuf, context: &egui::Context) {
     if self.phase != Phase::Idle {
-      self.set_toast("当前会话结束后才能导入讲义");
+      if !matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
+        self.set_toast("当前会话结束后才能导入讲义");
+      }
       return;
     }
     if path.extension().and_then(|extension| extension.to_str()) != Some("rsboard") {
@@ -1114,6 +1139,36 @@ impl RsBoardApp {
 
   fn set_toast(&mut self, message: impl Into<String>) {
     self.toast = Some((message.into(), Instant::now()));
+  }
+
+  fn clear_save_success_toast(&mut self) {
+    if self.toast.as_ref().is_some_and(|(message, _)| message == SAVE_SUCCESS_TOAST_MESSAGE) {
+      self.toast = None;
+    }
+  }
+
+  fn begin_save_success_presentation(&mut self, succeeded_at: Instant, context: &egui::Context) {
+    self.phase = Phase::showing_save_success(succeeded_at);
+    self.return_surface_after_editor = None;
+    self.toast = Some((SAVE_SUCCESS_TOAST_MESSAGE.to_owned(), succeeded_at));
+    context.request_repaint_after(SAVE_SUCCESS_TOAST_DURATION);
+  }
+
+  fn finish_save_success_presentation_if_due(&mut self, context: &egui::Context) {
+    let Some(delay) = self.phase.save_success_close_delay(Instant::now()) else {
+      return;
+    };
+    if !delay.is_zero() {
+      context.request_repaint_after(delay);
+      return;
+    }
+
+    self.clear_save_success_toast();
+    self.phase = Phase::Idle;
+    self.return_surface_after_editor = None;
+    self.hide_editor_window(context);
+    self.remember_tool_and_release_session();
+    self.update_tray();
   }
 
   fn persistence_trace_for(&self, request_id: Uuid) -> Option<PersistenceUiTrace> {
@@ -1656,6 +1711,7 @@ impl RsBoardApp {
                 saved.revision,
               ) =>
             {
+              let succeeded_at = Instant::now();
               let saved_draft_generation = self.session.as_ref().and_then(|session| {
                 if let SessionOrigin::LatestDraft { generation_id } = session.origin {
                   Some(generation_id)
@@ -1677,17 +1733,17 @@ impl RsBoardApp {
                 );
               }
               commit_visible_timer.finish_ok();
-              self.phase = Phase::Idle;
               self.preview_textures.remove(saved.document_id);
               self.preview_failures.remove_document(saved.document_id);
-              self.set_toast("讲义已保存");
               if self.quit_after_persist {
+                self.phase = Phase::Idle;
+                self.set_toast(SAVE_SUCCESS_TOAST_MESSAGE);
                 self.allow_close = true;
                 send_root_viewport_command(context, ViewportCommand::Close);
+                self.remember_tool_and_release_session();
               } else {
-                self.hide_editor_window(context);
+                self.begin_save_success_presentation(succeeded_at, context);
               }
-              self.remember_tool_and_release_session();
               self.finish_persistence_trace_ok(request_id);
 
               match post_save_job {
@@ -1900,6 +1956,9 @@ impl RsBoardApp {
   }
 
   fn close_editor(&mut self, context: &egui::Context) {
+    if matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
+      return;
+    }
     let Some(session) = self.session.as_ref() else {
       return;
     };
@@ -2045,11 +2104,20 @@ impl RsBoardApp {
   }
 
   fn fail_editor_presentation(&mut self, context: &egui::Context, error: impl Into<String>) {
+    let was_showing_save_success = matches!(self.phase, Phase::ShowingSaveSuccess { .. });
     self.overlay_readiness_started_at = None;
     self.library_error = Some(error.into());
     self.capture_surfaces.hide_active();
     self.return_surface_after_editor = None;
-    self.configure_library_window(context, true);
+    if was_showing_save_success {
+      self.clear_save_success_toast();
+      self.phase = Phase::Idle;
+      self.configure_editor_host(context);
+      self.remember_tool_and_release_session();
+      self.update_tray();
+    } else {
+      self.configure_library_window(context, true);
+    }
     request_root_repaint(context);
   }
 
@@ -2066,7 +2134,7 @@ impl RsBoardApp {
         TrayAction::ShowRecent => {
           if matches!(self.phase, Phase::Saving { .. }) {
             self.set_toast("保存完成后再打开最近讲义");
-          } else {
+          } else if !matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
             self.show_library_window(context);
           }
         }
@@ -2074,7 +2142,7 @@ impl RsBoardApp {
         TrayAction::ShowSettings => {
           if matches!(self.phase, Phase::Saving { .. }) {
             self.set_toast("保存完成后再修改设置");
-          } else {
+          } else if !matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
             self.settings_draft = self.settings.clone();
             self.show_settings = true;
             self.show_library_window(context);
@@ -2182,7 +2250,7 @@ impl RsBoardApp {
               session.background_texture.as_ref(),
             );
           }
-          Phase::Saving { .. } | Phase::ConfirmingDiscard => {
+          Phase::Saving { .. } | Phase::ShowingSaveSuccess { .. } | Phase::ConfirmingDiscard => {
             session.editor.show_read_only(
               ui,
               &session.document,
@@ -2949,11 +3017,16 @@ impl RsBoardApp {
       self.toast = None;
       return;
     }
+    let (anchor, offset) = toast_placement(message);
     egui::Area::new(egui::Id::new("app-toast"))
-      .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+      .anchor(anchor, offset)
       .order(egui::Order::Tooltip)
       .show(context, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
+        let mut frame = egui::Frame::popup(ui.style());
+        if message == SAVE_SUCCESS_TOAST_MESSAGE {
+          frame.shadow.offset = SAVE_SUCCESS_TOAST_SHADOW_OFFSET;
+        }
+        frame.show(ui, |ui| {
           ui.label(message);
         });
       });
@@ -3054,6 +3127,7 @@ impl eframe::App for RsBoardApp {
     self.handle_library_index_results();
     self.handle_preview_results(context);
     self.handle_worker_events(context);
+    self.finish_save_success_presentation_if_due(context);
     if self.capture_surfaces.should_refresh() {
       match self.capture_surfaces.refresh_available_displays() {
         Ok(DisplayRefreshOutcome::ActiveDisplayRemoved(_)) => {
@@ -3154,6 +3228,14 @@ fn root_close_action(surface: WindowSurface, phase: Phase) -> RootCloseAction {
     RootCloseAction::HideLibrary
   } else {
     RootCloseAction::RequestQuit
+  }
+}
+
+fn toast_placement(message: &str) -> (egui::Align2, egui::Vec2) {
+  if message == SAVE_SUCCESS_TOAST_MESSAGE {
+    (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
+  } else {
+    (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
   }
 }
 
@@ -3470,9 +3552,47 @@ mod tests {
   #[test]
   fn root_close_request_hides_idle_window_and_quits_active_session() {
     let phase = Phase::Capturing { request_id: Uuid::new_v4(), capture_sequence: 1, display_id: 7 };
+    let save_success = Phase::showing_save_success(Instant::now());
 
     assert_eq!(root_close_action(WindowSurface::Hidden, phase), RootCloseAction::RequestQuit);
+    assert_eq!(
+      root_close_action(WindowSurface::Hidden, save_success),
+      RootCloseAction::RequestQuit
+    );
     assert_eq!(root_close_action(WindowSurface::Hidden, Phase::Idle), RootCloseAction::HideLibrary);
+  }
+
+  #[test]
+  fn save_success_keeps_the_editor_active_for_exactly_1_3_seconds() {
+    let succeeded_at = Instant::now();
+    let phase = Phase::showing_save_success(succeeded_at);
+
+    assert!(phase.has_active_session());
+    assert_eq!(phase.save_success_close_delay(succeeded_at), Some(Duration::from_millis(1_300)));
+    assert_eq!(
+      phase.save_success_close_delay(succeeded_at + Duration::from_millis(1_299)),
+      Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+      phase.save_success_close_delay(succeeded_at + SAVE_SUCCESS_TOAST_DURATION),
+      Some(Duration::ZERO)
+    );
+    assert_eq!(
+      phase.save_success_close_delay(succeeded_at + SAVE_SUCCESS_TOAST_DURATION * 2),
+      Some(Duration::ZERO)
+    );
+    assert_eq!(Phase::Idle.save_success_close_delay(succeeded_at), None);
+    assert_eq!(SAVE_SUCCESS_TOAST_MESSAGE, "保存成功！");
+  }
+
+  #[test]
+  fn save_success_toast_is_centered_without_moving_other_toasts() {
+    assert_eq!(
+      toast_placement(SAVE_SUCCESS_TOAST_MESSAGE),
+      (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
+    );
+    assert_eq!(toast_placement("设置已保存"), (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0)));
+    assert_eq!(SAVE_SUCCESS_TOAST_SHADOW_OFFSET, [2, 3]);
   }
 
   #[test]
