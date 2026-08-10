@@ -2,18 +2,21 @@ use common::{
   ArrowEndpoint, ArrowHead, ArrowPayload, BoardDocument, ColorRgba, CommandBatch, CommandHistory,
   DocumentCommand, Element, ElementId, ElementPayload, LabelPlacementPreference,
   PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx, RectangleLabel, RectanglePayload,
-  SequenceMarkerPayload, SizePx, StrokePayload, StrokeStyle, StyleChange, TextPayload, TextStyle,
-  minimum_geometry_extent, rectangle_label_layout,
+  SequenceMarkerPayload, SizePx, StrokePayload, StrokeStyle, StyleChange, TextAlign, TextPayload,
+  TextStyle, minimum_geometry_extent, rectangle_label_layout,
 };
 use eframe::egui::{
-  self, Align2, Color32, CursorIcon, Event, FontId, Id, Key, Modifiers, Pos2, Rect, Response,
-  Sense, Stroke, StrokeKind, TextureHandle,
+  self, Align2, Color32, CursorIcon, Event, FontId, Id, ImeEvent, Key, KeyboardShortcut, Modifiers,
+  Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
 };
 
-use crate::renderer::{paint_document, paint_element, paint_raw_polyline};
+use crate::renderer::{
+  layout_egui_text, paint_document, paint_element, paint_raw_polyline,
+  paint_rectangle_without_label_text,
+};
 
 const DEFAULT_RECTANGLE_LABEL: &str = "标题";
-const DEFAULT_TEXT_BOX_WIDTH_PX: f32 = 420.0;
+const EMPTY_RECTANGLE_LABEL_DRAFT: &str = "\u{200b}";
 const COLOR_SWATCH_FONT_SIZE_PT: f32 = 20.0;
 const FLOATING_CONTROL_HEIGHT_PT: f32 = 32.0;
 const FLOATING_MENU_MAX_HEIGHT_PT: f32 = f32::INFINITY;
@@ -218,9 +221,21 @@ enum TextTarget {
 struct TextEditing {
   target: TextTarget,
   buffer: String,
-  style: ToolStyle,
+  text_style: TextStyle,
+  ime: InlineImeState,
   request_focus: bool,
   select_all: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InlineImeState {
+  preedit: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InlineTextGeometry {
+  origin_px: PointPx,
+  wrap_width_px: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +248,6 @@ enum ShortcutAction {
   Delete,
   Copy,
   Paste,
-  CommitText,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +320,7 @@ impl EditorController {
     let mut actions = Vec::new();
 
     let mut transform = None;
+    let mut canvas_painter = None;
     let background_fill = if background.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
       root_ui,
@@ -341,14 +356,22 @@ impl EditorController {
             Color32::WHITE,
           );
         }
-        paint_document(&painter, &canvas_transform, document);
-        self.paint_interaction(&painter, canvas_transform, document);
-        self.paint_selection(&painter, canvas_transform, document);
+        canvas_painter = Some(painter);
       },
     );
 
     if let Some(transform) = transform {
-      self.show_text_editor(&ctx, transform, document, &mut actions);
+      let submit_text = self.show_text_editor(&ctx, transform, document);
+      if let Some(painter) = canvas_painter {
+        self.paint_document_for_editing(&painter, transform, document);
+        self.paint_interaction(&painter, transform, document);
+        if self.text_editing.is_none() {
+          self.paint_selection(&painter, transform, document);
+        }
+      }
+      if submit_text {
+        self.commit_text(document, &mut actions);
+      }
       self.handle_keyboard(&ctx, document, &mut actions);
       self.show_option_panel(&ctx, transform, document, &mut actions);
     } else {
@@ -466,7 +489,6 @@ impl EditorController {
           self.last_pointer_document.unwrap_or_else(|| document.canvas_size_px.bounds().center());
         actions.push(EditorAction::Paste { position });
       }
-      ShortcutAction::CommitText => self.commit_text(document, actions),
     }
   }
 
@@ -500,10 +522,13 @@ impl EditorController {
             hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale());
         }
         EditorTool::Text => {
+          let style = self.tool_style(EditorTool::Text);
           self.text_editing = Some(TextEditing {
             target: TextTarget::NewText { anchor_px: position },
             buffer: String::new(),
-            style: self.tool_style(EditorTool::Text),
+            text_style: TextStyle::mvp(style.color_rgba, style.font_size_px)
+              .expect("text tool style is valid"),
+            ime: InlineImeState::default(),
             request_focus: true,
             select_all: false,
           });
@@ -609,12 +634,17 @@ impl EditorController {
         EditorTool::Rectangle => {
           if let Some(element) = self.make_rectangle(document, start, current) {
             let element_id = element.element_id;
+            let ElementPayload::Rectangle(payload) = &element.payload else {
+              unreachable!("rectangle tool created a non-rectangle element");
+            };
+            let text_style = payload.label.text_style.clone();
             actions.push(command_action(DocumentCommand::AddElement { element }));
             self.selected_element_id = Some(element_id);
             self.text_editing = Some(TextEditing {
               target: TextTarget::RectangleLabel { element_id },
               buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
-              style: self.tool_style(EditorTool::Rectangle),
+              text_style,
+              ime: InlineImeState::default(),
               request_focus: true,
               select_all: true,
             });
@@ -796,11 +826,8 @@ impl EditorController {
         self.text_editing = Some(TextEditing {
           target: TextTarget::ExistingText { element_id },
           buffer: payload.text.clone(),
-          style: ToolStyle {
-            color_rgba: payload.text_style.color_rgba,
-            width_px: 8.0,
-            font_size_px: payload.text_style.font_size_px,
-          },
+          text_style: payload.text_style.clone(),
+          ime: InlineImeState::default(),
           request_focus: true,
           select_all: false,
         });
@@ -809,11 +836,8 @@ impl EditorController {
         self.text_editing = Some(TextEditing {
           target: TextTarget::RectangleLabel { element_id },
           buffer: payload.label.text.clone(),
-          style: ToolStyle {
-            color_rgba: payload.stroke_style.color_rgba,
-            width_px: payload.stroke_style.width_px,
-            font_size_px: payload.label.text_style.font_size_px,
-          },
+          text_style: payload.label.text_style.clone(),
+          ime: InlineImeState::default(),
           request_focus: true,
           select_all: false,
         });
@@ -831,12 +855,7 @@ impl EditorController {
     }
     match editing.target {
       TextTarget::NewText { anchor_px } => {
-        let box_width_px = DEFAULT_TEXT_BOX_WIDTH_PX
-          .min((document.canvas_size_px.width_px as f32 - anchor_px.x_px).max(1.0));
-        let Ok(text_style) = TextStyle::mvp(editing.style.color_rgba, editing.style.font_size_px)
-        else {
-          return;
-        };
+        let box_width_px = text_width_to_canvas_edge(anchor_px, document.canvas_size_px);
         let Ok(element) = Element::new(
           ElementId::new(),
           document.elements.len() as i64,
@@ -844,7 +863,7 @@ impl EditorController {
             anchor_px,
             text: editing.buffer,
             box_width_px,
-            text_style,
+            text_style: editing.text_style,
           }),
           document.canvas_size_px,
         ) else {
@@ -859,11 +878,13 @@ impl EditorController {
         let ElementPayload::Text(payload) = &element.payload else {
           return;
         };
-        if payload.text == editing.buffer {
+        let box_width_px = text_width_to_canvas_edge(payload.anchor_px, document.canvas_size_px);
+        if payload.text == editing.buffer && payload.box_width_px == box_width_px {
           return;
         }
         let mut payload = payload.clone();
         payload.text = editing.buffer;
+        payload.box_width_px = box_width_px;
         actions.push(command_action(DocumentCommand::UpdateElement {
           element_id,
           payload: ElementPayload::Text(payload),
@@ -891,71 +912,96 @@ impl EditorController {
     ctx: &egui::Context,
     transform: CanvasTransform,
     document: &BoardDocument,
-    actions: &mut Vec<EditorAction>,
-  ) {
+  ) -> bool {
     let Some(editing) = self.text_editing.as_ref() else {
-      return;
+      return false;
     };
-    let origin = match editing.target {
-      TextTarget::NewText { anchor_px } => anchor_px,
-      TextTarget::ExistingText { element_id } => document
-        .element(element_id)
-        .and_then(|element| match &element.payload {
-          ElementPayload::Text(payload) => Some(payload.anchor_px),
-          _ => None,
-        })
-        .unwrap_or(PointPx::ZERO),
-      TextTarget::RectangleLabel { element_id } => document
-        .element(element_id)
-        .and_then(|element| match &element.payload {
-          ElementPayload::Rectangle(payload) => {
-            rectangle_label_layout(payload, document.canvas_size_px)
-              .ok()
-              .map(|layout| layout.bounds_px.min)
-          }
-          _ => None,
-        })
-        .unwrap_or(PointPx::ZERO),
+    let Some(geometry) = inline_text_geometry(editing, document) else {
+      return false;
     };
-    let screen_position = transform.document_to_egui(origin);
+    let screen_position = transform.document_to_egui(geometry.origin_px);
     let editor_id = Id::new("rs-board-inline-text-editor");
     let mut lost_focus = false;
     let editing = self.text_editing.as_mut().expect("text editor checked above");
-    egui::Area::new(Id::new("rs-board-inline-text-area"))
-      .order(egui::Order::Foreground)
-      .fixed_pos(screen_position)
-      .constrain_to(ctx.content_rect())
-      .show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-          let width = (DEFAULT_TEXT_BOX_WIDTH_PX * transform.scale()).clamp(160.0, 520.0);
-          let mut output = egui::TextEdit::multiline(&mut editing.buffer)
-            .id(editor_id)
-            .font(FontId::proportional(
-              (editing.style.font_size_px * transform.scale()).clamp(12.0, 64.0),
-            ))
-            .desired_width(width)
-            .desired_rows(1)
-            .return_key(None)
-            .show(ui);
-          if editing.request_focus {
-            output.response.request_focus();
-            if editing.select_all {
-              use egui::text::{CCursor, CCursorRange};
-              output.state.cursor.set_char_range(Some(CCursorRange::two(
-                CCursor::new(0),
-                CCursor::new(editing.buffer.chars().count()),
-              )));
-              output.state.store(ctx, editor_id);
-            }
-            editing.request_focus = false;
-          } else {
-            lost_focus = output.response.lost_focus();
-          }
-        });
-      });
-    if lost_focus {
-      self.commit_text(document, actions);
+    let submit_after_widget =
+      ctx.input_mut(|input| normalize_inline_text_events(&mut input.events, &mut editing.ime));
+    let font_id = FontId::proportional(editing.text_style.font_size_px * transform.scale());
+    let text_color = color32(editing.text_style.color_rgba);
+    let horizontal_align = match editing.text_style.align {
+      TextAlign::Left => egui::Align::Min,
+      TextAlign::Center => egui::Align::Center,
+      TextAlign::Right => egui::Align::Max,
+    };
+    let desired_width = (geometry.wrap_width_px * transform.scale()).max(1.0);
+    let editor_rect = Rect::from_min_size(
+      screen_position,
+      egui::vec2(desired_width, transform.canvas_rect().height().max(1.0)),
+    );
+    let layer_id = egui::LayerId::new(egui::Order::Foreground, editor_id.with("layer"));
+    ctx.set_transform_layer(layer_id, egui::emath::TSTransform::IDENTITY);
+    ctx.move_to_top(layer_id);
+    let first_shape = ctx.graphics_mut(|graphics| graphics.entry(layer_id).next_idx());
+    let mut ui = egui::Ui::new(
+      ctx.clone(),
+      editor_id.with("ui"),
+      egui::UiBuilder::new().layer_id(layer_id).max_rect(editor_rect),
+    );
+    ui.set_clip_rect(transform.canvas_rect());
+    ui.set_width(desired_width);
+    let layout_text_style = editing.text_style.clone();
+    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+      layout_egui_text(
+        ui.painter(),
+        text.as_str(),
+        &layout_text_style,
+        wrap_width,
+        transform.scale(),
+        1.0,
+      )
+    };
+    let mut output = egui::TextEdit::multiline(&mut editing.buffer)
+      .id(editor_id)
+      .font(font_id)
+      .text_color(text_color)
+      .horizontal_align(horizontal_align)
+      .desired_width(desired_width)
+      .desired_rows(1)
+      .frame(egui::Frame::NONE)
+      .margin(egui::Margin::ZERO)
+      .layouter(&mut layouter)
+      .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
+      .show(&mut ui);
+    if editing.request_focus {
+      use egui::text::{CCursor, CCursorRange};
+
+      output.response.request_focus();
+      output.state = Default::default();
+      let character_count = editing.buffer.chars().count();
+      let cursor_range = if editing.select_all {
+        CCursorRange::two(CCursor::new(0), CCursor::new(character_count))
+      } else {
+        CCursorRange::one(CCursor::new(character_count))
+      };
+      output.state.cursor.set_char_range(Some(cursor_range));
+      output.state.store(ctx, editor_id);
+      editing.request_focus = false;
+    } else {
+      lost_focus = output.response.lost_focus();
     }
+    if submit_after_widget {
+      output.response.surrender_focus();
+    }
+    if let Some(updated_geometry) = inline_text_geometry(editing, document) {
+      let updated_position = transform.document_to_egui(updated_geometry.origin_px);
+      translate_inline_text_layer(
+        ctx,
+        layer_id,
+        first_shape,
+        updated_position - screen_position,
+        transform.canvas_rect(),
+      );
+    }
+    lost_focus || submit_after_widget
   }
 
   fn show_toolbar(
@@ -1190,6 +1236,29 @@ impl EditorController {
     }
     if let Some(font_size) = change.font_size_px {
       style.font_size_px = font_size;
+    }
+  }
+
+  fn paint_document_for_editing(
+    &self,
+    painter: &egui::Painter,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+  ) {
+    let painter = painter.with_clip_rect(transform.canvas_rect());
+    for element in &document.elements {
+      match self.text_editing.as_ref().map(|editing| &editing.target) {
+        Some(TextTarget::ExistingText { element_id }) if *element_id == element.element_id => {}
+        Some(TextTarget::RectangleLabel { element_id }) if *element_id == element.element_id => {
+          let ElementPayload::Rectangle(payload) = &element.payload else {
+            continue;
+          };
+          let editing = self.text_editing.as_ref().expect("text editing target checked above");
+          let draft = rectangle_label_draft(payload, editing);
+          paint_rectangle_without_label_text(&painter, &transform, &draft, 1.0);
+        }
+        _ => paint_element(&painter, &transform, element, 1.0),
+      }
     }
   }
 
@@ -1433,9 +1502,6 @@ fn map_shortcut(key: Key, modifiers: Modifiers, text_editing: bool) -> Option<Sh
     if key == Key::Escape {
       return Some(ShortcutAction::CloseOrCancel);
     }
-    if key == Key::Enter && !modifiers.shift && !command {
-      return Some(ShortcutAction::CommitText);
-    }
     if command {
       if let Some(tool) = tool_for_key(key) {
         return Some(ShortcutAction::Tool(tool));
@@ -1471,6 +1537,145 @@ fn map_shortcut(key: Key, modifiers: Modifiers, text_editing: bool) -> Option<Sh
     return Some(ShortcutAction::Delete);
   }
   None
+}
+
+fn text_width_to_canvas_edge(anchor_px: PointPx, canvas_size_px: SizePx) -> f32 {
+  let canvas_width_px = canvas_size_px.width_px as f32;
+  (canvas_width_px - anchor_px.x_px).clamp(1.0, canvas_width_px)
+}
+
+fn inline_text_geometry(
+  editing: &TextEditing,
+  document: &BoardDocument,
+) -> Option<InlineTextGeometry> {
+  match editing.target {
+    TextTarget::NewText { anchor_px } => Some(InlineTextGeometry {
+      origin_px: anchor_px,
+      wrap_width_px: text_width_to_canvas_edge(anchor_px, document.canvas_size_px),
+    }),
+    TextTarget::ExistingText { element_id } => {
+      let ElementPayload::Text(payload) = &document.element(element_id)?.payload else {
+        return None;
+      };
+      Some(InlineTextGeometry {
+        origin_px: payload.anchor_px,
+        wrap_width_px: text_width_to_canvas_edge(payload.anchor_px, document.canvas_size_px),
+      })
+    }
+    TextTarget::RectangleLabel { element_id } => {
+      // A newly-created rectangle is added after this frame. Waiting for it to
+      // enter the document avoids briefly placing its editor at the origin.
+      let ElementPayload::Rectangle(payload) = &document.element(element_id)?.payload else {
+        return None;
+      };
+      let draft = rectangle_label_draft(payload, editing);
+      let layout = rectangle_label_layout(&draft, document.canvas_size_px).ok()?;
+      let alignment_width_px = (layout.bounds_px.width() - draft.label.padding_px * 2.0).max(1.0);
+      let alignment_offset_px = match editing.text_style.align {
+        TextAlign::Left => 0.0,
+        TextAlign::Center => (alignment_width_px - layout.text_wrap_width_px) / 2.0,
+        TextAlign::Right => alignment_width_px - layout.text_wrap_width_px,
+      };
+      Some(InlineTextGeometry {
+        origin_px: layout.bounds_px.min
+          + PointPx::new(draft.label.padding_px + alignment_offset_px, draft.label.padding_px),
+        wrap_width_px: layout.text_wrap_width_px,
+      })
+    }
+  }
+}
+
+fn rectangle_label_draft(payload: &RectanglePayload, editing: &TextEditing) -> RectanglePayload {
+  let mut draft = payload.clone();
+  draft.label.text = if editing.buffer.trim().is_empty() {
+    EMPTY_RECTANGLE_LABEL_DRAFT.to_owned()
+  } else {
+    editing.buffer.clone()
+  };
+  draft.label.text_style = editing.text_style.clone();
+  draft
+}
+
+fn translate_inline_text_layer(
+  ctx: &egui::Context,
+  layer_id: egui::LayerId,
+  first_shape: egui::layers::ShapeIdx,
+  delta: egui::Vec2,
+  canvas_clip_rect: Rect,
+) {
+  if delta == egui::Vec2::ZERO {
+    return;
+  }
+  ctx.graphics_mut(|graphics| {
+    let paint_list = graphics.entry(layer_id);
+    let end_shape = paint_list.next_idx();
+    for index in first_shape.0..end_shape.0 {
+      paint_list.mutate_shape(egui::layers::ShapeIdx(index), |clipped_shape| {
+        clipped_shape.clip_rect = canvas_clip_rect.translate(-delta);
+      });
+    }
+  });
+  ctx.set_transform_layer(layer_id, egui::emath::TSTransform::from_translation(delta));
+  ctx.output_mut(|output| {
+    if let Some(ime) = &mut output.ime {
+      ime.rect = ime.rect.translate(delta);
+      ime.cursor_rect = ime.cursor_rect.translate(delta);
+    }
+  });
+}
+
+fn normalize_inline_text_events(events: &mut Vec<Event>, ime: &mut InlineImeState) -> bool {
+  let frame_preedit = events.iter().rev().find_map(|event| match event {
+    Event::Ime(ImeEvent::Preedit { text, .. }) if !text.is_empty() => Some(text.clone()),
+    _ => None,
+  });
+  let ime_involved_this_frame = ime.preedit.as_ref().is_some_and(|text| !text.is_empty())
+    || frame_preedit.is_some()
+    || events.iter().any(|event| match event {
+      Event::Ime(ImeEvent::Commit(text)) => !text.trim_end_matches(['\r', '\n']).is_empty(),
+      _ => false,
+    });
+
+  let previous_preedit = ime.preedit.clone();
+  let mut submit_after_widget = false;
+  events.retain_mut(|event| match event {
+    Event::Ime(ImeEvent::Preedit { text, .. }) => {
+      ime.preedit = (!text.is_empty()).then(|| text.clone());
+      true
+    }
+    Event::Ime(ImeEvent::Commit(text)) => {
+      let trimmed_len = text.trim_end_matches(['\r', '\n']).len();
+      let had_trailing_line_ending = trimmed_len != text.len();
+      text.truncate(trimmed_len);
+      if text.is_empty()
+        && had_trailing_line_ending
+        && let Some(preedit) = ime.preedit.clone().or_else(|| previous_preedit.clone())
+      {
+        *text = preedit;
+      }
+      let keep_event = if text.is_empty() && had_trailing_line_ending && !ime_involved_this_frame {
+        submit_after_widget = true;
+        false
+      } else {
+        true
+      };
+      ime.preedit = None;
+      keep_event
+    }
+    Event::Key { key: Key::Enter, pressed: true, modifiers, .. } => {
+      if ime_involved_this_frame {
+        false
+      } else if modifiers.shift || modifiers.mac_cmd || modifiers.command {
+        *modifiers = Modifiers::SHIFT;
+        true
+      } else {
+        submit_after_widget = true;
+        false
+      }
+    }
+    _ => true,
+  });
+  submit_after_widget
 }
 
 fn tool_for_key(key: Key) -> Option<EditorTool> {
@@ -1617,16 +1822,69 @@ mod tests {
   use super::*;
 
   fn document() -> BoardDocument {
+    document_with_size(SizePx::new(400, 200))
+  }
+
+  fn document_with_size(canvas_size_px: SizePx) -> BoardDocument {
     BoardDocument::new_capture(
       DocumentId::from_uuid(Uuid::nil()),
-      SizePx::new(400, 200),
+      canvas_size_px,
       CapturedDisplay {
-        global_bounds_px: GlobalBoundsPx { x_px: 0, y_px: 0, width_px: 400, height_px: 200 },
+        global_bounds_px: GlobalBoundsPx {
+          x_px: 0,
+          y_px: 0,
+          width_px: canvas_size_px.width_px,
+          height_px: canvas_size_px.height_px,
+        },
         scale_factor: 1.0,
       },
       Utc.with_ymd_and_hms(2026, 8, 6, 0, 0, 0).unwrap(),
     )
     .unwrap()
+  }
+
+  fn text_element(
+    document: &BoardDocument,
+    anchor_px: PointPx,
+    text: impl Into<String>,
+    box_width_px: f32,
+  ) -> Element {
+    Element::new(
+      ElementId::new(),
+      document.elements.len() as i64,
+      ElementPayload::Text(TextPayload {
+        anchor_px,
+        text: text.into(),
+        box_width_px,
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+      }),
+      document.canvas_size_px,
+    )
+    .unwrap()
+  }
+
+  fn raw_input(events: Vec<Event>, screen_size: egui::Vec2) -> egui::RawInput {
+    egui::RawInput {
+      screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen_size)),
+      events,
+      ..Default::default()
+    }
+  }
+
+  fn run_editor_frame(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    events: Vec<Event>,
+  ) -> Vec<EditorAction> {
+    let mut actions = None;
+    context
+      .run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
+        actions = Some(controller.show(ui, document, history, None));
+      })
+      .drop_without_applying_deltas();
+    actions.expect("editor frame ran")
   }
 
   fn rectangle(document: &BoardDocument, z_index: i64, start: PointPx, end: PointPx) -> Element {
@@ -1901,7 +2159,643 @@ mod tests {
       map_shortcut(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT, false),
       Some(ShortcutAction::Redo)
     );
-    assert_eq!(map_shortcut(Key::Enter, Modifiers::NONE, true), Some(ShortcutAction::CommitText));
+    assert_eq!(map_shortcut(Key::Enter, Modifiers::NONE, true), None);
     assert_eq!(map_shortcut(Key::Enter, Modifiers::SHIFT, true), None);
+  }
+
+  fn enter_event(modifiers: Modifiers) -> Event {
+    Event::Key {
+      key: Key::Enter,
+      physical_key: Some(Key::Enter),
+      pressed: true,
+      repeat: false,
+      modifiers,
+    }
+  }
+
+  #[test]
+  fn inline_enter_events_distinguish_submit_and_newline() {
+    let mut ime = InlineImeState::default();
+    let mut events = vec![enter_event(Modifiers::NONE)];
+    assert!(normalize_inline_text_events(&mut events, &mut ime));
+    assert!(events.is_empty());
+
+    for modifiers in [Modifiers::SHIFT, Modifiers::COMMAND, Modifiers::SHIFT | Modifiers::COMMAND] {
+      let mut events = vec![enter_event(modifiers)];
+      assert!(!normalize_inline_text_events(&mut events, &mut ime));
+      assert!(matches!(
+        events.as_slice(),
+        [Event::Key { key: Key::Enter, modifiers: Modifiers::SHIFT, pressed: true, .. }]
+      ));
+    }
+  }
+
+  #[test]
+  fn inline_newline_replaces_selection_or_inserts_at_cursor_once() {
+    use egui::text::{CCursor, CCursorRange};
+
+    for (modifiers, cursor_range, expected) in [
+      (Modifiers::SHIFT, CCursorRange::two(CCursor::new(1), CCursor::new(3)), "a\nd"),
+      (Modifiers::MAC_CMD | Modifiers::COMMAND, CCursorRange::one(CCursor::new(2)), "ab\ncd"),
+      (
+        Modifiers::SHIFT | Modifiers::MAC_CMD | Modifiers::COMMAND,
+        CCursorRange::two(CCursor::new(1), CCursor::new(3)),
+        "a\nd",
+      ),
+    ] {
+      let context = egui::Context::default();
+      let editor_id = Id::new(("inline-newline-test", modifiers));
+      let mut buffer = "abcd".to_owned();
+      context
+        .run_ui(raw_input(Vec::new(), egui::vec2(320.0, 120.0)), |ui| {
+          let mut output = egui::TextEdit::multiline(&mut buffer)
+            .id(editor_id)
+            .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
+            .show(ui);
+          output.response.request_focus();
+          output.state.cursor.set_char_range(Some(cursor_range));
+          output.state.store(&context, editor_id);
+        })
+        .drop_without_applying_deltas();
+
+      let mut ime = InlineImeState::default();
+      let mut events = vec![enter_event(modifiers)];
+      assert!(!normalize_inline_text_events(&mut events, &mut ime));
+      let focused = Cell::new(false);
+      context
+        .run_ui(raw_input(events, egui::vec2(320.0, 120.0)), |ui| {
+          let output = egui::TextEdit::multiline(&mut buffer)
+            .id(editor_id)
+            .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter))
+            .show(ui);
+          focused.set(output.response.has_focus());
+        })
+        .drop_without_applying_deltas();
+
+      assert_eq!(buffer, expected);
+      assert_eq!(buffer.matches('\n').count(), 1);
+      assert!(focused.get());
+    }
+  }
+
+  #[test]
+  fn ime_commit_trims_confirmation_newline_without_submitting() {
+    for key_first in [false, true] {
+      let mut ime = InlineImeState { preedit: Some("o".to_owned()) };
+      let commit = Event::Ime(ImeEvent::Commit("OK\r\n".to_owned()));
+      let enter = enter_event(Modifiers::NONE);
+      let mut events = if key_first { vec![enter, commit] } else { vec![commit, enter] };
+
+      assert!(!normalize_inline_text_events(&mut events, &mut ime));
+      assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("OK".to_owned()))]);
+      assert!(ime.preedit.is_none());
+    }
+  }
+
+  #[test]
+  fn ime_enter_is_consumed_until_composition_commits() {
+    let mut ime = InlineImeState::default();
+    let mut preedit =
+      vec![Event::Ime(ImeEvent::Preedit { text: "o".to_owned(), active_range_chars: Some(0..1) })];
+    assert!(!normalize_inline_text_events(&mut preedit, &mut ime));
+    assert_eq!(ime.preedit.as_deref(), Some("o"));
+
+    let mut first_enter = vec![enter_event(Modifiers::NONE)];
+    assert!(!normalize_inline_text_events(&mut first_enter, &mut ime));
+    assert!(first_enter.is_empty());
+
+    let mut commit = vec![Event::Ime(ImeEvent::Commit("OK\n".to_owned()))];
+    assert!(!normalize_inline_text_events(&mut commit, &mut ime));
+    assert_eq!(commit, vec![Event::Ime(ImeEvent::Commit("OK".to_owned()))]);
+    assert!(ime.preedit.is_none());
+
+    let mut second_enter = vec![enter_event(Modifiers::NONE)];
+    assert!(normalize_inline_text_events(&mut second_enter, &mut ime));
+    assert!(second_enter.is_empty());
+  }
+
+  #[test]
+  fn ime_commit_preserves_internal_newlines() {
+    let mut ime = InlineImeState::default();
+    let mut events = vec![Event::Ime(ImeEvent::Commit("A\nB\n".to_owned()))];
+    assert!(!normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("A\nB".to_owned()))]);
+  }
+
+  #[test]
+  fn ime_events_are_order_independent_for_candidate_confirmation() {
+    let preedit =
+      Event::Ime(ImeEvent::Preedit { text: "O".to_owned(), active_range_chars: Some(0..1) });
+    let commit = Event::Ime(ImeEvent::Commit("OK\n".to_owned()));
+    let enter = enter_event(Modifiers::NONE);
+    for mut events in [
+      vec![preedit.clone(), commit.clone(), enter.clone()],
+      vec![preedit.clone(), enter.clone(), commit.clone()],
+      vec![commit.clone(), preedit.clone(), enter.clone()],
+      vec![commit.clone(), enter.clone(), preedit.clone()],
+      vec![enter.clone(), preedit.clone(), commit.clone()],
+      vec![enter.clone(), commit.clone(), preedit.clone()],
+    ] {
+      let mut ime = InlineImeState::default();
+      assert!(!normalize_inline_text_events(&mut events, &mut ime));
+      assert!(
+        events
+          .iter()
+          .all(|event| !matches!(event, Event::Key { key: Key::Enter, pressed: true, .. }))
+      );
+      assert!(
+        events
+          .iter()
+          .any(|event| { matches!(event, Event::Ime(ImeEvent::Commit(text)) if text == "OK") })
+      );
+    }
+  }
+
+  #[test]
+  fn ime_newline_commit_uses_only_an_already_active_preedit() {
+    let mut ime = InlineImeState::default();
+    let mut events = vec![
+      Event::Ime(ImeEvent::Commit("\n".to_owned())),
+      Event::Ime(ImeEvent::Preedit { text: "future".to_owned(), active_range_chars: Some(0..6) }),
+    ];
+
+    assert!(!normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(events[0], Event::Ime(ImeEvent::Commit(String::new())));
+    assert_eq!(ime.preedit.as_deref(), Some("future"));
+  }
+
+  #[test]
+  fn idle_ime_newline_commit_routes_to_submit() {
+    for line_ending in ["\n", "\r", "\r\n"] {
+      let mut ime = InlineImeState::default();
+      let mut events = vec![Event::Ime(ImeEvent::Commit(line_ending.to_owned()))];
+
+      assert!(normalize_inline_text_events(&mut events, &mut ime));
+      assert!(events.is_empty());
+    }
+  }
+
+  #[test]
+  fn rectangle_ime_confirmation_keeps_editing_then_second_enter_submits() {
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(80.0, 100.0), PointPx::new(220.0, 170.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.label.text_style.clone();
+    document.elements.push(element);
+    let mut controller = EditorController {
+      selected_element_id: Some(element_id),
+      text_editing: Some(TextEditing {
+        target: TextTarget::RectangleLabel { element_id },
+        buffer: String::new(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    assert!(
+      run_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::Ime(ImeEvent::Preedit {
+          text: "O".to_owned(),
+          active_range_chars: Some(0..1),
+        })],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![enter_event(Modifiers::NONE), Event::Ime(ImeEvent::Commit("OK\n".to_owned()))],
+      )
+      .is_empty()
+    );
+    assert_eq!(controller.text_editing.as_ref().map(|editing| editing.buffer.as_str()), Some("OK"));
+
+    let actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![enter_event(Modifiers::NONE)],
+    );
+    assert!(controller.text_editing.is_none());
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one rectangle label update, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::UpdateRectangleLabel { element_id: updated, text }]
+        if *updated == element_id && text == "OK"
+    ));
+  }
+
+  #[test]
+  fn existing_text_commit_updates_width_and_history_restores_both_fields() {
+    let mut document = document();
+    let element = text_element(&document, PointPx::new(100.0, 40.0), "legacy", 80.0);
+    let element_id = element.element_id;
+    let ElementPayload::Text(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.text_style.clone();
+    document.elements.push(element);
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::ExistingText { element_id },
+        buffer: "updated\ntext".to_owned(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: false,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+    controller.commit_text(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one text update, got {actions:?}");
+    };
+
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    let ElementPayload::Text(updated) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(updated.text, "updated\ntext");
+    assert_eq!(updated.box_width_px, 300.0);
+
+    assert!(history.undo(&mut document).unwrap());
+    let ElementPayload::Text(undone) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(undone.text, "legacy");
+    assert_eq!(undone.box_width_px, 80.0);
+
+    assert!(history.redo(&mut document).unwrap());
+    let ElementPayload::Text(redone) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(redone.text, "updated\ntext");
+    assert_eq!(redone.box_width_px, 300.0);
+  }
+
+  #[test]
+  fn new_text_commit_persists_width_to_the_canvas_edge() {
+    let document = document();
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: "new text".to_owned(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: false,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+
+    controller.commit_text(&document, &mut actions);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one added text element, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::AddElement {
+        element: Element {
+          payload: ElementPayload::Text(TextPayload { box_width_px, .. }),
+          ..
+        },
+      }] if *box_width_px == 280.0
+    ));
+  }
+
+  #[test]
+  fn existing_text_commit_updates_legacy_width_when_content_is_unchanged() {
+    let mut document = document();
+    let element = text_element(&document, PointPx::new(120.0, 40.0), "same", 40.0);
+    let element_id = element.element_id;
+    let ElementPayload::Text(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.text_style.clone();
+    document.elements.push(element);
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::ExistingText { element_id },
+        buffer: "same".to_owned(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: false,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+
+    controller.commit_text(&document, &mut actions);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected a width-only text update, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::UpdateElement {
+        element_id: updated,
+        payload: ElementPayload::Text(TextPayload { text, box_width_px, .. }),
+      }] if *updated == element_id && text == "same" && *box_width_px == 280.0
+    ));
+  }
+
+  #[test]
+  fn rectangle_inline_geometry_tracks_draft_and_empty_label() {
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(80.0, 90.0), PointPx::new(180.0, 160.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.label.text_style.clone();
+    document.elements.push(element);
+    let mut editing = TextEditing {
+      target: TextTarget::RectangleLabel { element_id },
+      buffer: "OK".to_owned(),
+      text_style,
+      ime: InlineImeState::default(),
+      request_focus: false,
+      select_all: false,
+    };
+
+    let geometry = inline_text_geometry(&editing, &document).unwrap();
+    let ElementPayload::Rectangle(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    let draft = rectangle_label_draft(payload, &editing);
+    let layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap();
+    assert_eq!(geometry.wrap_width_px, layout.text_wrap_width_px);
+    assert_eq!(
+      geometry.origin_px,
+      layout.bounds_px.min + PointPx::new(draft.label.padding_px, draft.label.padding_px)
+    );
+    assert_eq!(layout.text_layout.line_count, 1);
+    assert!(layout.text_wrap_width_px > layout.bounds_px.width() - draft.label.padding_px * 2.0);
+
+    editing.buffer.clear();
+    let empty_draft = rectangle_label_draft(payload, &editing);
+    let empty_layout = rectangle_label_layout(&empty_draft, document.canvas_size_px).unwrap();
+    let empty_geometry = inline_text_geometry(&editing, &document).unwrap();
+    assert_eq!(empty_draft.label.text, EMPTY_RECTANGLE_LABEL_DRAFT);
+    assert_eq!(empty_layout.text_layout.width_px, 1.0);
+    assert_eq!(empty_geometry.wrap_width_px, empty_layout.text_wrap_width_px);
+  }
+
+  #[test]
+  fn pending_rectangle_editor_has_no_fallback_origin() {
+    let document = document();
+    let editing = TextEditing {
+      target: TextTarget::RectangleLabel { element_id: ElementId::new() },
+      buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
+      text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+      ime: InlineImeState::default(),
+      request_focus: true,
+      select_all: true,
+    };
+
+    assert!(inline_text_geometry(&editing, &document).is_none());
+  }
+
+  #[test]
+  fn inline_editor_is_frameless_visible_and_not_capped_at_default_area_width() {
+    let mut document = document_with_size(SizePx::new(1000, 200));
+    let element = text_element(&document, PointPx::new(20.0, 40.0), "A".repeat(60), 120.0);
+    let element_id = element.element_id;
+    document.elements.push(element);
+    let mut controller = EditorController::default();
+    controller.start_editing_existing(&document, element_id);
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 200.0)),
+    )
+    .unwrap();
+    let context = egui::Context::default();
+    let output = context.run_ui(raw_input(Vec::new(), egui::vec2(1000.0, 200.0)), |ui| {
+      assert!(!controller.show_text_editor(&context, transform, &document));
+      controller.paint_document_for_editing(ui.painter(), transform, &document);
+    });
+    let text_shape_count =
+      output.shapes.iter().filter(|shape| matches!(shape.shape, egui::Shape::Text(_))).count();
+    let text_row_count = output.shapes.iter().find_map(|shape| match &shape.shape {
+      egui::Shape::Text(text) => Some(text.galley.rows.len()),
+      _ => None,
+    });
+    let rectangle_shapes_are_invisible = output.shapes.iter().all(|shape| match &shape.shape {
+      egui::Shape::Rect(rectangle) => {
+        rectangle.fill == Color32::TRANSPARENT && rectangle.stroke == Stroke::NONE
+      }
+      _ => true,
+    });
+    output.drop_without_applying_deltas();
+    assert_eq!(text_shape_count, 1);
+    assert_eq!(text_row_count, Some(1));
+    assert!(rectangle_shapes_are_invisible);
+  }
+
+  #[test]
+  fn active_text_edit_hides_the_element_selection_chrome() {
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(80.0, 90.0), PointPx::new(220.0, 170.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.label.text_style.clone();
+    let element_bounds = element.bounds_px;
+    document.elements.push(element);
+    let mut controller = EditorController {
+      selected_element_id: Some(element_id),
+      text_editing: Some(TextEditing {
+        target: TextTarget::RectangleLabel { element_id },
+        buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let output = context.run_ui(raw_input(Vec::new(), egui::vec2(800.0, 400.0)), |ui| {
+      assert!(controller.show(ui, &document, &history, None).is_empty());
+    });
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+    let selection_rect = transform.document_rect_to_egui(element_bounds).expand(3.0);
+    let paints_selection_outline = output.shapes.iter().any(|shape| match &shape.shape {
+      egui::Shape::Rect(rectangle) => {
+        rectangle.rect.min.distance(selection_rect.min) < 0.1
+          && rectangle.rect.max.distance(selection_rect.max) < 0.1
+          && rectangle.stroke == Stroke::new(1.0, Color32::WHITE)
+      }
+      _ => false,
+    });
+    output.drop_without_applying_deltas();
+
+    assert!(!paints_selection_outline);
+  }
+
+  #[test]
+  fn rectangle_background_updates_in_the_same_frame_as_ime_commit() {
+    let mut document = document();
+    let mut element =
+      rectangle(&document, 0, PointPx::new(340.0, 100.0), PointPx::new(400.0, 170.0));
+    let ElementPayload::Rectangle(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.label.anchor_offset_px = 30.0;
+    element.refresh_bounds(document.canvas_size_px).unwrap();
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.label.text_style.clone();
+    document.elements.push(element);
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::RectangleLabel { element_id },
+        buffer: String::new(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 200.0)),
+    )
+    .unwrap();
+    let context = egui::Context::default();
+    fn run_frame(
+      context: &egui::Context,
+      controller: &mut EditorController,
+      transform: CanvasTransform,
+      document: &BoardDocument,
+      events: Vec<Event>,
+    ) -> egui::FullOutput {
+      context.run_ui(raw_input(events, egui::vec2(400.0, 200.0)), |ui| {
+        assert!(!controller.show_text_editor(context, transform, document));
+        controller.paint_document_for_editing(ui.painter(), transform, document);
+      })
+    }
+    run_frame(&context, &mut controller, transform, &document, Vec::new())
+      .drop_without_applying_deltas();
+    let preedit_output = run_frame(
+      &context,
+      &mut controller,
+      transform,
+      &document,
+      vec![Event::Ime(ImeEvent::Preedit { text: "O".to_owned(), active_range_chars: Some(0..1) })],
+    );
+    let preedit_origin =
+      inline_text_geometry(controller.text_editing.as_ref().unwrap(), &document).unwrap().origin_px;
+    let preedit_ime_rect = preedit_output.platform_output.ime.map(|ime| ime.rect);
+    preedit_output.drop_without_applying_deltas();
+    assert!(
+      preedit_ime_rect.is_some_and(|rect| {
+        rect.min.distance(transform.document_to_egui(preedit_origin)) < 0.1
+      })
+    );
+    let output = run_frame(
+      &context,
+      &mut controller,
+      transform,
+      &document,
+      vec![enter_event(Modifiers::NONE), Event::Ime(ImeEvent::Commit("OK\n".to_owned()))],
+    );
+
+    let editing = controller.text_editing.as_ref().unwrap();
+    assert_eq!(editing.buffer, "OK");
+    let ElementPayload::Rectangle(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    let draft = rectangle_label_draft(payload, editing);
+    let expected_layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap();
+    let expected_label_rect = transform.document_rect_to_egui(expected_layout.bounds_px);
+    let expected_geometry = inline_text_geometry(editing, &document).unwrap();
+    let expected_text_position = transform.document_to_egui(expected_geometry.origin_px);
+    let colored_rectangles = output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::Rect(rectangle) if rectangle.fill != Color32::TRANSPARENT => Some(rectangle),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let text_row_counts = output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) => Some(text.galley.rows.len()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let text_positions = output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) => Some(text.pos),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let text_clip_rects = output
+      .shapes
+      .iter()
+      .filter_map(|shape| matches!(shape.shape, egui::Shape::Text(_)).then_some(shape.clip_rect))
+      .collect::<Vec<_>>();
+    let background_matches = colored_rectangles.iter().any(|rectangle| {
+      rectangle.rect.min.distance(expected_label_rect.min) < 0.1
+        && rectangle.rect.max.distance(expected_label_rect.max) < 0.1
+    });
+    output.drop_without_applying_deltas();
+
+    assert!(background_matches);
+    assert_eq!(text_row_counts, vec![1]);
+    assert!(preedit_origin.distance_to(expected_geometry.origin_px) > 1.0);
+    assert_eq!(text_positions.len(), 1);
+    assert!(text_positions[0].distance(expected_text_position) < 0.1);
+    assert_eq!(text_clip_rects.len(), 1);
+    assert!(text_clip_rects[0].min.distance(transform.canvas_rect().min) < 0.1);
+    assert!(text_clip_rects[0].max.distance(transform.canvas_rect().max) < 0.1);
+  }
+
+  #[test]
+  fn text_width_extends_from_anchor_to_canvas_edge() {
+    let canvas = SizePx::new(400, 200);
+    assert_eq!(text_width_to_canvas_edge(PointPx::new(120.0, 20.0), canvas), 280.0);
+    assert_eq!(text_width_to_canvas_edge(PointPx::new(-30.0, 20.0), canvas), 400.0);
+    assert_eq!(text_width_to_canvas_edge(PointPx::new(399.5, 20.0), canvas), 1.0);
   }
 }

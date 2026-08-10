@@ -768,6 +768,7 @@ pub struct RectangleLabelLayout {
   pub bounds_px: RectPx,
   pub placement: DerivedLabelPlacement,
   pub text_layout: TextLayout,
+  pub text_wrap_width_px: f32,
 }
 
 pub fn rectangle_label_layout(
@@ -784,11 +785,9 @@ pub fn rectangle_label_layout(
     .min(body.width() * 1.5)
     .min(canvas.width())
     .max(rectangle.label.padding_px * 2.0 + 1.0);
-  let text_layout = layout_text(
-    &rectangle.label.text,
-    &rectangle.label.text_style,
-    (maximum_width - rectangle.label.padding_px * 2.0).max(1.0),
-  )?;
+  let text_wrap_width_px = (maximum_width - rectangle.label.padding_px * 2.0).max(1.0);
+  let text_layout =
+    layout_text(&rectangle.label.text, &rectangle.label.text_style, text_wrap_width_px)?;
   let width_px =
     (text_layout.width_px + rectangle.label.padding_px * 2.0).min(maximum_width).max(1.0);
   let height_px = text_layout.height_px + rectangle.label.padding_px * 2.0;
@@ -808,6 +807,7 @@ pub fn rectangle_label_layout(
     ),
     placement,
     text_layout,
+    text_wrap_width_px,
   })
 }
 
@@ -856,7 +856,9 @@ pub fn layout_text(
 }
 
 fn character_width(character: char, font_size_px: f32) -> f32 {
-  if character.is_ascii_whitespace() {
+  if character == '\u{200b}' {
+    0.0
+  } else if character.is_ascii_whitespace() {
     font_size_px * 0.33
   } else if character.is_ascii() {
     font_size_px * 0.6
@@ -1055,6 +1057,18 @@ mod tests {
     let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 120)).unwrap();
     assert_eq!(layout.placement, DerivedLabelPlacement::Below);
     assert!(SizePx::new(200, 120).bounds().contains_rect(layout.bounds_px));
+  }
+
+  #[test]
+  fn rectangle_label_exposes_pre_shrink_text_wrap_width() {
+    let rectangle = rectangle(PointPx::new(20.0, 40.0), PointPx::new(120.0, 100.0));
+    let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 140)).unwrap();
+
+    // The body-derived outer cap is 150 px; the text wraps inside its 4 px padding.
+    assert_eq!(layout.text_wrap_width_px, 142.0);
+    assert!(
+      layout.text_wrap_width_px > layout.bounds_px.width() - rectangle.label.padding_px * 2.0
+    );
   }
 
   #[test]

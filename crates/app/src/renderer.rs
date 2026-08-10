@@ -1,11 +1,13 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ab_glyph::{FontArc, PxScale};
 use common::{
   ArrowPayload, BoardDocument, ColorRgba, DocumentSnapshot, Element, ElementPayload, PointPx,
-  RectanglePayload, SizePx, TextAlign, TextStyle, rectangle_label_layout,
+  RectangleLabelLayout, RectanglePayload, SizePx, TextAlign, TextStyle, rectangle_label_layout,
 };
-use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind};
+use eframe::egui::{
+  self, Align, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+};
 use image::{Rgba, RgbaImage, imageops::FilterType};
 use imageproc::drawing::{draw_text_mut, text_size};
 
@@ -97,7 +99,7 @@ pub(crate) fn paint_element(
         transform.document_to_egui(payload.anchor_px),
         &payload.text,
         &payload.text_style,
-        payload.box_width_px * transform.scale(),
+        TextPaintWidths::uniform(payload.box_width_px * transform.scale()),
         transform.scale(),
         opacity,
       );
@@ -181,6 +183,30 @@ fn paint_rectangle(
   payload: &RectanglePayload,
   opacity: f32,
 ) {
+  if let Some(layout) = paint_rectangle_without_label_text(painter, transform, payload, opacity) {
+    let label_rect = transform.document_rect_to_egui(layout.bounds_px);
+    let padding = payload.label.padding_px * transform.scale();
+    paint_text(
+      painter,
+      label_rect.min + egui::vec2(padding, padding),
+      &payload.label.text,
+      &payload.label.text_style,
+      TextPaintWidths {
+        wrap: layout.text_wrap_width_px * transform.scale(),
+        alignment: (label_rect.width() - padding * 2.0).max(1.0),
+      },
+      transform.scale(),
+      opacity,
+    );
+  }
+}
+
+pub(crate) fn paint_rectangle_without_label_text(
+  painter: &Painter,
+  transform: &CanvasTransform,
+  payload: &RectanglePayload,
+  opacity: f32,
+) -> Option<RectangleLabelLayout> {
   let body =
     transform.document_rect_to_egui(common::RectPx::from_points(payload.start_px, payload.end_px));
   painter.rect_stroke(
@@ -193,25 +219,15 @@ fn paint_rectangle(
     StrokeKind::Middle,
   );
 
-  if let Ok(layout) = rectangle_label_layout(payload, transform.document_size()) {
-    let label_rect = transform.document_rect_to_egui(layout.bounds_px);
-    let radius = (5.0 * transform.scale()).clamp(0.0, 255.0) as u8;
-    painter.rect_filled(
-      label_rect,
-      egui::CornerRadius::same(radius),
-      egui_color(payload.stroke_style.color_rgba, opacity),
-    );
-    let padding = payload.label.padding_px * transform.scale();
-    paint_text(
-      painter,
-      label_rect.min + egui::vec2(padding, padding),
-      &payload.label.text,
-      &payload.label.text_style,
-      (label_rect.width() - padding * 2.0).max(1.0),
-      transform.scale(),
-      opacity,
-    );
-  }
+  let layout = rectangle_label_layout(payload, transform.document_size()).ok()?;
+  let label_rect = transform.document_rect_to_egui(layout.bounds_px);
+  let radius = (5.0 * transform.scale()).clamp(0.0, 255.0) as u8;
+  painter.rect_filled(
+    label_rect,
+    egui::CornerRadius::same(radius),
+    egui_color(payload.stroke_style.color_rgba, opacity),
+  );
+  Some(layout)
 }
 
 fn paint_text(
@@ -219,23 +235,57 @@ fn paint_text(
   origin: Pos2,
   text: &str,
   style: &TextStyle,
-  wrap_width: f32,
+  widths: TextPaintWidths,
   scale: f32,
   opacity: f32,
 ) {
   let color = egui_color(style.color_rgba, opacity);
-  let galley = painter.layout(
+  let galley = layout_egui_text(painter, text, style, widths.wrap, scale, opacity);
+  let x = match style.align {
+    TextAlign::Left => origin.x,
+    TextAlign::Center => origin.x + widths.alignment / 2.0,
+    TextAlign::Right => origin.x + widths.alignment,
+  };
+  painter.galley(egui::pos2(x, origin.y), galley, color);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPaintWidths {
+  wrap: f32,
+  alignment: f32,
+}
+
+impl TextPaintWidths {
+  fn uniform(width: f32) -> Self {
+    Self { wrap: width, alignment: width }
+  }
+}
+
+pub(crate) fn layout_egui_text(
+  painter: &Painter,
+  text: &str,
+  style: &TextStyle,
+  wrap_width: f32,
+  scale: f32,
+  opacity: f32,
+) -> Arc<egui::Galley> {
+  let color = egui_color(style.color_rgba, opacity);
+  let mut job = egui::text::LayoutJob::simple(
     text.to_owned(),
     FontId::proportional(style.font_size_px * scale),
     color,
     wrap_width.max(1.0),
   );
-  let x = match style.align {
-    TextAlign::Left => origin.x,
-    TextAlign::Center => origin.x + (wrap_width - galley.size().x) / 2.0,
-    TextAlign::Right => origin.x + wrap_width - galley.size().x,
+  job.halign = match style.align {
+    TextAlign::Left => Align::LEFT,
+    TextAlign::Center => Align::Center,
+    TextAlign::Right => Align::RIGHT,
   };
-  painter.galley(egui::pos2(x, origin.y), galley, color);
+  job.keep_trailing_whitespace = true;
+  for section in &mut job.sections {
+    section.format.line_height = Some(style.line_height_px * scale);
+  }
+  painter.layout_job(job)
 }
 
 fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx) {
@@ -305,7 +355,10 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
           ),
           &payload.label.text,
           &payload.label.text_style,
-          (layout.bounds_px.width() - payload.label.padding_px * 2.0).max(1.0),
+          TextPaintWidths {
+            wrap: layout.text_wrap_width_px,
+            alignment: (layout.bounds_px.width() - payload.label.padding_px * 2.0).max(1.0),
+          },
         );
       }
     }
@@ -314,7 +367,7 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
       payload.anchor_px,
       &payload.text,
       &payload.text_style,
-      payload.box_width_px,
+      TextPaintWidths::uniform(payload.box_width_px),
     ),
     ElementPayload::SequenceMarker(payload) => {
       let bounds = common::RectPx::from_center_size(
@@ -475,18 +528,18 @@ fn draw_wrapped_text(
   origin: PointPx,
   text: &str,
   style: &TextStyle,
-  maximum_width: f32,
+  widths: TextPaintWidths,
 ) {
   let Some(font) = cjk_font() else {
     return;
   };
-  let lines = wrap_text(text, style.font_size_px, maximum_width);
+  let lines = wrap_text(text, style.font_size_px, widths.wrap);
   for (index, line) in lines.iter().enumerate() {
     let (width, _) = text_size(PxScale::from(style.font_size_px), font, line);
     let x = match style.align {
       TextAlign::Left => origin.x_px,
-      TextAlign::Center => origin.x_px + (maximum_width - width as f32) / 2.0,
-      TextAlign::Right => origin.x_px + maximum_width - width as f32,
+      TextAlign::Center => origin.x_px + (widths.alignment - width as f32) / 2.0,
+      TextAlign::Right => origin.x_px + widths.alignment - width as f32,
     };
     draw_text_mut(
       image,
@@ -626,6 +679,92 @@ mod tests {
       Utc.with_ymd_and_hms(2026, 8, 6, 0, 0, 0).unwrap(),
     )
     .unwrap()
+  }
+
+  fn rectangle_payload(
+    start_px: PointPx,
+    end_px: PointPx,
+    text: impl Into<String>,
+  ) -> RectanglePayload {
+    let stroke_style = StrokeStyle::mvp(ColorRgba::RED, 4.0).unwrap();
+    RectanglePayload {
+      start_px,
+      end_px,
+      stroke_style: stroke_style.clone(),
+      fill_rgba: None,
+      label: RectangleLabel {
+        text: text.into(),
+        placement_preference: LabelPlacementPreference::Above,
+        max_width_px: 240.0,
+        padding_px: 8.0,
+        anchor_offset_px: 8.0,
+        text_style: TextStyle::mvp(stroke_style.color_rgba.contrasting_text(), 24.0).unwrap(),
+      },
+    }
+  }
+
+  #[test]
+  fn egui_text_layout_honors_scaled_document_line_height() {
+    let context = egui::Context::default();
+    context
+      .run_ui(egui::RawInput::default(), |ui| {
+        let style = TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap();
+        let scale = 1.5;
+        let galley = layout_egui_text(ui.painter(), "first\nsecond", &style, 240.0, scale, 1.0);
+
+        assert_eq!(galley.rows.len(), 2);
+        for row in &galley.rows {
+          assert!((row.row.size.y - style.line_height_px * scale).abs() <= 1.0);
+        }
+      })
+      .drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn rectangle_chrome_helper_paints_no_label_glyphs() {
+    let context = egui::Context::default();
+    let payload = rectangle_payload(PointPx::new(40.0, 80.0), PointPx::new(140.0, 140.0), "OK");
+    let expected = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap();
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 180.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(SizePx::new(200, 180), ui.max_rect()).unwrap();
+        let actual =
+          paint_rectangle_without_label_text(ui.painter(), &transform, &payload, 1.0).unwrap();
+        assert_eq!(actual, expected);
+      },
+    );
+
+    assert!(
+      output.shapes.iter().all(|shape| !matches!(shape.shape, Shape::Text(_))),
+      "rectangle chrome must leave label glyphs to the inline editor"
+    );
+    output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn rectangle_label_egui_layout_uses_pre_shrink_wrap_width() {
+    let context = egui::Context::default();
+    let payload = rectangle_payload(PointPx::new(40.0, 80.0), PointPx::new(140.0, 140.0), "OK");
+    let layout = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap();
+
+    context
+      .run_ui(egui::RawInput::default(), |ui| {
+        let galley = layout_egui_text(
+          ui.painter(),
+          &payload.label.text,
+          &payload.label.text_style,
+          layout.text_wrap_width_px,
+          1.0,
+          1.0,
+        );
+        assert_eq!(galley.rows.len(), layout.text_layout.line_count);
+        assert_eq!(galley.rows.len(), 1);
+      })
+      .drop_without_applying_deltas();
   }
 
   #[test]
