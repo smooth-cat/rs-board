@@ -297,12 +297,17 @@ pub struct ArrowPayload {
 }
 
 impl ArrowPayload {
-  fn validate(&self) -> Result<(), ElementError> {
+  fn validate_for_bounds(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
     self.head.validate()?;
     if !self.start_px.is_finite() || !self.end_px.is_finite() {
       return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
     }
+    Ok(())
+  }
+
+  fn validate(&self) -> Result<(), ElementError> {
+    self.validate_for_bounds()?;
     if self.start_px.distance_to(self.end_px) < self.head.min_body_length_px {
       return Err(ElementError::GeometryBelowMinimum);
     }
@@ -356,7 +361,7 @@ pub struct RectanglePayload {
 }
 
 impl RectanglePayload {
-  fn validate(&self) -> Result<(), ElementError> {
+  fn validate_for_layout(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
     self.label.validate()?;
     if self.label.text_style.color_rgba != self.stroke_style.color_rgba.contrasting_text() {
@@ -368,6 +373,11 @@ impl RectanglePayload {
     if !self.start_px.is_finite() || !self.end_px.is_finite() {
       return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
     }
+    Ok(())
+  }
+
+  fn validate(&self) -> Result<(), ElementError> {
+    self.validate_for_layout()?;
     let body = RectPx::from_points(self.start_px, self.end_px);
     let minimum = minimum_geometry_extent(self.stroke_style.width_px)?;
     if body.width() < minimum || body.height() < minimum {
@@ -776,7 +786,7 @@ pub fn rectangle_label_layout(
   canvas_size_px: SizePx,
 ) -> Result<RectangleLabelLayout, ElementError> {
   canvas_size_px.validate()?;
-  rectangle.validate()?;
+  rectangle.validate_for_layout()?;
   let canvas = canvas_size_px.bounds();
   let body = RectPx::from_points(rectangle.start_px, rectangle.end_px);
   let maximum_width = rectangle
@@ -907,10 +917,10 @@ fn apply_stroke_change(style: &mut StrokeStyle, change: &StyleChange) {
 }
 
 fn arrow_bounds(payload: &ArrowPayload) -> Result<RectPx, ElementError> {
-  payload.validate()?;
+  payload.validate_for_bounds()?;
   let x = payload.end_px.x_px - payload.start_px.x_px;
   let y = payload.end_px.y_px - payload.start_px.y_px;
-  let length = x.hypot(y);
+  let length = x.hypot(y).max(f32::EPSILON);
   let unit = PointPx::new(x / length, y / length);
   let perpendicular = PointPx::new(-unit.y_px, unit.x_px);
   let base = PointPx::new(
@@ -1127,6 +1137,61 @@ mod tests {
     .unwrap();
     assert!(arrow.bounds_px.width() > 160.0);
     assert!(arrow.bounds_px.height() > 160.0);
+  }
+
+  #[test]
+  fn undersized_rectangles_have_finite_transient_layout_but_fail_validation() {
+    let canvas = SizePx::new(300, 200);
+    for end_px in [PointPx::new(41.0, 61.0), PointPx::new(40.0, 60.0)] {
+      let payload = rectangle(PointPx::new(40.0, 60.0), end_px);
+      let layout = rectangle_label_layout(&payload, canvas).unwrap();
+      assert_eq!(layout.bounds_px.validate(), Ok(()));
+      assert!(layout.text_wrap_width_px.is_finite());
+      assert!(layout.text_layout.width_px.is_finite());
+      assert!(layout.text_layout.height_px.is_finite());
+
+      let mut transient = Element {
+        element_id: ElementId::new(),
+        z_index: 0,
+        bounds_px: RectPx::from_min_max(PointPx::ZERO, PointPx::ZERO),
+        payload: ElementPayload::Rectangle(payload.clone()),
+      };
+      transient.refresh_bounds(canvas).unwrap();
+      assert_eq!(transient.bounds_px.validate(), Ok(()));
+      assert_eq!(transient.validate(canvas), Err(ElementError::GeometryBelowMinimum));
+      assert_eq!(
+        Element::new(ElementId::new(), 0, ElementPayload::Rectangle(payload), canvas),
+        Err(ElementError::GeometryBelowMinimum)
+      );
+    }
+  }
+
+  #[test]
+  fn undersized_arrows_have_finite_transient_bounds_but_fail_validation() {
+    let canvas = SizePx::new(300, 200);
+    let style = StrokeStyle::default();
+    let head = ArrowHead::for_stroke_width(style.width_px).unwrap();
+    for end_px in [PointPx::new(41.0, 60.0), PointPx::new(40.0, 60.0)] {
+      let payload = ArrowPayload {
+        start_px: PointPx::new(40.0, 60.0),
+        end_px,
+        stroke_style: style.clone(),
+        head: head.clone(),
+      };
+      let mut transient = Element {
+        element_id: ElementId::new(),
+        z_index: 0,
+        bounds_px: RectPx::from_min_max(PointPx::ZERO, PointPx::ZERO),
+        payload: ElementPayload::Arrow(payload.clone()),
+      };
+      transient.refresh_bounds(canvas).unwrap();
+      assert_eq!(transient.bounds_px.validate(), Ok(()));
+      assert_eq!(transient.validate(canvas), Err(ElementError::GeometryBelowMinimum));
+      assert_eq!(
+        Element::new(ElementId::new(), 0, ElementPayload::Arrow(payload), canvas),
+        Err(ElementError::GeometryBelowMinimum)
+      );
+    }
   }
 
   #[test]

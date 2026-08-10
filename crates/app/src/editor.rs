@@ -27,6 +27,7 @@ const TOOLBAR_DRAG_HANDLE_DOT_RADIUS_PT: f32 = 1.5;
 const HANDLE_VISUAL_RADIUS_PT: f32 = 4.5;
 const HANDLE_HIT_RADIUS_PT: f32 = 11.0;
 const HIT_TOLERANCE_PT: f32 = 7.0;
+const MINIMUM_DISTANCE_ROUNDING_FACTOR: f32 = 4.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTool {
@@ -256,6 +257,7 @@ pub struct EditorController {
   styles: [ToolStyle; 6],
   selected_element_id: Option<ElementId>,
   interaction: Option<PointerInteraction>,
+  released_preview_element: Option<Element>,
   text_editing: Option<TextEditing>,
   last_pointer_document: Option<PointPx>,
   option_panel_anchor: Option<Pos2>,
@@ -276,6 +278,7 @@ impl EditorController {
       styles: [ToolStyle::default(); 6],
       selected_element_id: None,
       interaction: None,
+      released_preview_element: None,
       text_editing: None,
       last_pointer_document: None,
       option_panel_anchor: None,
@@ -291,6 +294,7 @@ impl EditorController {
   pub fn set_active_tool(&mut self, tool: EditorTool) {
     self.tool = tool;
     self.interaction = None;
+    self.released_preview_element = None;
   }
 
   pub fn selected_element_id(&self) -> Option<ElementId> {
@@ -313,6 +317,7 @@ impl EditorController {
     background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     let ctx = root_ui.ctx().clone();
+    self.released_preview_element = None;
     if self.selected_element_id.is_some_and(|id| document.element(id).is_none()) {
       self.selected_element_id = None;
     }
@@ -369,6 +374,7 @@ impl EditorController {
           self.paint_selection(&painter, transform, document);
         }
       }
+      self.released_preview_element = None;
       if submit_text {
         self.commit_text(document, &mut actions);
       }
@@ -629,6 +635,7 @@ impl EditorController {
     let Some(interaction) = self.interaction.take() else {
       return;
     };
+    self.released_preview_element = None;
     match interaction {
       PointerInteraction::Draw { tool, start, current, mut points } => match tool {
         EditorTool::Rectangle => {
@@ -638,7 +645,12 @@ impl EditorController {
               unreachable!("rectangle tool created a non-rectangle element");
             };
             let text_style = payload.label.text_style.clone();
-            actions.push(command_action(DocumentCommand::AddElement { element }));
+            self.push_pointer_command(
+              document,
+              actions,
+              DocumentCommand::AddElement { element },
+              element_id,
+            );
             self.selected_element_id = Some(element_id);
             self.text_editing = Some(TextEditing {
               target: TextTarget::RectangleLabel { element_id },
@@ -652,7 +664,13 @@ impl EditorController {
         }
         EditorTool::Arrow => {
           if let Some(element) = self.make_arrow(document, start, current) {
-            actions.push(command_action(DocumentCommand::AddElement { element }));
+            let element_id = element.element_id;
+            self.push_pointer_command(
+              document,
+              actions,
+              DocumentCommand::AddElement { element },
+              element_id,
+            );
           }
         }
         EditorTool::Stroke => {
@@ -660,7 +678,13 @@ impl EditorController {
             points.push(current);
           }
           if let Some(element) = self.make_stroke(document, &points) {
-            actions.push(command_action(DocumentCommand::AddElement { element }));
+            let element_id = element.element_id;
+            self.push_pointer_command(
+              document,
+              actions,
+              DocumentCommand::AddElement { element },
+              element_id,
+            );
           }
         }
         EditorTool::Select | EditorTool::Text | EditorTool::Sequence => {}
@@ -668,43 +692,61 @@ impl EditorController {
       PointerInteraction::Move { element_id, start, current } => {
         let delta_px = current - start;
         if delta_px.distance_to(PointPx::ZERO) > 0.01 {
-          actions.push(command_action(DocumentCommand::MoveElement { element_id, delta_px }));
+          self.push_pointer_command(
+            document,
+            actions,
+            DocumentCommand::MoveElement { element_id, delta_px },
+            element_id,
+          );
         }
       }
       PointerInteraction::ResizeRectangle { element_id, handle, original, current } => {
-        let (start_px, end_px) = resized_rectangle(original, handle, current);
         if let Some(element) = document.element(element_id)
           && let ElementPayload::Rectangle(payload) = &element.payload
-          && minimum_geometry_extent(payload.stroke_style.width_px).is_ok_and(|minimum| {
-            let rect = RectPx::from_points(start_px, end_px);
-            rect.width() >= minimum && rect.height() >= minimum
-          })
+          && let Ok(minimum) = minimum_geometry_extent(payload.stroke_style.width_px)
         {
-          actions.push(command_action(DocumentCommand::ResizeRectangle {
+          let (start_px, end_px) = minimum_resized_rectangle(original, handle, current, minimum);
+          self.push_pointer_command(
+            document,
+            actions,
+            DocumentCommand::ResizeRectangle { element_id, start_px, end_px },
             element_id,
-            start_px,
-            end_px,
-          }));
+          );
         }
       }
       PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current } => {
         if let Some(element) = document.element(element_id)
           && let ElementPayload::Arrow(payload) = &element.payload
         {
-          let other = match endpoint {
-            ArrowEndpoint::Start => payload.end_px,
-            ArrowEndpoint::End => payload.start_px,
+          let position_px = clamped_arrow_endpoint(payload, endpoint, current);
+          let original_position_px = match endpoint {
+            ArrowEndpoint::Start => payload.start_px,
+            ArrowEndpoint::End => payload.end_px,
           };
-          if current.distance_to(other) >= payload.head.min_body_length_px {
-            actions.push(command_action(DocumentCommand::UpdateArrowEndpoint {
+          if position_px.distance_to(original_position_px) > 0.01 {
+            self.push_pointer_command(
+              document,
+              actions,
+              DocumentCommand::UpdateArrowEndpoint { element_id, endpoint, position_px },
               element_id,
-              endpoint,
-              position_px: current,
-            }));
+            );
           }
         }
       }
     }
+  }
+
+  fn push_pointer_command(
+    &mut self,
+    document: &BoardDocument,
+    actions: &mut Vec<EditorAction>,
+    command: DocumentCommand,
+    preview_element_id: ElementId,
+  ) {
+    let batch = CommandBatch::single(command);
+    self.released_preview_element =
+      preview_element_after_batch(document, &batch, preview_element_id);
+    actions.push(EditorAction::Command(batch));
   }
 
   fn make_rectangle(
@@ -713,35 +755,62 @@ impl EditorController {
     start_px: PointPx,
     end_px: PointPx,
   ) -> Option<Element> {
-    let style = self.tool_style(EditorTool::Rectangle);
-    let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
-    let rect = RectPx::from_points(start_px, end_px);
-    let minimum = minimum_geometry_extent(style.width_px).ok()?;
-    if rect.width() < minimum || rect.height() < minimum {
-      return None;
-    }
-    let text_style =
-      TextStyle::mvp(style.color_rgba.contrasting_text(), style.font_size_px).ok()?;
+    let minimum = minimum_geometry_extent(self.tool_style(EditorTool::Rectangle).width_px).ok()?;
+    let end_px = PointPx::new(
+      coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0),
+      coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0),
+    );
+    let payload = self.rectangle_payload(start_px, end_px)?;
     Element::new(
       ElementId::new(),
       document.elements.len() as i64,
-      ElementPayload::Rectangle(RectanglePayload {
-        start_px,
-        end_px,
-        stroke_style,
-        fill_rgba: None,
-        label: RectangleLabel {
-          text: DEFAULT_RECTANGLE_LABEL.to_owned(),
-          placement_preference: LabelPlacementPreference::Above,
-          max_width_px: 420.0,
-          padding_px: 8.0,
-          anchor_offset_px: 8.0,
-          text_style,
-        },
-      }),
+      ElementPayload::Rectangle(payload),
       document.canvas_size_px,
     )
     .ok()
+  }
+
+  fn make_rectangle_preview(
+    &self,
+    document: &BoardDocument,
+    start_px: PointPx,
+    end_px: PointPx,
+  ) -> Option<Element> {
+    let payload = self.rectangle_payload(start_px, end_px)?;
+    let body = RectPx::from_points(start_px, end_px);
+    let minimum = minimum_geometry_extent(payload.stroke_style.width_px).ok()?;
+    let mut element = Element {
+      element_id: ElementId::new(),
+      z_index: document.elements.len() as i64,
+      bounds_px: RectPx::from_min_max(PointPx::ZERO, PointPx::ZERO),
+      payload: ElementPayload::Rectangle(payload),
+    };
+    element.refresh_bounds(document.canvas_size_px).ok()?;
+    if body.width() >= minimum && body.height() >= minimum {
+      element.constrain_to_canvas(document.canvas_size_px, true).ok()?;
+    }
+    Some(element)
+  }
+
+  fn rectangle_payload(&self, start_px: PointPx, end_px: PointPx) -> Option<RectanglePayload> {
+    let style = self.tool_style(EditorTool::Rectangle);
+    let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
+    let text_style =
+      TextStyle::mvp(style.color_rgba.contrasting_text(), style.font_size_px).ok()?;
+    Some(RectanglePayload {
+      start_px,
+      end_px,
+      stroke_style,
+      fill_rgba: None,
+      label: RectangleLabel {
+        text: DEFAULT_RECTANGLE_LABEL.to_owned(),
+        placement_preference: LabelPlacementPreference::Above,
+        max_width_px: 420.0,
+        padding_px: 8.0,
+        anchor_offset_px: 8.0,
+        text_style,
+      },
+    })
   }
 
   fn make_arrow(
@@ -751,18 +820,44 @@ impl EditorController {
     end_px: PointPx,
   ) -> Option<Element> {
     let style = self.tool_style(EditorTool::Arrow);
-    let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
-    let head = ArrowHead::for_stroke_width(style.width_px).ok()?;
-    if start_px.distance_to(end_px) < head.min_body_length_px {
-      return None;
-    }
+    let minimum = ArrowHead::for_stroke_width(style.width_px).ok()?.min_body_length_px;
+    let end_px = point_at_minimum_distance(start_px, end_px, minimum, PointPx::new(1.0, 0.0));
+    let payload = self.arrow_payload(start_px, end_px)?;
     Element::new(
       ElementId::new(),
       document.elements.len() as i64,
-      ElementPayload::Arrow(ArrowPayload { start_px, end_px, stroke_style, head }),
+      ElementPayload::Arrow(payload),
       document.canvas_size_px,
     )
     .ok()
+  }
+
+  fn make_arrow_preview(
+    &self,
+    document: &BoardDocument,
+    start_px: PointPx,
+    end_px: PointPx,
+  ) -> Option<Element> {
+    let payload = self.arrow_payload(start_px, end_px)?;
+    let meets_minimum = start_px.distance_to(end_px) >= payload.head.min_body_length_px;
+    let mut element = Element {
+      element_id: ElementId::new(),
+      z_index: document.elements.len() as i64,
+      bounds_px: RectPx::from_min_max(PointPx::ZERO, PointPx::ZERO),
+      payload: ElementPayload::Arrow(payload),
+    };
+    element.refresh_bounds(document.canvas_size_px).ok()?;
+    if meets_minimum {
+      element.constrain_to_canvas(document.canvas_size_px, true).ok()?;
+    }
+    Some(element)
+  }
+
+  fn arrow_payload(&self, start_px: PointPx, end_px: PointPx) -> Option<ArrowPayload> {
+    let style = self.tool_style(EditorTool::Arrow);
+    let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
+    let head = ArrowHead::for_stroke_width(style.width_px).ok()?;
+    Some(ArrowPayload { start_px, end_px, stroke_style, head })
   }
 
   fn make_stroke(&self, document: &BoardDocument, points: &[PointPx]) -> Option<Element> {
@@ -1246,7 +1341,18 @@ impl EditorController {
     document: &BoardDocument,
   ) {
     let painter = painter.with_clip_rect(transform.canvas_rect());
+    let interaction_preview = self
+      .interaction
+      .as_ref()
+      .and_then(|interaction| interaction_preview_element(interaction, document));
+    let preview_element = interaction_preview.as_ref().or(self.released_preview_element.as_ref());
     for element in &document.elements {
+      if let Some(preview) = preview_element
+        && preview.element_id == element.element_id
+      {
+        paint_element(&painter, &transform, preview, 1.0);
+        continue;
+      }
       match self.text_editing.as_ref().map(|editing| &editing.target) {
         Some(TextTarget::ExistingText { element_id }) if *element_id == element.element_id => {}
         Some(TextTarget::RectangleLabel { element_id }) if *element_id == element.element_id => {
@@ -1259,6 +1365,11 @@ impl EditorController {
         }
         _ => paint_element(&painter, &transform, element, 1.0),
       }
+    }
+    if let Some(preview) = preview_element
+      && document.element(preview.element_id).is_none()
+    {
+      paint_element(&painter, &transform, preview, 1.0);
     }
   }
 
@@ -1274,21 +1385,13 @@ impl EditorController {
     match interaction {
       PointerInteraction::Draw { tool, start, current, points } => match tool {
         EditorTool::Rectangle => {
-          if let Some(element) = self.make_rectangle(document, *start, *current) {
+          if let Some(element) = self.make_rectangle_preview(document, *start, *current) {
             paint_element(painter, &transform, &element, 0.72);
           }
         }
         EditorTool::Arrow => {
-          if let Some(element) = self.make_arrow(document, *start, *current) {
+          if let Some(element) = self.make_arrow_preview(document, *start, *current) {
             paint_element(painter, &transform, &element, 0.72);
-          } else {
-            paint_raw_polyline(
-              painter,
-              &transform,
-              &[*start, *current],
-              self.tool_style(EditorTool::Arrow).color_rgba,
-              self.tool_style(EditorTool::Arrow).width_px,
-            );
           }
         }
         EditorTool::Stroke => paint_raw_polyline(
@@ -1300,39 +1403,9 @@ impl EditorController {
         ),
         EditorTool::Select | EditorTool::Text | EditorTool::Sequence => {}
       },
-      PointerInteraction::Move { element_id, start, current } => {
-        if let Some(element) = document.element(*element_id) {
-          let mut preview = element.clone();
-          if preview.move_by(*current - *start, document.canvas_size_px).is_ok() {
-            paint_element(painter, &transform, &preview, 0.64);
-          }
-        }
-      }
-      PointerInteraction::ResizeRectangle { element_id, handle, original, current } => {
-        if let Some(element) = document.element(*element_id) {
-          let mut preview = element.clone();
-          if let ElementPayload::Rectangle(payload) = &mut preview.payload {
-            (payload.start_px, payload.end_px) = resized_rectangle(*original, *handle, *current);
-            if preview.refresh_bounds(document.canvas_size_px).is_ok() {
-              paint_element(painter, &transform, &preview, 0.7);
-            }
-          }
-        }
-      }
-      PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current } => {
-        if let Some(element) = document.element(*element_id) {
-          let mut preview = element.clone();
-          if let ElementPayload::Arrow(payload) = &mut preview.payload {
-            match endpoint {
-              ArrowEndpoint::Start => payload.start_px = *current,
-              ArrowEndpoint::End => payload.end_px = *current,
-            }
-            if preview.refresh_bounds(document.canvas_size_px).is_ok() {
-              paint_element(painter, &transform, &preview, 0.7);
-            }
-          }
-        }
-      }
+      PointerInteraction::Move { .. }
+      | PointerInteraction::ResizeRectangle { .. }
+      | PointerInteraction::UpdateArrowEndpoint { .. } => {}
     }
   }
 
@@ -1345,16 +1418,18 @@ impl EditorController {
     let Some(element_id) = self.selected_element_id else {
       return;
     };
-    let Some(element) = document.element(element_id) else {
+    let interaction_preview = self
+      .interaction
+      .as_ref()
+      .and_then(|interaction| interaction_preview_element(interaction, document));
+    let preview_element = interaction_preview.as_ref().or(self.released_preview_element.as_ref());
+    let Some(element) = preview_element
+      .filter(|element| element.element_id == element_id)
+      .or_else(|| document.element(element_id))
+    else {
       return;
     };
-    let mut bounds = element.bounds_px;
-    if let Some(PointerInteraction::Move { element_id: moving, start, current }) = &self.interaction
-      && *moving == element_id
-    {
-      bounds = bounds.translated(*current - *start);
-    }
-    let rect = transform.document_rect_to_egui(bounds).expand(3.0);
+    let rect = transform.document_rect_to_egui(element.bounds_px).expand(3.0);
     painter.rect_stroke(
       rect,
       egui::CornerRadius::ZERO,
@@ -1494,6 +1569,157 @@ fn resized_rectangle(
     RectangleHandle::Left => minimum.x_px = current.x_px,
   }
   (minimum, maximum)
+}
+
+fn interaction_preview_element(
+  interaction: &PointerInteraction,
+  document: &BoardDocument,
+) -> Option<Element> {
+  match interaction {
+    PointerInteraction::Draw { .. } => None,
+    PointerInteraction::Move { element_id, start, current } => {
+      let mut preview = document.element(*element_id)?.clone();
+      preview.move_by(*current - *start, document.canvas_size_px).ok()?;
+      Some(preview)
+    }
+    PointerInteraction::ResizeRectangle { element_id, handle, original, current } => {
+      let mut preview = document.element(*element_id)?.clone();
+      let meets_minimum = {
+        let ElementPayload::Rectangle(payload) = &mut preview.payload else {
+          return None;
+        };
+        (payload.start_px, payload.end_px) = resized_rectangle(*original, *handle, *current);
+        let body = RectPx::from_points(payload.start_px, payload.end_px);
+        minimum_geometry_extent(payload.stroke_style.width_px)
+          .is_ok_and(|minimum| body.width() >= minimum && body.height() >= minimum)
+      };
+      preview.refresh_bounds(document.canvas_size_px).ok()?;
+      if meets_minimum {
+        preview.constrain_to_canvas(document.canvas_size_px, true).ok()?;
+      }
+      Some(preview)
+    }
+    PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current } => {
+      let mut preview = document.element(*element_id)?.clone();
+      let meets_minimum = {
+        let ElementPayload::Arrow(payload) = &mut preview.payload else {
+          return None;
+        };
+        match endpoint {
+          ArrowEndpoint::Start => payload.start_px = *current,
+          ArrowEndpoint::End => payload.end_px = *current,
+        }
+        payload.start_px.distance_to(payload.end_px) >= payload.head.min_body_length_px
+      };
+      preview.refresh_bounds(document.canvas_size_px).ok()?;
+      if meets_minimum {
+        preview.constrain_to_canvas(document.canvas_size_px, true).ok()?;
+      }
+      Some(preview)
+    }
+  }
+}
+
+fn minimum_resized_rectangle(
+  original: RectPx,
+  handle: RectangleHandle,
+  current: PointPx,
+  minimum: f32,
+) -> (PointPx, PointPx) {
+  let (mut start_px, mut end_px) = resized_rectangle(original, handle, current);
+  match handle {
+    RectangleHandle::TopLeft => {
+      start_px.x_px = coordinate_at_minimum(end_px.x_px, start_px.x_px, minimum, -1.0);
+      start_px.y_px = coordinate_at_minimum(end_px.y_px, start_px.y_px, minimum, -1.0);
+    }
+    RectangleHandle::Top => {
+      start_px.y_px = coordinate_at_minimum(end_px.y_px, start_px.y_px, minimum, -1.0);
+    }
+    RectangleHandle::TopRight => {
+      end_px.x_px = coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0);
+      start_px.y_px = coordinate_at_minimum(end_px.y_px, start_px.y_px, minimum, -1.0);
+    }
+    RectangleHandle::Right => {
+      end_px.x_px = coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0);
+    }
+    RectangleHandle::BottomRight => {
+      end_px.x_px = coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0);
+      end_px.y_px = coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0);
+    }
+    RectangleHandle::Bottom => {
+      end_px.y_px = coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0);
+    }
+    RectangleHandle::BottomLeft => {
+      start_px.x_px = coordinate_at_minimum(end_px.x_px, start_px.x_px, minimum, -1.0);
+      end_px.y_px = coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0);
+    }
+    RectangleHandle::Left => {
+      start_px.x_px = coordinate_at_minimum(end_px.x_px, start_px.x_px, minimum, -1.0);
+    }
+  }
+  (start_px, end_px)
+}
+
+fn coordinate_at_minimum(fixed: f32, requested: f32, minimum: f32, fallback_direction: f32) -> f32 {
+  let offset = requested - fixed;
+  if offset.abs() >= minimum {
+    requested
+  } else if offset.abs() > f32::EPSILON {
+    fixed + offset.signum() * minimum
+  } else {
+    fixed + fallback_direction * minimum
+  }
+}
+
+fn point_at_minimum_distance(
+  fixed_px: PointPx,
+  requested_px: PointPx,
+  minimum: f32,
+  fallback_direction: PointPx,
+) -> PointPx {
+  let requested_direction = requested_px - fixed_px;
+  let requested_length = requested_px.distance_to(fixed_px);
+  if requested_length >= minimum {
+    return requested_px;
+  }
+
+  let fallback_length = fallback_direction.distance_to(PointPx::ZERO);
+  let (direction, direction_length) = if requested_length > f32::EPSILON {
+    (requested_direction, requested_length)
+  } else if fallback_length > f32::EPSILON {
+    (fallback_direction, fallback_length)
+  } else {
+    (PointPx::new(1.0, 0.0), 1.0)
+  };
+  let coordinate_scale = fixed_px
+    .x_px
+    .abs()
+    .max(fixed_px.y_px.abs())
+    .max(requested_px.x_px.abs())
+    .max(requested_px.y_px.abs())
+    .max(minimum)
+    .max(1.0);
+  let target_distance =
+    minimum + coordinate_scale * f32::EPSILON * MINIMUM_DISTANCE_ROUNDING_FACTOR;
+  let scale = target_distance / direction_length;
+  PointPx::new(fixed_px.x_px + direction.x_px * scale, fixed_px.y_px + direction.y_px * scale)
+}
+
+fn clamped_arrow_endpoint(
+  payload: &ArrowPayload,
+  endpoint: ArrowEndpoint,
+  requested_px: PointPx,
+) -> PointPx {
+  let (original_px, fixed_px) = match endpoint {
+    ArrowEndpoint::Start => (payload.start_px, payload.end_px),
+    ArrowEndpoint::End => (payload.end_px, payload.start_px),
+  };
+  point_at_minimum_distance(
+    fixed_px,
+    requested_px,
+    payload.head.min_body_length_px,
+    original_px - fixed_px,
+  )
 }
 
 fn map_shortcut(key: Key, modifiers: Modifiers, text_editing: bool) -> Option<ShortcutAction> {
@@ -1724,6 +1950,16 @@ fn command_action(command: DocumentCommand) -> EditorAction {
   EditorAction::Command(CommandBatch::single(command))
 }
 
+fn preview_element_after_batch(
+  document: &BoardDocument,
+  batch: &CommandBatch,
+  element_id: ElementId,
+) -> Option<Element> {
+  let mut staged = document.clone();
+  batch.clone().apply(&mut staged).ok()?;
+  staged.element(element_id).cloned()
+}
+
 fn contains(rect: RectPx, point: PointPx) -> bool {
   point.x_px >= rect.min.x_px
     && point.y_px >= rect.min.y_px
@@ -1909,6 +2145,820 @@ mod tests {
       document.canvas_size_px,
     )
     .unwrap()
+  }
+
+  fn arrow(document: &BoardDocument, z_index: i64, start: PointPx, end: PointPx) -> Element {
+    let stroke_style = StrokeStyle::default();
+    let head = ArrowHead::for_stroke_width(stroke_style.width_px).unwrap();
+    Element::new(
+      ElementId::new(),
+      z_index,
+      ElementPayload::Arrow(ArrowPayload { start_px: start, end_px: end, stroke_style, head }),
+      document.canvas_size_px,
+    )
+    .unwrap()
+  }
+
+  fn stroke(document: &BoardDocument, z_index: i64) -> Element {
+    let payload = StrokePayload::from_raw_points(
+      &[PointPx::new(60.0, 70.0), PointPx::new(150.0, 95.0)],
+      StrokeStyle::default(),
+    )
+    .unwrap();
+    Element::new(
+      ElementId::new(),
+      z_index,
+      ElementPayload::Stroke(payload),
+      document.canvas_size_px,
+    )
+    .unwrap()
+  }
+
+  fn sequence_marker(document: &BoardDocument, z_index: i64) -> Element {
+    let fill_rgba = ColorRgba::BLUE;
+    Element::new(
+      ElementId::new(),
+      z_index,
+      ElementPayload::SequenceMarker(SequenceMarkerPayload {
+        center_px: PointPx::new(150.0, 100.0),
+        number: 1,
+        radius_px: 18.0,
+        pill_width_px: 44.0,
+        fill_rgba,
+        stroke_style: StrokeStyle::mvp(fill_rgba, 8.0).unwrap(),
+        text_style: TextStyle::mvp(fill_rgba.contrasting_text(), 24.0).unwrap(),
+      }),
+      document.canvas_size_px,
+    )
+    .unwrap()
+  }
+
+  fn paint_canvas_output(
+    controller: &EditorController,
+    document: &BoardDocument,
+  ) -> egui::FullOutput {
+    paint_canvas_output_with_context(controller, document).1
+  }
+
+  fn paint_canvas_output_with_context(
+    controller: &EditorController,
+    document: &BoardDocument,
+  ) -> (egui::Context, egui::FullOutput) {
+    let context = egui::Context::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0));
+    let transform = CanvasTransform::fit(document.canvas_size_px, viewport).unwrap();
+    let output = context.run_ui(raw_input(Vec::new(), viewport.size()), |ui| {
+      controller.paint_document_for_editing(ui.painter(), transform, document);
+      controller.paint_interaction(ui.painter(), transform, document);
+    });
+    (context, output)
+  }
+
+  fn paint_selection_output(
+    controller: &EditorController,
+    document: &BoardDocument,
+  ) -> egui::FullOutput {
+    let context = egui::Context::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0));
+    let transform = CanvasTransform::fit(document.canvas_size_px, viewport).unwrap();
+    context.run_ui(raw_input(Vec::new(), viewport.size()), |ui| {
+      controller.paint_selection(ui.painter(), transform, document);
+    })
+  }
+
+  fn painted_shape_rects(output: &egui::FullOutput) -> Vec<Rect> {
+    output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect()
+  }
+
+  fn assert_point_close(actual: PointPx, expected: PointPx) {
+    assert!(
+      (actual.x_px - expected.x_px).abs() < 0.001,
+      "actual={actual:?}, expected={expected:?}"
+    );
+    assert!(
+      (actual.y_px - expected.y_px).abs() < 0.001,
+      "actual={actual:?}, expected={expected:?}"
+    );
+  }
+
+  fn assert_paint_shapes_are_finite(output: &egui::FullOutput) {
+    assert!(!output.shapes.is_empty(), "expected the interaction preview to paint");
+    for shape in &output.shapes {
+      let bounds = shape.shape.visual_bounding_rect();
+      assert!(
+        bounds.min.x.is_finite()
+          && bounds.min.y.is_finite()
+          && bounds.max.x.is_finite()
+          && bounds.max.y.is_finite(),
+        "non-finite painted bounds: {bounds:?}"
+      );
+    }
+  }
+
+  fn assert_tessellated_meshes_are_finite(context: &egui::Context, output: &egui::FullOutput) {
+    for clipped in context.tessellate(output.shapes.clone(), output.pixels_per_point) {
+      let egui::epaint::Primitive::Mesh(mesh) = clipped.primitive else {
+        continue;
+      };
+      for vertex in mesh.vertices {
+        assert!(
+          vertex.pos.x.is_finite()
+            && vertex.pos.y.is_finite()
+            && vertex.uv.x.is_finite()
+            && vertex.uv.y.is_finite(),
+          "non-finite tessellated vertex: {vertex:?}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn moving_each_element_kind_replaces_the_original_paint() {
+    let template = document();
+    let elements = vec![
+      stroke(&template, 0),
+      arrow(&template, 0, PointPx::new(70.0, 110.0), PointPx::new(170.0, 110.0)),
+      rectangle(&template, 0, PointPx::new(80.0, 80.0), PointPx::new(180.0, 155.0)),
+      text_element(&template, PointPx::new(80.0, 80.0), "move", 120.0),
+      sequence_marker(&template, 0),
+    ];
+    let start = PointPx::new(100.0, 100.0);
+    let current = PointPx::new(120.0, 110.0);
+
+    for element in elements {
+      let kind = element.kind();
+      let element_id = element.element_id;
+      let original_bounds = element.bounds_px;
+      let mut document = document();
+      document.elements.push(element);
+      let baseline = paint_canvas_output(&EditorController::default(), &document);
+      let baseline_shape_count = baseline.shapes.len();
+      let baseline_rects =
+        baseline.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+      baseline.drop_without_applying_deltas();
+
+      let interaction = PointerInteraction::Move { element_id, start, current };
+      let preview = interaction_preview_element(&interaction, &document).unwrap();
+      assert_ne!(preview.bounds_px, original_bounds, "kind={kind:?}");
+      let controller = EditorController { interaction: Some(interaction), ..Default::default() };
+      let output = paint_canvas_output(&controller, &document);
+      assert_eq!(output.shapes.len(), baseline_shape_count, "kind={kind:?}");
+      let preview_rects =
+        output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+      assert_ne!(preview_rects, baseline_rects, "kind={kind:?}");
+      for shape in &output.shapes {
+        if let egui::Shape::LineSegment { stroke, .. } = &shape.shape {
+          assert_eq!(stroke.color.a(), u8::MAX, "kind={kind:?}");
+        }
+      }
+      output.drop_without_applying_deltas();
+
+      let mut applied = document.clone();
+      DocumentCommand::MoveElement { element_id, delta_px: current - start }
+        .apply(&mut applied)
+        .unwrap();
+      assert_eq!(applied.element(element_id), Some(&preview), "kind={kind:?}");
+    }
+  }
+
+  #[test]
+  fn release_frame_paints_the_committed_selection_transform() {
+    let cases = [
+      {
+        let mut document = document();
+        let element = rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(180.0, 155.0));
+        let element_id = element.element_id;
+        document.elements.push(element);
+        (
+          "move",
+          document,
+          PointerInteraction::Move {
+            element_id,
+            start: PointPx::new(100.0, 100.0),
+            current: PointPx::new(132.0, 118.0),
+          },
+          element_id,
+        )
+      },
+      {
+        let mut document = document();
+        let element = rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(180.0, 155.0));
+        let element_id = element.element_id;
+        let ElementPayload::Rectangle(payload) = &element.payload else {
+          unreachable!();
+        };
+        let original = RectPx::from_points(payload.start_px, payload.end_px);
+        document.elements.push(element);
+        (
+          "resize rectangle",
+          document,
+          PointerInteraction::ResizeRectangle {
+            element_id,
+            handle: RectangleHandle::BottomRight,
+            original,
+            current: PointPx::new(230.0, 178.0),
+          },
+          element_id,
+        )
+      },
+      {
+        let mut document = document();
+        let element = arrow(&document, 0, PointPx::new(70.0, 110.0), PointPx::new(170.0, 110.0));
+        let element_id = element.element_id;
+        document.elements.push(element);
+        (
+          "update arrow endpoint",
+          document,
+          PointerInteraction::UpdateArrowEndpoint {
+            element_id,
+            endpoint: ArrowEndpoint::End,
+            current: PointPx::new(210.0, 150.0),
+          },
+          element_id,
+        )
+      },
+    ];
+
+    for (case, document, interaction, element_id) in cases {
+      let baseline_output = paint_canvas_output(&EditorController::default(), &document);
+      let baseline_rects = painted_shape_rects(&baseline_output);
+      baseline_output.drop_without_applying_deltas();
+
+      let mut controller = EditorController {
+        selected_element_id: Some(element_id),
+        interaction: Some(interaction),
+        ..Default::default()
+      };
+      let mut actions = Vec::new();
+      controller.finish_pointer_interaction(&document, &mut actions);
+      assert!(controller.interaction.is_none(), "case={case}");
+      assert!(
+        controller.released_preview_element.is_some(),
+        "case={case} should keep the final element for release-frame painting"
+      );
+
+      let release_output = paint_canvas_output(&controller, &document);
+      let release_rects = painted_shape_rects(&release_output);
+      release_output.drop_without_applying_deltas();
+      assert_ne!(release_rects, baseline_rects, "case={case}");
+
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one command for {case}, got {actions:?}");
+      };
+      let mut committed_document = document.clone();
+      batch.clone().apply(&mut committed_document).unwrap();
+      let committed_output = paint_canvas_output(&EditorController::default(), &committed_document);
+      let committed_rects = painted_shape_rects(&committed_output);
+      committed_output.drop_without_applying_deltas();
+
+      assert_eq!(release_rects, committed_rects, "case={case}");
+    }
+  }
+
+  #[test]
+  fn new_rectangle_shows_raw_undersized_geometry_then_adds_minimum_size() {
+    let document = document();
+    let preview_controller = EditorController::default();
+    let minimum =
+      minimum_geometry_extent(preview_controller.tool_style(EditorTool::Rectangle).width_px)
+        .unwrap();
+    let start = PointPx::new(200.0, 100.0);
+    let cases = [
+      ("zero", start),
+      ("small", PointPx::new(start.x_px + minimum / 4.0, start.y_px + minimum / 3.0)),
+      ("reverse", PointPx::new(start.x_px - minimum / 4.0, start.y_px - minimum / 3.0)),
+    ];
+
+    for (case, requested) in cases {
+      let preview = preview_controller.make_rectangle_preview(&document, start, requested).unwrap();
+      let ElementPayload::Rectangle(preview_payload) = &preview.payload else {
+        unreachable!();
+      };
+      assert_eq!(preview_payload.start_px, start, "case={case}");
+      assert_eq!(preview_payload.end_px, requested, "case={case}");
+      assert_eq!(preview_payload.label.text, DEFAULT_RECTANGLE_LABEL, "case={case}");
+      let raw = RectPx::from_points(preview_payload.start_px, preview_payload.end_px);
+      assert!(raw.width() < minimum && raw.height() < minimum, "case={case}");
+      preview.bounds_px.validate().unwrap();
+      assert!(preview.validate(document.canvas_size_px).is_err(), "case={case}");
+
+      let interaction = PointerInteraction::Draw {
+        tool: EditorTool::Rectangle,
+        start,
+        current: requested,
+        points: vec![start, requested],
+      };
+      let mut controller =
+        EditorController { interaction: Some(interaction), ..Default::default() };
+      let (context, output) = paint_canvas_output_with_context(&controller, &document);
+      assert_paint_shapes_are_finite(&output);
+      assert_tessellated_meshes_are_finite(&context, &output);
+      output.drop_without_applying_deltas();
+
+      let mut actions = Vec::new();
+      controller.finish_pointer_interaction(&document, &mut actions);
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one added rectangle for {case}, got {actions:?}");
+      };
+      let [DocumentCommand::AddElement { element }] = batch.commands() else {
+        panic!("expected AddElement for {case}");
+      };
+      let committed = element.clone();
+      let ElementPayload::Rectangle(committed_payload) = &committed.payload else {
+        unreachable!();
+      };
+      let committed_body =
+        RectPx::from_points(committed_payload.start_px, committed_payload.end_px);
+      assert!((committed_body.width() - minimum).abs() < 0.001, "case={case}");
+      assert!((committed_body.height() - minimum).abs() < 0.001, "case={case}");
+      let expected_x_direction = if requested.x_px < start.x_px { -1.0 } else { 1.0 };
+      let expected_y_direction = if requested.y_px < start.y_px { -1.0 } else { 1.0 };
+      assert_eq!(
+        (committed_payload.end_px.x_px - start.x_px).signum(),
+        expected_x_direction,
+        "case={case}"
+      );
+      assert_eq!(
+        (committed_payload.end_px.y_px - start.y_px).signum(),
+        expected_y_direction,
+        "case={case}"
+      );
+      committed.validate(document.canvas_size_px).unwrap();
+
+      let mut applied = document.clone();
+      batch.clone().apply(&mut applied).unwrap();
+      assert_eq!(applied.elements, vec![committed], "case={case}");
+    }
+  }
+
+  #[test]
+  fn new_arrow_shows_raw_undersized_geometry_then_adds_minimum_length() {
+    let document = document();
+    let preview_controller = EditorController::default();
+    let style = preview_controller.tool_style(EditorTool::Arrow);
+    let minimum = ArrowHead::for_stroke_width(style.width_px).unwrap().min_body_length_px;
+    let start = PointPx::new(200.0, 100.0);
+    let cases = [
+      ("zero", start),
+      ("small", PointPx::new(start.x_px + minimum / 4.0, start.y_px + minimum / 5.0)),
+      ("reverse", PointPx::new(start.x_px - minimum / 4.0, start.y_px - minimum / 5.0)),
+    ];
+
+    for (case, requested) in cases {
+      let preview = preview_controller.make_arrow_preview(&document, start, requested).unwrap();
+      let ElementPayload::Arrow(preview_payload) = &preview.payload else {
+        unreachable!();
+      };
+      assert_eq!(preview_payload.start_px, start, "case={case}");
+      assert_eq!(preview_payload.end_px, requested, "case={case}");
+      assert!(
+        preview_payload.start_px.distance_to(preview_payload.end_px) < minimum,
+        "case={case}"
+      );
+      assert!(preview_payload.start_px.is_finite(), "case={case}");
+      assert!(preview_payload.end_px.is_finite(), "case={case}");
+      preview.bounds_px.validate().unwrap();
+      assert!(preview.validate(document.canvas_size_px).is_err(), "case={case}");
+
+      let interaction = PointerInteraction::Draw {
+        tool: EditorTool::Arrow,
+        start,
+        current: requested,
+        points: vec![start, requested],
+      };
+      let mut controller =
+        EditorController { interaction: Some(interaction), ..Default::default() };
+      let (context, output) = paint_canvas_output_with_context(&controller, &document);
+      assert_paint_shapes_are_finite(&output);
+      assert_tessellated_meshes_are_finite(&context, &output);
+      output.drop_without_applying_deltas();
+
+      let mut actions = Vec::new();
+      controller.finish_pointer_interaction(&document, &mut actions);
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one added arrow for {case}, got {actions:?}");
+      };
+      let [DocumentCommand::AddElement { element }] = batch.commands() else {
+        panic!("expected AddElement for {case}");
+      };
+      let committed = element.clone();
+      let ElementPayload::Arrow(committed_payload) = &committed.payload else {
+        unreachable!();
+      };
+      let committed_offset = committed_payload.end_px - committed_payload.start_px;
+      let committed_length = committed_payload.start_px.distance_to(committed_payload.end_px);
+      assert!((committed_length - minimum).abs() < 0.001, "case={case}");
+      let requested_offset = requested - start;
+      let requested_length = start.distance_to(requested);
+      if requested_length <= f32::EPSILON {
+        assert_point_close(
+          committed_payload.end_px,
+          PointPx::new(start.x_px + minimum, start.y_px),
+        );
+      } else {
+        let cross = committed_offset.x_px * requested_offset.y_px
+          - committed_offset.y_px * requested_offset.x_px;
+        let dot = committed_offset.x_px * requested_offset.x_px
+          + committed_offset.y_px * requested_offset.y_px;
+        assert!(cross.abs() < 0.001, "case={case}, cross={cross}");
+        assert!(dot > 0.0, "case={case}, dot={dot}");
+      }
+      committed.validate(document.canvas_size_px).unwrap();
+
+      let mut applied = document.clone();
+      batch.clone().apply(&mut applied).unwrap();
+      assert_eq!(applied.elements, vec![committed], "case={case}");
+    }
+  }
+
+  #[test]
+  fn high_coordinate_new_arrow_release_still_reaches_the_minimum_length() {
+    let document = document_with_size(SizePx::new(8_192, 8_192));
+    let controller = EditorController::default();
+    let start = PointPx::new(8_000.0, 8_000.0);
+    let requested = start + PointPx::new(5.0, 3.0);
+
+    let element = controller.make_arrow(&document, start, requested).unwrap();
+
+    let ElementPayload::Arrow(payload) = &element.payload else {
+      unreachable!();
+    };
+    let length = payload.start_px.distance_to(payload.end_px);
+    assert!(length >= payload.head.min_body_length_px);
+    assert!(length - payload.head.min_body_length_px < 0.01);
+    element.validate(document.canvas_size_px).unwrap();
+  }
+
+  #[test]
+  fn rectangle_resize_shows_raw_size_then_clamps_on_release() {
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(200.0, 160.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let original = RectPx::from_points(payload.start_px, payload.end_px);
+    let minimum = minimum_geometry_extent(payload.stroke_style.width_px).unwrap();
+    document.elements.push(element);
+    let baseline = paint_canvas_output(&EditorController::default(), &document);
+    let baseline_shape_count = baseline.shapes.len();
+    let baseline_rects =
+      baseline.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+    baseline.drop_without_applying_deltas();
+
+    let undersized_interactions = [
+      (RectangleHandle::TopLeft, original.max),
+      (RectangleHandle::Top, PointPx::new(original.center().x_px, original.max.y_px)),
+      (RectangleHandle::TopRight, PointPx::new(original.min.x_px, original.max.y_px)),
+      (RectangleHandle::Right, PointPx::new(original.min.x_px, original.center().y_px)),
+      (RectangleHandle::BottomRight, original.min),
+      (RectangleHandle::Bottom, PointPx::new(original.center().x_px, original.min.y_px)),
+      (RectangleHandle::BottomLeft, PointPx::new(original.max.x_px, original.min.y_px)),
+      (RectangleHandle::Left, PointPx::new(original.max.x_px, original.center().y_px)),
+    ];
+
+    for (handle, current) in undersized_interactions {
+      let interaction =
+        PointerInteraction::ResizeRectangle { element_id, handle, original, current };
+      let preview = interaction_preview_element(&interaction, &document).unwrap();
+      let ElementPayload::Rectangle(preview_payload) = &preview.payload else {
+        unreachable!();
+      };
+      let raw = RectPx::from_points(preview_payload.start_px, preview_payload.end_px);
+      assert!(raw.width() < minimum || raw.height() < minimum, "handle={handle:?}");
+      assert!(preview.validate(document.canvas_size_px).is_err());
+      let mut controller =
+        EditorController { interaction: Some(interaction), ..Default::default() };
+      let output = paint_canvas_output(&controller, &document);
+      assert_eq!(output.shapes.len(), baseline_shape_count, "handle={handle:?}");
+      let painted_rects =
+        output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+      assert_ne!(painted_rects, baseline_rects, "handle={handle:?}");
+      output.drop_without_applying_deltas();
+      let mut actions = Vec::new();
+      controller.finish_pointer_interaction(&document, &mut actions);
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one rectangle command for {handle:?}, got {actions:?}");
+      };
+      let [DocumentCommand::ResizeRectangle { start_px, end_px, .. }] = batch.commands() else {
+        panic!("expected rectangle resize for {handle:?}");
+      };
+      let committed = RectPx::from_points(*start_px, *end_px);
+      assert!(committed.width() >= minimum, "handle={handle:?}");
+      assert!(committed.height() >= minimum, "handle={handle:?}");
+      if raw.width() < minimum {
+        assert!((committed.width() - minimum).abs() < 0.001, "handle={handle:?}");
+      }
+      if raw.height() < minimum {
+        assert!((committed.height() - minimum).abs() < 0.001, "handle={handle:?}");
+      }
+      let mut applied = document.clone();
+      batch.clone().apply(&mut applied).unwrap();
+      applied.element(element_id).unwrap().validate(applied.canvas_size_px).unwrap();
+    }
+
+    let crossing_current = PointPx::new(original.min.x_px - minimum - 5.0, original.center().y_px);
+    let interaction = PointerInteraction::ResizeRectangle {
+      element_id,
+      handle: RectangleHandle::Right,
+      original,
+      current: crossing_current,
+    };
+    let preview = interaction_preview_element(&interaction, &document).unwrap();
+    let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
+    let output = paint_canvas_output(&controller, &document);
+    assert_eq!(output.shapes.len(), baseline_shape_count);
+    let preview_rects =
+      output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+    assert_ne!(preview_rects, baseline_rects);
+    output.drop_without_applying_deltas();
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one rectangle command, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::ResizeRectangle { start_px, end_px, .. }]
+        if *start_px == original.min
+          && *end_px == PointPx::new(crossing_current.x_px, original.max.y_px)
+    ));
+    let mut applied = document.clone();
+    batch.clone().apply(&mut applied).unwrap();
+    assert_eq!(applied.element(element_id), Some(&preview));
+  }
+
+  #[test]
+  fn arrow_endpoint_clamp_uses_requested_direction_and_original_fallback() {
+    let document = document();
+    let element = arrow(&document, 0, PointPx::new(100.0, 100.0), PointPx::new(200.0, 100.0));
+    let ElementPayload::Arrow(payload) = &element.payload else {
+      unreachable!();
+    };
+    let minimum = payload.head.min_body_length_px;
+    let cases = [
+      (ArrowEndpoint::End, PointPx::new(105.0, 100.0), PointPx::new(100.0 + minimum, 100.0)),
+      (ArrowEndpoint::Start, PointPx::new(195.0, 100.0), PointPx::new(200.0 - minimum, 100.0)),
+      (ArrowEndpoint::End, payload.start_px, PointPx::new(100.0 + minimum, 100.0)),
+      (ArrowEndpoint::Start, payload.end_px, PointPx::new(200.0 - minimum, 100.0)),
+      (ArrowEndpoint::End, PointPx::new(95.0, 100.0), PointPx::new(100.0 - minimum, 100.0)),
+      (
+        ArrowEndpoint::End,
+        PointPx::new(100.0 + minimum, 100.0),
+        PointPx::new(100.0 + minimum, 100.0),
+      ),
+      (ArrowEndpoint::End, PointPx::new(70.0, 100.0), PointPx::new(70.0, 100.0)),
+    ];
+
+    for (endpoint, requested, expected) in cases {
+      assert_point_close(clamped_arrow_endpoint(payload, endpoint, requested), expected);
+    }
+
+    let mut degenerate = payload.clone();
+    degenerate.end_px = degenerate.start_px;
+    let fallback = clamped_arrow_endpoint(&degenerate, ArrowEndpoint::End, degenerate.start_px);
+    assert!(fallback.is_finite());
+    assert_point_close(
+      fallback,
+      PointPx::new(
+        degenerate.start_px.x_px + degenerate.head.min_body_length_px,
+        degenerate.start_px.y_px,
+      ),
+    );
+  }
+
+  #[test]
+  fn arrow_shows_raw_size_then_clamps_commit_and_history() {
+    for endpoint in [ArrowEndpoint::Start, ArrowEndpoint::End] {
+      let mut document = document();
+      let element = arrow(&document, 0, PointPx::new(100.0, 100.0), PointPx::new(200.0, 100.0));
+      let original = element.clone();
+      let element_id = element.element_id;
+      let ElementPayload::Arrow(payload) = &element.payload else {
+        unreachable!();
+      };
+      let requested = match endpoint {
+        ArrowEndpoint::Start => payload.end_px,
+        ArrowEndpoint::End => payload.start_px,
+      };
+      let expected_position = clamped_arrow_endpoint(payload, endpoint, requested);
+      document.elements.push(element);
+      let interaction =
+        PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current: requested };
+      let preview = interaction_preview_element(&interaction, &document).unwrap();
+      let ElementPayload::Arrow(preview_payload) = &preview.payload else {
+        unreachable!();
+      };
+      let preview_position = match endpoint {
+        ArrowEndpoint::Start => preview_payload.start_px,
+        ArrowEndpoint::End => preview_payload.end_px,
+      };
+      assert_eq!(preview_position, requested);
+      assert!(
+        preview_payload.start_px.distance_to(preview_payload.end_px)
+          < preview_payload.head.min_body_length_px
+      );
+      assert!(preview.validate(document.canvas_size_px).is_err());
+      let baseline = paint_canvas_output(&EditorController::default(), &document);
+      let baseline_shape_count = baseline.shapes.len();
+      let baseline_rects =
+        baseline.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+      baseline.drop_without_applying_deltas();
+      let mut controller =
+        EditorController { interaction: Some(interaction), ..Default::default() };
+      let output = paint_canvas_output(&controller, &document);
+      let preview_shape_count = output.shapes.len();
+      let preview_rects =
+        output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
+      output.drop_without_applying_deltas();
+      assert_eq!(preview_shape_count + 1, baseline_shape_count, "endpoint={endpoint:?}");
+      assert_ne!(preview_rects, baseline_rects, "endpoint={endpoint:?}");
+
+      let mut actions = Vec::new();
+      controller.finish_pointer_interaction(&document, &mut actions);
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one arrow command, got {actions:?}");
+      };
+      assert!(matches!(
+        batch.commands(),
+        [DocumentCommand::UpdateArrowEndpoint {
+          endpoint: updated_endpoint,
+          position_px,
+          ..
+        }] if *updated_endpoint == endpoint && *position_px == expected_position
+      ));
+
+      let mut changed = document.clone();
+      let mut history = CommandHistory::new();
+      history.execute_batch(&mut changed, batch.clone()).unwrap();
+      let committed = changed.element(element_id).unwrap().clone();
+      let ElementPayload::Arrow(committed_payload) = &committed.payload else {
+        unreachable!();
+      };
+      assert!(
+        (committed_payload.start_px.distance_to(committed_payload.end_px)
+          - committed_payload.head.min_body_length_px)
+          .abs()
+          < 0.001
+      );
+      assert_ne!(committed, preview);
+      assert!(history.undo(&mut changed).unwrap());
+      assert_eq!(changed.element(element_id), Some(&original));
+      assert!(history.redo(&mut changed).unwrap());
+      assert_eq!(changed.element(element_id), Some(&committed));
+    }
+  }
+
+  #[test]
+  fn diagonal_arrow_endpoint_release_commits_a_valid_minimum_length() {
+    for endpoint in [ArrowEndpoint::Start, ArrowEndpoint::End] {
+      let mut document = document_with_size(SizePx::new(8_192, 8_192));
+      let element =
+        arrow(&document, 0, PointPx::new(7_900.0, 7_900.0), PointPx::new(8_000.0, 7_900.0));
+      let element_id = element.element_id;
+      let ElementPayload::Arrow(payload) = &element.payload else {
+        unreachable!();
+      };
+      let fixed_px = match endpoint {
+        ArrowEndpoint::Start => payload.end_px,
+        ArrowEndpoint::End => payload.start_px,
+      };
+      let requested = fixed_px + PointPx::new(5.0, 3.0);
+      let requested_direction = requested - fixed_px;
+      let minimum = payload.head.min_body_length_px;
+      document.elements.push(element);
+      let mut controller = EditorController {
+        interaction: Some(PointerInteraction::UpdateArrowEndpoint {
+          element_id,
+          endpoint,
+          current: requested,
+        }),
+        ..Default::default()
+      };
+      let mut actions = Vec::new();
+
+      controller.finish_pointer_interaction(&document, &mut actions);
+
+      let [EditorAction::Command(batch)] = actions.as_slice() else {
+        panic!("expected one diagonal arrow command for {endpoint:?}, got {actions:?}");
+      };
+      let mut changed = document.clone();
+      batch.clone().apply(&mut changed).unwrap();
+      let ElementPayload::Arrow(committed) = &changed.element(element_id).unwrap().payload else {
+        unreachable!();
+      };
+      let committed_position = match endpoint {
+        ArrowEndpoint::Start => committed.start_px,
+        ArrowEndpoint::End => committed.end_px,
+      };
+      let committed_direction = committed_position - fixed_px;
+      assert!(committed_position.distance_to(fixed_px) >= minimum);
+      assert!(committed_position.distance_to(fixed_px) - minimum < 0.01);
+      let cross = committed_direction.x_px * requested_direction.y_px
+        - committed_direction.y_px * requested_direction.x_px;
+      let dot = committed_direction.x_px * requested_direction.x_px
+        + committed_direction.y_px * requested_direction.y_px;
+      assert!(cross.abs() < 0.05, "endpoint={endpoint:?}, cross={cross}");
+      assert!(dot > 0.0, "endpoint={endpoint:?}, dot={dot}");
+    }
+  }
+
+  #[test]
+  fn selection_outline_and_handles_follow_the_transform_preview() {
+    let mut rectangle_document = document();
+    let rectangle =
+      rectangle(&rectangle_document, 0, PointPx::new(80.0, 80.0), PointPx::new(200.0, 150.0));
+    let rectangle_id = rectangle.element_id;
+    let ElementPayload::Rectangle(rectangle_payload) = &rectangle.payload else {
+      unreachable!();
+    };
+    let original_rectangle =
+      RectPx::from_points(rectangle_payload.start_px, rectangle_payload.end_px);
+    rectangle_document.elements.push(rectangle);
+    let rectangle_interaction = PointerInteraction::ResizeRectangle {
+      element_id: rectangle_id,
+      handle: RectangleHandle::BottomRight,
+      original: original_rectangle,
+      current: PointPx::new(260.0, 175.0),
+    };
+    let rectangle_preview =
+      interaction_preview_element(&rectangle_interaction, &rectangle_document).unwrap();
+    let rectangle_controller = EditorController {
+      selected_element_id: Some(rectangle_id),
+      interaction: Some(rectangle_interaction),
+      ..Default::default()
+    };
+    let rectangle_output = paint_selection_output(&rectangle_controller, &rectangle_document);
+    let transform = CanvasTransform::fit(
+      rectangle_document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+    let expected_outline = transform.document_rect_to_egui(rectangle_preview.bounds_px).expand(3.0);
+    let actual_outline = rectangle_output.shapes.iter().find_map(|shape| match &shape.shape {
+      egui::Shape::Rect(rectangle) => Some(rectangle.rect),
+      _ => None,
+    });
+    assert_eq!(actual_outline, Some(expected_outline));
+    let circle_centers = rectangle_output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::Circle(circle) => Some(circle.center),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let ElementPayload::Rectangle(preview_payload) = &rectangle_preview.payload else {
+      unreachable!();
+    };
+    for (_, point) in
+      rectangle_handles(RectPx::from_points(preview_payload.start_px, preview_payload.end_px))
+    {
+      let expected = transform.document_to_egui(point);
+      assert!(circle_centers.iter().any(|center| center.distance(expected) < 0.001));
+    }
+    let old_bottom_right = transform.document_to_egui(original_rectangle.max);
+    assert!(!circle_centers.iter().any(|center| center.distance(old_bottom_right) < 0.001));
+    rectangle_output.drop_without_applying_deltas();
+
+    let mut arrow_document = document();
+    let arrow = arrow(&arrow_document, 0, PointPx::new(100.0, 100.0), PointPx::new(200.0, 100.0));
+    let arrow_id = arrow.element_id;
+    let ElementPayload::Arrow(arrow_payload) = &arrow.payload else {
+      unreachable!();
+    };
+    let old_end = arrow_payload.end_px;
+    let arrow_interaction = PointerInteraction::UpdateArrowEndpoint {
+      element_id: arrow_id,
+      endpoint: ArrowEndpoint::End,
+      current: arrow_payload.start_px,
+    };
+    arrow_document.elements.push(arrow);
+    let arrow_preview = interaction_preview_element(&arrow_interaction, &arrow_document).unwrap();
+    let arrow_controller = EditorController {
+      selected_element_id: Some(arrow_id),
+      interaction: Some(arrow_interaction),
+      ..Default::default()
+    };
+    let arrow_output = paint_selection_output(&arrow_controller, &arrow_document);
+    let arrow_centers = arrow_output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::Circle(circle) => Some(circle.center),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let ElementPayload::Arrow(preview_payload) = &arrow_preview.payload else {
+      unreachable!();
+    };
+    for point in [preview_payload.start_px, preview_payload.end_px] {
+      let expected = transform.document_to_egui(point);
+      assert!(arrow_centers.iter().any(|center| center.distance(expected) < 0.001));
+    }
+    let old_end = transform.document_to_egui(old_end);
+    assert!(!arrow_centers.iter().any(|center| center.distance(old_end) < 0.001));
+    arrow_output.drop_without_applying_deltas();
   }
 
   #[test]

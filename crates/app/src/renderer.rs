@@ -165,16 +165,17 @@ fn paint_arrow(
     [transform.document_to_egui(payload.start_px), transform.document_to_egui(payload.end_px)],
     stroke,
   );
-  let [tip, left, right] = arrow_head_points(payload);
-  painter.add(Shape::convex_polygon(
-    vec![
-      transform.document_to_egui(tip),
-      transform.document_to_egui(left),
-      transform.document_to_egui(right),
-    ],
-    color,
-    Stroke::NONE,
-  ));
+  if let Some([tip, left, right]) = arrow_head_points(payload) {
+    painter.add(Shape::convex_polygon(
+      vec![
+        transform.document_to_egui(tip),
+        transform.document_to_egui(left),
+        transform.document_to_egui(right),
+      ],
+      color,
+      Stroke::NONE,
+    ));
+  }
 }
 
 fn paint_rectangle(
@@ -310,8 +311,9 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
         payload.stroke_style.width_px,
         color,
       );
-      let [tip, left, right] = arrow_head_points(payload);
-      fill_triangle(image, tip, left, right, color);
+      if let Some([tip, left, right]) = arrow_head_points(payload) {
+        fill_triangle(image, tip, left, right, color);
+      }
     }
     ElementPayload::Rectangle(payload) => {
       let color = rgba(payload.stroke_style.color_rgba);
@@ -396,10 +398,13 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
   }
 }
 
-fn arrow_head_points(payload: &ArrowPayload) -> [PointPx; 3] {
+fn arrow_head_points(payload: &ArrowPayload) -> Option<[PointPx; 3]> {
   let x = payload.end_px.x_px - payload.start_px.x_px;
   let y = payload.end_px.y_px - payload.start_px.y_px;
-  let length = x.hypot(y).max(f32::EPSILON);
+  let length = x.hypot(y);
+  if length <= f32::EPSILON {
+    return None;
+  }
   let unit = PointPx::new(x / length, y / length);
   let perpendicular = PointPx::new(-unit.y_px, unit.x_px);
   let base = PointPx::new(
@@ -407,7 +412,7 @@ fn arrow_head_points(payload: &ArrowPayload) -> [PointPx; 3] {
     payload.end_px.y_px - unit.y_px * payload.head.length_px,
   );
   let half_width = payload.head.width_px / 2.0;
-  [
+  Some([
     payload.end_px,
     PointPx::new(
       base.x_px + perpendicular.x_px * half_width,
@@ -417,7 +422,7 @@ fn arrow_head_points(payload: &ArrowPayload) -> [PointPx; 3] {
       base.x_px - perpendicular.x_px * half_width,
       base.y_px - perpendicular.y_px * half_width,
     ),
-  ]
+  ])
 }
 
 fn draw_thick_segment(
