@@ -80,7 +80,7 @@ RS_BOARD_BUNDLE_VERSION="$(cargo-bundle --version 2>/dev/null || true)"
 cd "$RS_BOARD_ROOT"
 
 RS_BOARD_WORKSPACE_VERSION="$(
-  cargo metadata --no-deps --format-version 1 \
+  cargo metadata --locked --no-deps --format-version 1 \
     | jq -r '.packages[] | select(.name == "app") | .version'
 )"
 [[ "$RS_BOARD_VERSION" == "$RS_BOARD_WORKSPACE_VERSION" ]] \
@@ -136,12 +136,15 @@ trap cleanup EXIT
 
 echo "checking Rust sources"
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 
 echo "building RS Board $RS_BOARD_VERSION for $RS_BOARD_TARGET"
+MACOSX_DEPLOYMENT_TARGET="$RS_BOARD_MINIMUM_MACOS" \
+  cargo build --locked --release --target "$RS_BOARD_TARGET"
 (
   cd "$RS_BOARD_ROOT/crates/app"
+  CARGO_BUNDLE_SKIP_BUILD=1 \
   MACOSX_DEPLOYMENT_TARGET="$RS_BOARD_MINIMUM_MACOS" \
     cargo bundle --release --target "$RS_BOARD_TARGET" --format osx
 )

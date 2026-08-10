@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["third_party/winit-0.30.13"]
 
 [workspace.package]
 version = "0.1.1"
@@ -25,8 +26,11 @@ single-instance = "0.3.3"
 thiserror = "2.0.17"
 tray-icon = { version = "0.24.2", default-features = false }
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 xcap = "0.9.8"
+
+[patch.crates-io]
+winit = { path = "third_party/winit-0.30.13" }
 
 [profile.release]
 lto = true

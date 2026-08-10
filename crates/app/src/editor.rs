@@ -231,6 +231,7 @@ struct TextEditing {
 #[derive(Debug, Clone, Default)]
 struct InlineImeState {
   preedit: Option<String>,
+  confirming_preedit_with_enter: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1850,46 +1851,94 @@ fn translate_inline_text_layer(
   });
 }
 
-fn normalize_inline_text_events(events: &mut Vec<Event>, ime: &mut InlineImeState) -> bool {
-  let frame_preedit = events.iter().rev().find_map(|event| match event {
-    Event::Ime(ImeEvent::Preedit { text, .. }) if !text.is_empty() => Some(text.clone()),
-    _ => None,
-  });
-  let ime_involved_this_frame = ime.preedit.as_ref().is_some_and(|text| !text.is_empty())
-    || frame_preedit.is_some()
-    || events.iter().any(|event| match event {
-      Event::Ime(ImeEvent::Commit(text)) => !text.trim_end_matches(['\r', '\n']).is_empty(),
-      _ => false,
-    });
+fn strip_one_logical_trailing_newline(text: &mut String) -> bool {
+  if text.ends_with("\r\n") {
+    text.truncate(text.len() - 2);
+    true
+  } else if text.ends_with(['\r', '\n']) {
+    text.truncate(text.len() - 1);
+    true
+  } else {
+    false
+  }
+}
 
-  let previous_preedit = ime.preedit.clone();
+fn is_single_logical_newline(text: &str) -> bool {
+  matches!(text, "\n" | "\r" | "\r\n")
+}
+
+fn is_unmodified_enter(modifiers: &Modifiers) -> bool {
+  modifiers.is_none()
+}
+
+fn synthetic_shift_enter_event() -> Event {
+  Event::Key {
+    key: Key::Enter,
+    physical_key: Some(Key::Enter),
+    pressed: true,
+    repeat: false,
+    modifiers: Modifiers::SHIFT,
+  }
+}
+
+fn normalize_inline_text_events(events: &mut Vec<Event>, ime: &mut InlineImeState) -> bool {
+  let mut active_preedit = ime.preedit.clone();
+  let mut confirmation_preedit = active_preedit.clone();
+  let mut confirming_preedit_with_enter = ime.confirming_preedit_with_enter;
+  let mut consume_following_confirm_enter = false;
   let mut submit_after_widget = false;
   events.retain_mut(|event| match event {
     Event::Ime(ImeEvent::Preedit { text, .. }) => {
-      ime.preedit = (!text.is_empty()).then(|| text.clone());
+      if text.is_empty() {
+        active_preedit = None;
+        confirming_preedit_with_enter = false;
+      } else {
+        active_preedit = Some(text.clone());
+        confirmation_preedit = Some(text.clone());
+        confirming_preedit_with_enter = false;
+      }
       true
     }
     Event::Ime(ImeEvent::Commit(text)) => {
-      let trimmed_len = text.trim_end_matches(['\r', '\n']).len();
-      let had_trailing_line_ending = trimmed_len != text.len();
-      text.truncate(trimmed_len);
-      if text.is_empty()
-        && had_trailing_line_ending
-        && let Some(preedit) = ime.preedit.clone().or_else(|| previous_preedit.clone())
-      {
-        *text = preedit;
-      }
-      let keep_event = if text.is_empty() && had_trailing_line_ending && !ime_involved_this_frame {
-        submit_after_widget = true;
-        false
-      } else {
+      let preedit_before_commit = active_preedit
+        .clone()
+        .or_else(|| confirmation_preedit.clone())
+        .filter(|preedit| !preedit.is_empty());
+      let is_candidate_confirmation =
+        preedit_before_commit.is_some() && strip_one_logical_trailing_newline(text);
+
+      if is_candidate_confirmation {
+        if text.is_empty()
+          && let Some(preedit) = preedit_before_commit
+        {
+          *text = preedit;
+        }
+        active_preedit = None;
+        confirmation_preedit = None;
+        confirming_preedit_with_enter = false;
+        consume_following_confirm_enter = true;
         true
-      };
-      ime.preedit = None;
-      keep_event
+      } else if is_single_logical_newline(text) {
+        *event = synthetic_shift_enter_event();
+        active_preedit = None;
+        confirmation_preedit = None;
+        confirming_preedit_with_enter = false;
+        true
+      } else {
+        active_preedit = None;
+        confirmation_preedit = None;
+        confirming_preedit_with_enter = false;
+        true
+      }
     }
     Event::Key { key: Key::Enter, pressed: true, modifiers, .. } => {
-      if ime_involved_this_frame {
+      if is_unmodified_enter(modifiers) && consume_following_confirm_enter {
+        consume_following_confirm_enter = false;
+        false
+      } else if is_unmodified_enter(modifiers)
+        && active_preedit.as_ref().is_some_and(|text| !text.is_empty())
+      {
+        confirming_preedit_with_enter = true;
         false
       } else if modifiers.shift || modifiers.mac_cmd || modifiers.command {
         *modifiers = Modifiers::SHIFT;
@@ -1899,8 +1948,19 @@ fn normalize_inline_text_events(events: &mut Vec<Event>, ime: &mut InlineImeStat
         false
       }
     }
+    Event::WindowFocused(false) => {
+      active_preedit = None;
+      confirmation_preedit = None;
+      confirming_preedit_with_enter = false;
+      consume_following_confirm_enter = false;
+      true
+    }
     _ => true,
   });
+
+  ime.preedit = active_preedit;
+  ime.confirming_preedit_with_enter =
+    confirming_preedit_with_enter && ime.preedit.as_ref().is_some_and(|text| !text.is_empty());
   submit_after_widget
 }
 
@@ -3291,7 +3351,7 @@ mod tests {
   #[test]
   fn ime_commit_trims_confirmation_newline_without_submitting() {
     for key_first in [false, true] {
-      let mut ime = InlineImeState { preedit: Some("o".to_owned()) };
+      let mut ime = InlineImeState { preedit: Some("o".to_owned()), ..Default::default() };
       let commit = Event::Ime(ImeEvent::Commit("OK\r\n".to_owned()));
       let enter = enter_event(Modifiers::NONE);
       let mut events = if key_first { vec![enter, commit] } else { vec![commit, enter] };
@@ -3325,26 +3385,25 @@ mod tests {
   }
 
   #[test]
-  fn ime_commit_preserves_internal_newlines() {
+  fn dictation_commit_preserves_trailing_and_internal_newlines() {
     let mut ime = InlineImeState::default();
     let mut events = vec![Event::Ime(ImeEvent::Commit("A\nB\n".to_owned()))];
     assert!(!normalize_inline_text_events(&mut events, &mut ime));
-    assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("A\nB".to_owned()))]);
+    assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("A\nB\n".to_owned()))]);
   }
 
   #[test]
-  fn ime_events_are_order_independent_for_candidate_confirmation() {
+  fn ime_confirmation_handles_preedit_clear_before_commit() {
     let preedit =
       Event::Ime(ImeEvent::Preedit { text: "O".to_owned(), active_range_chars: Some(0..1) });
+    let clear_preedit =
+      Event::Ime(ImeEvent::Preedit { text: String::new(), active_range_chars: None });
     let commit = Event::Ime(ImeEvent::Commit("OK\n".to_owned()));
     let enter = enter_event(Modifiers::NONE);
     for mut events in [
       vec![preedit.clone(), commit.clone(), enter.clone()],
       vec![preedit.clone(), enter.clone(), commit.clone()],
-      vec![commit.clone(), preedit.clone(), enter.clone()],
-      vec![commit.clone(), enter.clone(), preedit.clone()],
-      vec![enter.clone(), preedit.clone(), commit.clone()],
-      vec![enter.clone(), commit.clone(), preedit.clone()],
+      vec![preedit.clone(), clear_preedit.clone(), commit.clone()],
     ] {
       let mut ime = InlineImeState::default();
       assert!(!normalize_inline_text_events(&mut events, &mut ime));
@@ -3362,7 +3421,7 @@ mod tests {
   }
 
   #[test]
-  fn ime_newline_commit_uses_only_an_already_active_preedit() {
+  fn ime_newline_commit_does_not_use_future_preedit() {
     let mut ime = InlineImeState::default();
     let mut events = vec![
       Event::Ime(ImeEvent::Commit("\n".to_owned())),
@@ -3370,19 +3429,111 @@ mod tests {
     ];
 
     assert!(!normalize_inline_text_events(&mut events, &mut ime));
-    assert_eq!(events[0], Event::Ime(ImeEvent::Commit(String::new())));
+    assert_eq!(events[0], synthetic_shift_enter_event());
     assert_eq!(ime.preedit.as_deref(), Some("future"));
   }
 
   #[test]
-  fn idle_ime_newline_commit_routes_to_submit() {
+  fn active_ime_newline_confirmation_falls_back_to_preedit() {
+    let mut ime = InlineImeState { preedit: Some("候选".to_owned()), ..Default::default() };
+    let mut events = vec![Event::Ime(ImeEvent::Commit("\r\n".to_owned()))];
+
+    assert!(!normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("候选".to_owned()))]);
+    assert!(ime.preedit.is_none());
+  }
+
+  #[test]
+  fn idle_ime_newline_commit_routes_to_inline_newline() {
     for line_ending in ["\n", "\r", "\r\n"] {
       let mut ime = InlineImeState::default();
       let mut events = vec![Event::Ime(ImeEvent::Commit(line_ending.to_owned()))];
 
-      assert!(normalize_inline_text_events(&mut events, &mut ime));
-      assert!(events.is_empty());
+      assert!(!normalize_inline_text_events(&mut events, &mut ime));
+      assert_eq!(events, vec![synthetic_shift_enter_event()]);
     }
+  }
+
+  #[test]
+  fn dictation_commit_then_enter_submits_after_widget() {
+    let mut ime = InlineImeState::default();
+    let mut events =
+      vec![Event::Ime(ImeEvent::Commit("dictated".to_owned())), enter_event(Modifiers::NONE)];
+
+    assert!(normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(events, vec![Event::Ime(ImeEvent::Commit("dictated".to_owned()))]);
+    assert!(ime.preedit.is_none());
+  }
+
+  #[test]
+  fn dictation_same_frame_enter_applies_text_before_submit() {
+    let document = document();
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: String::new(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+      }),
+      ..Default::default()
+    };
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    let actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::Ime(ImeEvent::Commit("dictated".to_owned())), enter_event(Modifiers::NONE)],
+    );
+
+    assert!(controller.text_editing.is_none());
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one text add, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::AddElement {
+        element: Element {
+          payload: ElementPayload::Text(TextPayload { text, .. }),
+          ..
+        },
+      }] if text == "dictated"
+    ));
+  }
+
+  #[test]
+  fn focus_loss_clears_inline_ime_state() {
+    let mut ime =
+      InlineImeState { preedit: Some("候选".to_owned()), confirming_preedit_with_enter: true };
+    let mut events = vec![Event::WindowFocused(false)];
+
+    assert!(!normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(events, vec![Event::WindowFocused(false)]);
+    assert!(ime.preedit.is_none());
+    assert!(!ime.confirming_preedit_with_enter);
+  }
+
+  #[test]
+  fn ime_cancel_clears_inline_ime_state() {
+    let mut ime =
+      InlineImeState { preedit: Some("候选".to_owned()), confirming_preedit_with_enter: true };
+    let mut events =
+      vec![Event::Ime(ImeEvent::Preedit { text: String::new(), active_range_chars: None })];
+
+    assert!(!normalize_inline_text_events(&mut events, &mut ime));
+    assert_eq!(
+      events,
+      vec![Event::Ime(ImeEvent::Preedit { text: String::new(), active_range_chars: None })]
+    );
+    assert!(ime.preedit.is_none());
+    assert!(!ime.confirming_preedit_with_enter);
   }
 
   #[test]

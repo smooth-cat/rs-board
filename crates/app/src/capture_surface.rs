@@ -701,12 +701,26 @@ mod macos {
       return OverlayWindowReadiness::Pending;
     };
     let window = &overlay_window.window;
-    if overlay_window.ready && window_pair_is_ready(&application, &screen, window, frozen_panel) {
+    if overlay_window.ready
+      && window_pair_is_ready(&application, &screen, window, frozen_panel)
+      && overlay_input_target_is_ready(true, content_view_is_first_responder(window))
+    {
       return OverlayWindowReadiness::Ready;
     }
     overlay_window.ready = false;
 
-    window.setStyleMask(NSWindowStyleMask::Borderless);
+    if window.styleMask() != NSWindowStyleMask::Borderless {
+      window.setStyleMask(NSWindowStyleMask::Borderless);
+    }
+    // AppKit can clear the responder when the style mask changes; winit's view owns key and IME input.
+    let Some(content_view) = window.contentView() else {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending;
+    };
+    if !window.makeFirstResponder(Some(&content_view)) {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending;
+    }
     window.setFrame_display(screen.frame(), false);
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -739,7 +753,8 @@ mod macos {
     window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
 
-    let ready = window_pair_is_structurally_ready(&application, &screen, window, frozen_panel);
+    let ready = window_pair_is_structurally_ready(&application, &screen, window, frozen_panel)
+      && overlay_input_target_is_ready(false, content_view_is_first_responder(window));
     if ready {
       window.setIgnoresMouseEvents(false);
       overlay_window.ready = true;
@@ -851,6 +866,20 @@ mod macos {
       && !window.ignoresMouseEvents()
   }
 
+  fn content_view_is_first_responder(window: &NSWindow) -> bool {
+    let Some(content_view) = window.contentView() else {
+      return false;
+    };
+    window.firstResponder().is_some_and(|first_responder| {
+      Retained::as_ptr(&first_responder).cast::<AnyObject>()
+        == Retained::as_ptr(&content_view).cast::<AnyObject>()
+    })
+  }
+
+  fn overlay_input_target_is_ready(was_ready: bool, content_view_is_first_responder: bool) -> bool {
+    was_ready || content_view_is_first_responder
+  }
+
   fn window_pair_is_structurally_ready(
     application: &NSApplication,
     screen: &NSScreen,
@@ -922,6 +951,7 @@ mod macos {
 
     use super::{
       editor_overlay_window_level, frozen_panel_window_level, inactive_overlay_window_level,
+      overlay_input_target_is_ready,
     };
 
     #[test]
@@ -929,6 +959,13 @@ mod macos {
       assert_eq!(frozen_panel_window_level(), NSScreenSaverWindowLevel);
       assert_eq!(editor_overlay_window_level(), frozen_panel_window_level());
       assert_eq!(inactive_overlay_window_level(), NSNormalWindowLevel);
+    }
+
+    #[test]
+    fn initial_overlay_requires_input_target_without_reclaiming_it_after_ready() {
+      assert!(!overlay_input_target_is_ready(false, false));
+      assert!(overlay_input_target_is_ready(false, true));
+      assert!(overlay_input_target_is_ready(true, false));
     }
   }
 }
