@@ -7,8 +7,8 @@ use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSApplication, NSCursor, NSEvent, NSEventPhase, NSEventSubtype, NSEventType, NSResponder,
+    NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying, NSInteger,
@@ -24,10 +24,10 @@ use super::event::{
 };
 use super::window::WinitWindow;
 use super::DEVICE_ID;
-use crate::dpi::{LogicalPosition, LogicalSize};
+use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use crate::event::{
-    DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, TouchPhase,
-    WindowEvent,
+    DeviceEvent, ElementState, Force, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta, Touch,
+    TouchPhase, WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
 use crate::platform::macos::OptionAsAlt;
@@ -202,6 +202,10 @@ pub struct ViewState {
 
     /// True while a physical key event is being interpreted by AppKit.
     interpreting_key_events: Cell<bool>,
+
+    /// Tablet identifier retained until mouse-up, whose AppKit subtype is not always tablet-point.
+    active_tablet_id: Cell<Option<u64>>,
+    active_tablet_location: Cell<Option<PhysicalPosition<f64>>>,
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
@@ -689,6 +693,9 @@ declare_class!(
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
             trace_scope!("mouseDown:");
+            if self.tablet_touch(event, TouchPhase::Started) {
+                return;
+            }
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Pressed);
         }
@@ -696,6 +703,9 @@ declare_class!(
         #[method(mouseUp:)]
         fn mouse_up(&self, event: &NSEvent) {
             trace_scope!("mouseUp:");
+            if self.tablet_touch(event, TouchPhase::Ended) {
+                return;
+            }
             self.mouse_motion(event);
             self.mouse_click(event, ElementState::Released);
         }
@@ -737,7 +747,15 @@ declare_class!(
 
         #[method(mouseDragged:)]
         fn mouse_dragged(&self, event: &NSEvent) {
+            if self.tablet_touch(event, TouchPhase::Moved) {
+                return;
+            }
             self.mouse_motion(event);
+        }
+
+        #[method(tabletPoint:)]
+        fn tablet_point(&self, event: &NSEvent) {
+            self.tablet_touch(event, TouchPhase::Moved);
         }
 
         #[method(rightMouseDragged:)]
@@ -912,6 +930,8 @@ impl WinitView {
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
             interpreting_key_events: Default::default(),
+            active_tablet_id: Default::default(),
+            active_tablet_location: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
@@ -1021,6 +1041,20 @@ impl WinitView {
             self.ivars().modifiers.set(Modifiers::default());
             self.queue_event(WindowEvent::ModifiersChanged(self.ivars().modifiers.get()));
         }
+    }
+
+    pub(super) fn reset_tablet_input(&self) {
+        let Some(tablet_id) = self.ivars().active_tablet_id.take() else {
+            return;
+        };
+        let location = self.ivars().active_tablet_location.take().unwrap_or_default();
+        self.queue_event(WindowEvent::Touch(Touch {
+            device_id: DEVICE_ID,
+            phase: TouchPhase::Cancelled,
+            location,
+            force: Some(Force::Normalized(0.0)),
+            id: tablet_id,
+        }));
     }
 
     pub(super) fn set_option_as_alt(&self, value: OptionAsAlt) {
@@ -1196,6 +1230,61 @@ impl WinitView {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
         });
+    }
+
+    fn tablet_touch(&self, event: &NSEvent, requested_phase: TouchPhase) -> bool {
+        let is_tablet_point = unsafe { event.r#type() } == NSEventType::TabletPoint
+            || unsafe { event.subtype() } == NSEventSubtype::TabletPoint;
+        let event_tablet_id = is_tablet_point.then(|| unsafe { event.deviceID() } as u64);
+        let Some(tablet_id) = event_tablet_id.or_else(|| {
+            (requested_phase == TouchPhase::Ended)
+                .then(|| self.ivars().active_tablet_id.get())
+                .flatten()
+        }) else {
+            return false;
+        };
+
+        let window_point = unsafe { event.locationInWindow() };
+        let view_point = self.convertPoint_fromView(window_point, None);
+        let location =
+            LogicalPosition::new(view_point.x, view_point.y).to_physical(self.scale_factor());
+        let pressure = if requested_phase == TouchPhase::Ended {
+            0.0
+        } else {
+            f64::from(unsafe { event.pressure() }).clamp(0.0, 1.0)
+        };
+        let phase = if requested_phase == TouchPhase::Moved
+            && pressure > 0.0
+            && self.ivars().active_tablet_id.get().is_none()
+        {
+            TouchPhase::Started
+        } else if requested_phase == TouchPhase::Started
+            && self.ivars().active_tablet_id.get() == Some(tablet_id)
+        {
+            TouchPhase::Moved
+        } else {
+            requested_phase
+        };
+        if phase == TouchPhase::Started || (phase == TouchPhase::Moved && pressure > 0.0) {
+            self.ivars().active_tablet_id.set(Some(tablet_id));
+        }
+        if self.ivars().active_tablet_id.get() == Some(tablet_id) {
+            self.ivars().active_tablet_location.set(Some(location));
+        }
+
+        self.update_modifiers(event, false);
+        self.queue_event(WindowEvent::Touch(Touch {
+            device_id: DEVICE_ID,
+            phase,
+            location,
+            force: Some(Force::Normalized(pressure)),
+            id: tablet_id,
+        }));
+        if phase == TouchPhase::Ended {
+            self.ivars().active_tablet_id.set(None);
+            self.ivars().active_tablet_location.set(None);
+        }
+        true
     }
 }
 

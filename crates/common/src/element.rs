@@ -200,6 +200,12 @@ impl StrokePoint {
     Self { x_px: point.x_px, y_px: point.y_px, pressure: 1.0 }
   }
 
+  pub fn with_pressure(point: PointPx, pressure: f32) -> Result<Self, ElementError> {
+    let point = Self { x_px: point.x_px, y_px: point.y_px, pressure };
+    point.validate()?;
+    Ok(point)
+  }
+
   pub fn point(&self) -> PointPx {
     PointPx::new(self.x_px, self.y_px)
   }
@@ -208,8 +214,8 @@ impl StrokePoint {
     if !self.point().is_finite() {
       return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
     }
-    if self.pressure != 1.0 {
-      return Err(ElementError::PressureMustBeOne);
+    if !self.pressure.is_finite() || !(0.0..=1.0).contains(&self.pressure) {
+      return Err(ElementError::InvalidStrokePressure(self.pressure));
     }
     Ok(())
   }
@@ -240,8 +246,16 @@ impl StrokePayload {
     let points = process_stroke_points(points, stroke_style.width_px)?
       .into_iter()
       .map(StrokePoint::new)
-      .collect();
-    let payload = Self { points, stroke_style, hardness };
+      .collect::<Vec<_>>();
+    Self::from_stroke_points_with_hardness(&points, stroke_style, hardness)
+  }
+
+  pub fn from_stroke_points_with_hardness(
+    points: &[StrokePoint],
+    stroke_style: StrokeStyle,
+    hardness: f32,
+  ) -> Result<Self, ElementError> {
+    let payload = Self { points: points.to_vec(), stroke_style, hardness };
     payload.validate()?;
     Ok(payload)
   }
@@ -1037,8 +1051,8 @@ pub enum ElementError {
   UnsupportedColor,
   #[error("opacity must be 1.0")]
   OpacityMustBeOpaque,
-  #[error("stroke pressure must be 1.0")]
-  PressureMustBeOne,
+  #[error("stroke pressure must be finite and between 0.0 and 1.0, found {0}")]
+  InvalidStrokePressure(f32),
   #[error("unsupported stroke width {0}")]
   InvalidStrokeWidth(f32),
   #[error("unsupported brush hardness {0}")]
@@ -1101,11 +1115,56 @@ mod tests {
   }
 
   #[test]
+  fn pressure_points_accept_the_closed_unit_interval_and_keep_conservative_bounds() {
+    let canvas = SizePx::new(200, 120);
+    let points = [
+      StrokePoint::with_pressure(PointPx::new(40.0, 60.0), 0.0).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(60.0, 60.0), 0.5).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(80.0, 60.0), 1.0).unwrap(),
+    ];
+    let payload = StrokePayload::from_stroke_points_with_hardness(
+      &points,
+      StrokeStyle::default(),
+      default_brush_hardness(),
+    )
+    .unwrap();
+    assert_eq!(payload.points, points);
+
+    let element =
+      Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), canvas).unwrap();
+    assert_eq!(
+      element.bounds_px,
+      RectPx::from_min_max(PointPx::new(36.0, 56.0), PointPx::new(84.0, 64.0))
+    );
+  }
+
+  #[test]
+  fn pressure_points_reject_non_finite_and_out_of_range_values() {
+    for pressure in [f32::NEG_INFINITY, -0.01, 1.01, f32::INFINITY, f32::NAN] {
+      assert!(matches!(
+        StrokePoint::with_pressure(PointPx::new(40.0, 60.0), pressure),
+        Err(ElementError::InvalidStrokePressure(_))
+      ));
+
+      let point = StrokePoint { x_px: 40.0, y_px: 60.0, pressure };
+      assert!(matches!(
+        StrokePayload::from_stroke_points_with_hardness(
+          &[point],
+          StrokeStyle::default(),
+          default_brush_hardness(),
+        ),
+        Err(ElementError::InvalidStrokePressure(_))
+      ));
+    }
+  }
+
+  #[test]
   fn a_single_point_stroke_is_a_valid_dot() {
     let canvas = SizePx::new(200, 120);
     let point = PointPx::new(80.0, 60.0);
     let payload = StrokePayload::from_raw_points(&[point], StrokeStyle::default()).unwrap();
     assert_eq!(payload.points.iter().map(StrokePoint::point).collect::<Vec<_>>(), vec![point]);
+    assert_eq!(payload.points[0].pressure, 1.0);
 
     let element =
       Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), canvas).unwrap();

@@ -3,7 +3,8 @@ use std::sync::{Arc, OnceLock};
 use ab_glyph::{FontArc, PxScale};
 use common::{
   ArrowPayload, BoardDocument, ColorRgba, DocumentSnapshot, Element, ElementPayload, PointPx,
-  RectangleLabelLayout, RectanglePayload, SizePx, TextAlign, TextStyle, rectangle_label_layout,
+  RectangleLabelLayout, RectanglePayload, SizePx, StrokePoint, TextAlign, TextStyle,
+  rectangle_label_layout,
 };
 use eframe::egui::{
   self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
@@ -93,7 +94,7 @@ pub(crate) fn paint_element(
         painter,
         transform,
         payload.points.len(),
-        |index| payload.points[index].point(),
+        |index| (payload.points[index].point(), payload.points[index].pressure),
         BrushPaintStyle {
           color: payload.stroke_style.color_rgba,
           width_px: payload.stroke_style.width_px,
@@ -148,6 +149,7 @@ pub(crate) fn paint_element(
   }
 }
 
+#[cfg(test)]
 pub(crate) fn paint_raw_polyline(
   painter: &Painter,
   transform: &CanvasTransform,
@@ -160,7 +162,25 @@ pub(crate) fn paint_raw_polyline(
     painter,
     transform,
     points.len(),
-    |index| points[index],
+    |index| (points[index], 1.0),
+    BrushPaintStyle { color, width_px, hardness, opacity: 1.0 },
+  );
+}
+
+/// Paints an in-progress stroke without first constructing a persistent element.
+pub(crate) fn paint_raw_stroke_points(
+  painter: &Painter,
+  transform: &CanvasTransform,
+  points: &[StrokePoint],
+  color: ColorRgba,
+  width_px: f32,
+  hardness: f32,
+) {
+  paint_brush_polyline(
+    painter,
+    transform,
+    points.len(),
+    |index| (points[index].point(), points[index].pressure),
     BrushPaintStyle { color, width_px, hardness, opacity: 1.0 },
   );
 }
@@ -169,35 +189,77 @@ fn paint_brush_polyline(
   painter: &Painter,
   transform: &CanvasTransform,
   point_count: usize,
-  point_at: impl Fn(usize) -> PointPx,
+  point_at: impl Fn(usize) -> (PointPx, f32),
   style: BrushPaintStyle,
 ) {
   if point_count == 0 {
     return;
   }
 
-  let width = style.width_px * transform.scale();
+  let (points, pressures): (Vec<_>, Vec<_>) = (0..point_count)
+    .map(|index| {
+      let (point, pressure) = point_at(index);
+      (transform.document_to_egui(point), pressure.clamp(0.0, 1.0))
+    })
+    .unzip();
+
+  if pressures.iter().all(|pressure| *pressure == pressures[0]) {
+    paint_uniform_brush_polyline(painter, &points, style, pressures[0], transform.scale());
+    return;
+  }
+
+  if style.hardness >= 1.0 {
+    let widths = pressures.iter().map(|pressure| style.width_px * transform.scale() * pressure);
+    paint_variable_width_polyline_layer(
+      painter,
+      &points,
+      widths,
+      egui_color(style.color, style.opacity),
+    );
+    return;
+  }
+
+  let core_factor = style.hardness.max(1.0 / SOFT_BRUSH_LAYER_COUNT as f32);
+  for layer in 0..SOFT_BRUSH_LAYER_COUNT {
+    let outer_fraction = 1.0 - layer as f32 / (SOFT_BRUSH_LAYER_COUNT - 1) as f32;
+    let layer_factor = core_factor + (1.0 - core_factor) * outer_fraction;
+    let widths =
+      pressures.iter().map(|pressure| style.width_px * transform.scale() * pressure * layer_factor);
+    let layer_opacity = style.opacity / (SOFT_BRUSH_LAYER_COUNT - layer) as f32;
+    paint_variable_width_polyline_layer(
+      painter,
+      &points,
+      widths,
+      egui_color(style.color, layer_opacity),
+    );
+  }
+}
+
+fn paint_uniform_brush_polyline(
+  painter: &Painter,
+  points: &[Pos2],
+  style: BrushPaintStyle,
+  pressure: f32,
+  scale: f32,
+) {
+  let width = style.width_px * pressure * scale;
+  if width <= 0.0 {
+    return;
+  }
+
   if style.hardness >= 1.0 {
     let color = egui_color(style.color, style.opacity);
     let stroke = Stroke::new(width, color);
-    if point_count == 1 {
-      painter.circle_filled(transform.document_to_egui(point_at(0)), stroke.width / 2.0, color);
+    if let [point] = points {
+      painter.circle_filled(*point, stroke.width / 2.0, color);
       return;
     }
-    for index in 1..point_count {
-      painter.line_segment(
-        [
-          transform.document_to_egui(point_at(index - 1)),
-          transform.document_to_egui(point_at(index)),
-        ],
-        stroke,
-      );
+    for points in points.windows(2) {
+      painter.line_segment([points[0], points[1]], stroke);
     }
     return;
   }
 
-  let points =
-    (0..point_count).map(|index| transform.document_to_egui(point_at(index))).collect::<Vec<_>>();
   let minimum_core_width = width / SOFT_BRUSH_LAYER_COUNT as f32;
   let core_width = (width * style.hardness).max(minimum_core_width);
   for layer in 0..SOFT_BRUSH_LAYER_COUNT {
@@ -205,10 +267,62 @@ fn paint_brush_polyline(
     let layer_width = core_width + (width - core_width) * outer_fraction;
     let layer_opacity = style.opacity / (SOFT_BRUSH_LAYER_COUNT - layer) as f32;
     let layer_color = egui_color(style.color, layer_opacity);
-    if let [point] = points.as_slice() {
+    if let [point] = points {
       painter.circle_filled(*point, layer_width / 2.0, layer_color);
     } else {
-      painter.add(Shape::line(points.clone(), Stroke::new(layer_width, layer_color)));
+      painter.add(Shape::line(points.to_vec(), Stroke::new(layer_width, layer_color)));
+    }
+  }
+}
+
+fn paint_variable_width_polyline_layer(
+  painter: &Painter,
+  points: &[Pos2],
+  widths: impl IntoIterator<Item = f32>,
+  color: Color32,
+) {
+  let mut samples = Vec::<(Pos2, f32)>::with_capacity(points.len());
+  for (point, width) in points.iter().copied().zip(widths) {
+    let radius = width.max(0.0) / 2.0;
+    if let Some((previous_point, previous_radius)) = samples.last_mut()
+      && *previous_point == point
+    {
+      *previous_radius = radius;
+      continue;
+    }
+    samples.push((point, radius));
+  }
+
+  match samples.as_slice() {
+    [] => return,
+    &[(point, radius)] => {
+      if radius > 0.0 {
+        painter.circle_filled(point, radius, color);
+      }
+      return;
+    }
+    _ => {}
+  }
+
+  let mut mesh = Mesh::default();
+  for pair in samples.windows(2) {
+    let [(start, start_radius), (end, end_radius)] = pair else {
+      unreachable!();
+    };
+    let direction = (*end - *start).normalized();
+    let normal = egui::vec2(-direction.y, direction.x);
+    let first = mesh.vertices.len() as u32;
+    mesh.colored_vertex(*start + normal * *start_radius, color);
+    mesh.colored_vertex(*start - normal * *start_radius, color);
+    mesh.colored_vertex(*end + normal * *end_radius, color);
+    mesh.colored_vertex(*end - normal * *end_radius, color);
+    mesh.add_triangle(first, first + 1, first + 2);
+    mesh.add_triangle(first + 1, first + 3, first + 2);
+  }
+  painter.add(Shape::mesh(mesh));
+  for (point, radius) in samples {
+    if radius > 0.0 {
+      painter.circle_filled(point, radius, color);
     }
   }
 }
@@ -359,28 +473,13 @@ pub(crate) fn layout_egui_text(
 
 fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx) {
   match &element.payload {
-    ElementPayload::Stroke(payload) => match payload.points.as_slice() {
-      [point] => draw_brush_segment(
-        image,
-        point.point(),
-        point.point(),
-        payload.stroke_style.width_px,
-        rgba(payload.stroke_style.color_rgba),
-        payload.hardness,
-      ),
-      points => {
-        for points in points.windows(2) {
-          draw_brush_segment(
-            image,
-            points[0].point(),
-            points[1].point(),
-            payload.stroke_style.width_px,
-            rgba(payload.stroke_style.color_rgba),
-            payload.hardness,
-          );
-        }
-      }
-    },
+    ElementPayload::Stroke(payload) => raster_brush_polyline(
+      image,
+      &payload.points,
+      payload.stroke_style.width_px,
+      rgba(payload.stroke_style.color_rgba),
+      payload.hardness,
+    ),
     ElementPayload::Arrow(payload) => {
       let color = rgba(payload.stroke_style.color_rgba);
       if let Some(geometry) = arrow_geometry(payload) {
@@ -574,6 +673,86 @@ fn draw_thick_segment(
       let point = PointPx::new(x as f32 + 0.5, y as f32 + 0.5);
       let distance = distance_to_segment(point, start, end);
       let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+      if coverage > 0.0 {
+        blend_pixel(image, x as u32, y as u32, color, coverage);
+      }
+    }
+  }
+}
+
+fn raster_brush_polyline(
+  image: &mut RgbaImage,
+  points: &[StrokePoint],
+  width: f32,
+  color: Rgba<u8>,
+  hardness: f32,
+) {
+  match points {
+    [] => {}
+    [point] => {
+      let point_width = width * point.pressure.clamp(0.0, 1.0);
+      if point_width > 0.0 {
+        draw_brush_segment(image, point.point(), point.point(), point_width, color, hardness);
+      }
+    }
+    points => {
+      for points in points.windows(2) {
+        draw_variable_brush_segment(
+          image,
+          points[0].point(),
+          points[1].point(),
+          width * points[0].pressure.clamp(0.0, 1.0),
+          width * points[1].pressure.clamp(0.0, 1.0),
+          color,
+          hardness,
+        );
+      }
+    }
+  }
+}
+
+fn draw_variable_brush_segment(
+  image: &mut RgbaImage,
+  start: PointPx,
+  end: PointPx,
+  start_width: f32,
+  end_width: f32,
+  color: Rgba<u8>,
+  hardness: f32,
+) {
+  if start_width == end_width {
+    if start_width > 0.0 {
+      draw_brush_segment(image, start, end, start_width, color, hardness);
+    }
+    return;
+  }
+
+  let maximum_radius = start_width.max(end_width).max(0.0) / 2.0;
+  if maximum_radius <= 0.0 {
+    return;
+  }
+  let min_x = (start.x_px.min(end.x_px) - maximum_radius - 1.0).floor() as i32;
+  let max_x = (start.x_px.max(end.x_px) + maximum_radius + 1.0).ceil() as i32;
+  let min_y = (start.y_px.min(end.y_px) - maximum_radius - 1.0).floor() as i32;
+  let max_y = (start.y_px.max(end.y_px) + maximum_radius + 1.0).ceil() as i32;
+  for y in min_y.max(0)..=max_y.min(image.height() as i32 - 1) {
+    for x in min_x.max(0)..=max_x.min(image.width() as i32 - 1) {
+      let point = PointPx::new(x as f32 + 0.5, y as f32 + 0.5);
+      let (distance, position) = distance_and_position_on_segment(point, start, end);
+      let radius = (start_width + (end_width - start_width) * position).max(0.0) / 2.0;
+      let coverage = if radius <= f32::EPSILON {
+        0.0
+      } else if hardness >= 1.0 {
+        (radius + 0.5 - distance).clamp(0.0, 1.0)
+      } else {
+        let core_radius = (radius * hardness).max(radius / SOFT_BRUSH_LAYER_COUNT as f32);
+        if distance <= core_radius {
+          1.0
+        } else {
+          let fade_width = radius - core_radius + 0.5;
+          ((radius + 0.5 - distance) / fade_width).clamp(0.0, 1.0)
+        }
+      };
       if coverage > 0.0 {
         blend_pixel(image, x as u32, y as u32, color, coverage);
       }
@@ -777,15 +956,19 @@ fn cjk_font() -> Option<&'static FontArc> {
 }
 
 fn distance_to_segment(point: PointPx, start: PointPx, end: PointPx) -> f32 {
+  distance_and_position_on_segment(point, start, end).0
+}
+
+fn distance_and_position_on_segment(point: PointPx, start: PointPx, end: PointPx) -> (f32, f32) {
   let dx = end.x_px - start.x_px;
   let dy = end.y_px - start.y_px;
   let length_squared = dx * dx + dy * dy;
   if length_squared <= f32::EPSILON {
-    return point.distance_to(start);
+    return (point.distance_to(start), 1.0);
   }
   let t = (((point.x_px - start.x_px) * dx + (point.y_px - start.y_px) * dy) / length_squared)
     .clamp(0.0, 1.0);
-  point.distance_to(PointPx::new(start.x_px + t * dx, start.y_px + t * dy))
+  (point.distance_to(PointPx::new(start.x_px + t * dx, start.y_px + t * dy)), t)
 }
 
 fn edge(first: PointPx, second: PointPx, point: PointPx) -> f32 {
@@ -988,6 +1171,90 @@ mod tests {
     let rendered = render_document_to_image(&document, &background);
     assert_eq!(rendered.get_pixel(50, 40), &Rgba([255, 59, 48, 255]));
     assert_eq!(rendered.get_pixel(56, 40), &Rgba([0, 0, 0, 255]));
+  }
+
+  #[test]
+  fn pressure_stroke_raster_width_continuously_tapers_to_the_tip() {
+    let mut document = document();
+    let points = [
+      StrokePoint::with_pressure(PointPx::new(20.0, 40.0), 1.0).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(50.0, 40.0), 0.5).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(80.0, 40.0), 0.0).unwrap(),
+    ];
+    let payload = StrokePayload::from_stroke_points_with_hardness(
+      &points,
+      StrokeStyle::mvp(ColorRgba::RED, 12.0).unwrap(),
+      1.0,
+    )
+    .unwrap();
+    document.elements.push(
+      Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), document.canvas_size_px)
+        .unwrap(),
+    );
+
+    let background = Rgba([0, 0, 0, 255]);
+    let rendered = render_document_to_image(&document, &RgbaImage::from_pixel(100, 80, background));
+    let painted_height =
+      |x| (0..rendered.height()).filter(|&y| rendered.get_pixel(x, y) != &background).count();
+    let wide = painted_height(25);
+    let middle = painted_height(55);
+    let tip = painted_height(75);
+    assert!(wide > middle && middle > tip, "wide={wide}, middle={middle}, tip={tip}");
+  }
+
+  #[test]
+  fn zero_pressure_tip_leaves_no_endpoint_pixel_for_hard_or_soft_brushes() {
+    for hardness in [1.0, 0.5] {
+      let mut document = document();
+      let points = [
+        StrokePoint::with_pressure(PointPx::new(60.5, 40.5), 0.5).unwrap(),
+        StrokePoint::with_pressure(PointPx::new(80.5, 40.5), 0.0).unwrap(),
+      ];
+      let payload = StrokePayload::from_stroke_points_with_hardness(
+        &points,
+        StrokeStyle::mvp(ColorRgba::RED, 12.0).unwrap(),
+        hardness,
+      )
+      .unwrap();
+      document.elements.push(
+        Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), document.canvas_size_px)
+          .unwrap(),
+      );
+
+      let background = Rgba([0, 0, 0, 255]);
+      let rendered =
+        render_document_to_image(&document, &RgbaImage::from_pixel(100, 80, background));
+      assert_eq!(rendered.get_pixel(80, 40), &background, "hardness={hardness}");
+    }
+  }
+
+  #[test]
+  fn pressure_stroke_screen_joins_stay_inside_the_nominal_brush_radius() {
+    let points = [
+      StrokePoint::with_pressure(PointPx::new(20.0, 20.0), 1.0).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(20.0, 60.0), 0.75).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(60.0, 60.0), 0.25).unwrap(),
+    ];
+    let context = egui::Context::default();
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 80.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(SizePx::new(100, 80), ui.max_rect()).unwrap();
+        paint_raw_stroke_points(ui.painter(), &transform, &points, ColorRgba::RED, 12.0, 1.0);
+      },
+    );
+    let nominal_bounds = Rect::from_min_max(Pos2::new(14.0, 14.0), Pos2::new(66.0, 66.0));
+    for shape in &output.shapes {
+      assert!(
+        nominal_bounds.contains_rect(shape.shape.visual_bounding_rect()),
+        "shape exceeded pressure stroke bounds: {:?}",
+        shape.shape.visual_bounding_rect()
+      );
+    }
+    output.drop_without_applying_deltas();
   }
 
   #[test]

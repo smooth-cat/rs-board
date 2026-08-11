@@ -203,7 +203,7 @@ mod tests {
     element::{
       ArrowHead, ArrowPayload, ColorRgba, Element, ElementId, ElementPayload,
       LabelPlacementPreference, RectangleLabel, RectanglePayload, SequenceMarkerPayload,
-      StrokePayload, StrokeStyle, TextPayload, TextStyle,
+      StrokePayload, StrokePoint, StrokeStyle, TextPayload, TextStyle,
     },
     geometry::{PointPx, SizePx},
   };
@@ -401,6 +401,23 @@ mod tests {
     }
     assert!(json.contains("\"hardness\": 1.0"));
     assert!(json.contains("第一行\\n第二行"));
+    assert_eq!(decode_document(&encoded).unwrap(), document);
+  }
+
+  #[test]
+  fn pressure_values_round_trip_without_changing_schema_version() {
+    let mut document = document_with_all_elements();
+    let ElementPayload::Stroke(stroke) = &mut document.elements[0].payload else {
+      unreachable!();
+    };
+    stroke.points[0] = StrokePoint::with_pressure(stroke.points[0].point(), 0.25).unwrap();
+    stroke.points[1] = StrokePoint::with_pressure(stroke.points[1].point(), 0.75).unwrap();
+
+    let encoded = encode_document(&document).unwrap();
+    let json = String::from_utf8(encoded.clone()).unwrap();
+    assert!(json.contains("\"schema_version\": 2"));
+    assert!(json.contains("\"pressure\": 0.25"));
+    assert!(json.contains("\"pressure\": 0.75"));
     assert_eq!(decode_document(&encoded).unwrap(), document);
   }
 

@@ -832,7 +832,8 @@ pub enum TouchPhase {
 /// ## Platform-specific
 ///
 /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
-/// - **macOS:** Unsupported.
+/// - **macOS:** Tablet-point events are reported as a single pressure-sensitive touch by RS Board's
+///   local backend patch. Direct touchscreen input remains unsupported.
 ///
 /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
 /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
@@ -847,7 +848,8 @@ pub struct Touch {
     ///
     /// ## Platform-specific
     ///
-    /// - Only available on **iOS** 9.0+, **Windows** 8+, **Web**, and **Android**.
+    /// - Only available on **iOS** 9.0+, **Windows** 8+, **Web**, **Android**, and macOS tablet-point
+    ///   events in RS Board's local backend patch.
     /// - **Android**: This will never be [None]. If the device doesn't support pressure
     ///   sensitivity, force will either be 0.0 or 1.0. Also see the
     ///   [android documentation](https://developer.android.com/reference/android/view/MotionEvent#AXIS_PRESSURE).

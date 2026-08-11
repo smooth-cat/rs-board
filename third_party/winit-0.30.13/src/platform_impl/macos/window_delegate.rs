@@ -223,6 +223,7 @@ declare_class!(
             // easily fall out of synchrony with reality.  This requires us to emit
             // a synthetic ModifiersChanged event when we lose focus.
             self.view().reset_modifiers();
+            self.view().reset_tablet_input();
 
             self.queue_event(WindowEvent::Focused(false));
         }

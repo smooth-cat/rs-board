@@ -2236,6 +2236,9 @@ impl RsBoardApp {
     }
 
     let actions = if let Some(session) = self.session.as_mut() {
+      if self.phase == Phase::Editing {
+        root_ui.input_mut(|input| session.editor.capture_stylus_input_state(input));
+      }
       let mut actions = Vec::new();
       let background_fill =
         if session.background_texture.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
@@ -3117,6 +3120,16 @@ impl RsBoardApp {
 }
 
 impl eframe::App for RsBoardApp {
+  fn raw_input_hook(&mut self, _context: &egui::Context, raw_input: &mut egui::RawInput) {
+    if self.phase == Phase::Editing
+      && let Some(session) = self.session.as_mut()
+    {
+      session.editor.capture_stylus_input(raw_input);
+    } else {
+      raw_input.events.retain(|event| !matches!(event, egui::Event::Touch { force: Some(_), .. }));
+    }
+  }
+
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
     if self.surface == WindowSurface::Hidden {
       configure_root_window(RootWindowPresentation::CaptureHost);

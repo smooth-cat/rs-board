@@ -18,6 +18,10 @@ macOS system dictation, the character viewer, and similar system text services c
 `interpretKeyEvents:` path. Upstream `winit 0.30.13` ignores those async insertions in RS Board's
 IME-enabled text fields, so focused egui text editors never receive dictated text.
 
+The upstream macOS backend also flattens tablet-point mouse events into ordinary cursor and mouse
+button events. That discards the normalized pressure reported by AppKit before it can reach egui's
+existing pressure-aware touch event path.
+
 ## Modified Behavior
 
 - While AppKit is interpreting a physical key event, ordinary keyboard characters continue to be
@@ -34,10 +38,19 @@ IME-enabled text fields, so focused egui text editors never receive dictated tex
   restart an active Dictation capture session; all other commands retain winit's existing handling.
 - Empty strings, unfocused views, disabled IME input, and control characters other than CR/LF are
   ignored. CR/LF remain valid so dictation can insert real line breaks.
+- Primary-button tablet-point down, drag, and up events are exposed through winit's existing
+  `Touch` event with normalized AppKit pressure. Standalone `tabletPoint:` events are recognized by
+  event type and synthesize a start phase on the first positive-pressure sample. Ordinary mouse and
+  trackpad events are unchanged.
+- Losing window focus clears any retained tablet contact so a later ordinary mouse-up is not
+  mistaken for the end of an interrupted pen stroke, and emits a cancelled touch so egui releases
+  its matching pointer emulation state.
 
 ## Modified Files
 
 - `src/platform_impl/macos/view.rs`
+- `src/platform_impl/macos/window_delegate.rs`
+- `src/event.rs` (platform-support documentation only)
 
 ## Removal Conditions
 

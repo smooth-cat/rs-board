@@ -2,16 +2,18 @@ use common::{
   ArrowEndpoint, ArrowHead, ArrowPayload, BoardDocument, ColorRgba, CommandBatch, CommandHistory,
   DocumentCommand, Element, ElementId, ElementPayload, LabelPlacementPreference,
   PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx,
-  RectangleLabel, RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokeStyle,
-  StyleChange, TextAlign, TextPayload, TextStyle, minimum_geometry_extent, rectangle_label_layout,
+  RectangleLabel, RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokePoint,
+  StrokeStyle, StyleChange, TextAlign, TextPayload, TextStyle, minimum_geometry_extent,
+  rectangle_label_layout,
 };
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FontId, Id, ImeEvent, Key, KeyboardShortcut, Modifiers,
-  Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
+  Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle, TouchDeviceId, TouchId,
+  TouchPhase,
 };
 
 use crate::renderer::{
-  layout_egui_text, paint_document, paint_element, paint_raw_polyline,
+  layout_egui_text, paint_document, paint_element, paint_raw_stroke_points,
   paint_rectangle_without_label_text,
 };
 
@@ -28,6 +30,7 @@ const HANDLE_VISUAL_RADIUS_PT: f32 = 4.5;
 const HANDLE_HIT_RADIUS_PT: f32 = 11.0;
 const HIT_TOLERANCE_PT: f32 = 7.0;
 const MINIMUM_DISTANCE_ROUNDING_FACTOR: f32 = 4.0;
+const RELEASE_TAPER_WIDTH_FACTOR: f32 = 3.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorTool {
@@ -161,12 +164,16 @@ impl CanvasTransform {
     if !self.canvas_rect.contains(position) {
       return None;
     }
-    Some(PointPx::new(
+    Some(self.egui_to_document_clamped(position))
+  }
+
+  fn egui_to_document_clamped(self, position: Pos2) -> PointPx {
+    PointPx::new(
       ((position.x - self.canvas_rect.min.x) / self.scale)
         .clamp(0.0, self.document_size.width_px as f32),
       ((position.y - self.canvas_rect.min.y) / self.scale)
         .clamp(0.0, self.document_size.height_px as f32),
-    ))
+    )
   }
 
   pub fn document_rect_to_egui(self, rect: RectPx) -> Rect {
@@ -180,7 +187,7 @@ enum PointerInteraction {
     tool: EditorTool,
     start: PointPx,
     current: PointPx,
-    points: Vec<PointPx>,
+    stroke_points: Vec<StrokePoint>,
   },
   Move {
     element_id: ElementId,
@@ -198,6 +205,34 @@ enum PointerInteraction {
     endpoint: ArrowEndpoint,
     current: PointPx,
   },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StylusId {
+  device_id: TouchDeviceId,
+  touch_id: TouchId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StylusEvent {
+  id: StylusId,
+  phase: TouchPhase,
+  position: Pos2,
+  pressure: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StylusSample {
+  phase: TouchPhase,
+  point: PointPx,
+  pressure: f32,
+}
+
+#[derive(Default)]
+struct StylusFrame {
+  samples: Vec<StylusSample>,
+  ended: bool,
+  cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +300,9 @@ pub struct EditorController {
   option_panel_anchor: Option<Pos2>,
   toolbar_screen_rect: Option<Rect>,
   toolbar_was_moved: bool,
+  queued_stylus_events: Vec<StylusEvent>,
+  active_stylus_id: Option<StylusId>,
+  pending_stroke_points: Vec<StrokePoint>,
 }
 
 impl Default for EditorController {
@@ -286,6 +324,9 @@ impl EditorController {
       option_panel_anchor: None,
       toolbar_screen_rect: None,
       toolbar_was_moved: false,
+      queued_stylus_events: Vec::new(),
+      active_stylus_id: None,
+      pending_stroke_points: Vec::new(),
     }
   }
 
@@ -297,6 +338,32 @@ impl EditorController {
     self.tool = tool;
     self.interaction = None;
     self.released_preview_element = None;
+    self.reset_stylus_input();
+  }
+
+  pub(crate) fn capture_stylus_input(&mut self, raw_input: &mut egui::RawInput) {
+    self.capture_stylus_events(&mut raw_input.events);
+  }
+
+  pub(crate) fn capture_stylus_input_state(&mut self, input: &mut egui::InputState) {
+    self.capture_stylus_events(&mut input.events);
+    input.raw.events.retain(|event| !is_stylus_event(event));
+  }
+
+  fn capture_stylus_events(&mut self, events: &mut Vec<Event>) {
+    if events.iter().any(|event| matches!(event, Event::WindowFocused(false))) {
+      self.interaction = None;
+      self.reset_stylus_input();
+      events.retain(|event| !is_stylus_event(event));
+      return;
+    }
+    events.retain(|event| {
+      let Some(stylus_event) = stylus_event(event) else {
+        return true;
+      };
+      self.queued_stylus_events.push(stylus_event);
+      false
+    });
   }
 
   pub fn selected_element_id(&self) -> Option<ElementId> {
@@ -457,16 +524,17 @@ impl EditorController {
         if text_editing {
           self.commit_text(document, actions);
         }
-        self.tool = tool;
-        self.interaction = None;
+        self.set_active_tool(tool);
       }
       ShortcutAction::Undo => {
         self.interaction = None;
+        self.reset_stylus_input();
         self.selected_element_id = None;
         actions.push(EditorAction::Undo);
       }
       ShortcutAction::Redo => {
         self.interaction = None;
+        self.reset_stylus_input();
         self.selected_element_id = None;
         actions.push(EditorAction::Redo);
       }
@@ -477,7 +545,10 @@ impl EditorController {
         actions.push(EditorAction::Save);
       }
       ShortcutAction::CloseOrCancel => {
-        if self.text_editing.take().is_some() || self.interaction.take().is_some() {
+        let cancelled_text = self.text_editing.take().is_some();
+        let cancelled_interaction = self.interaction.take().is_some();
+        if cancelled_text || cancelled_interaction {
+          self.reset_stylus_input();
           return;
         }
         actions.push(EditorAction::Close);
@@ -509,6 +580,44 @@ impl EditorController {
   ) {
     let pointer_position =
       response.interact_pointer_pos().and_then(|p| transform.egui_to_document(p));
+    let was_drawing_stroke =
+      matches!(self.interaction, Some(PointerInteraction::Draw { tool: EditorTool::Stroke, .. }));
+    let stylus_frame = if self.tool == EditorTool::Stroke || was_drawing_stroke {
+      self.take_stylus_frame(transform)
+    } else {
+      self.reset_stylus_input();
+      StylusFrame::default()
+    };
+
+    if was_drawing_stroke {
+      if let Some(PointerInteraction::Draw { current, stroke_points, .. }) = &mut self.interaction {
+        for sample in &stylus_frame.samples {
+          append_stylus_sample(stroke_points, *sample);
+          *current = sample.point;
+        }
+        if stylus_frame.ended {
+          apply_release_taper(stroke_points, self.styles[EditorTool::Stroke.index()].width_px);
+        }
+      }
+    } else if self.tool == EditorTool::Stroke {
+      for sample in &stylus_frame.samples {
+        append_stylus_sample(&mut self.pending_stroke_points, *sample);
+      }
+      if stylus_frame.ended {
+        apply_release_taper(
+          &mut self.pending_stroke_points,
+          self.styles[EditorTool::Stroke.index()].width_px,
+        );
+      }
+    }
+
+    if stylus_frame.cancelled {
+      if was_drawing_stroke {
+        self.interaction = None;
+      }
+      self.pending_stroke_points.clear();
+      return;
+    }
 
     if response.double_clicked()
       && self.tool == EditorTool::Select
@@ -543,7 +652,15 @@ impl EditorController {
         }
         EditorTool::Sequence => self.insert_sequence(document, position, actions),
         EditorTool::Stroke => {
-          if let Some(element) = self.make_stroke(document, &[position]) {
+          let pressure = self
+            .pending_stroke_points
+            .iter()
+            .map(|point| point.pressure)
+            .reduce(f32::max)
+            .unwrap_or(1.0);
+          let point = StrokePoint::with_pressure(position, pressure)
+            .expect("captured stroke pressure is normalized");
+          if let Some(element) = self.make_stroke_points(document, &[point]) {
             let element_id = element.element_id;
             self.push_pointer_command(
               document,
@@ -552,6 +669,7 @@ impl EditorController {
               element_id,
             );
           }
+          self.pending_stroke_points.clear();
         }
         EditorTool::Rectangle | EditorTool::Arrow => {}
       }
@@ -570,11 +688,25 @@ impl EditorController {
           self.tool,
           EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Stroke
         ) {
+          let stroke_points = if self.tool == EditorTool::Stroke {
+            let mut points = std::mem::take(&mut self.pending_stroke_points);
+            if points.first().is_none_or(|point| point.point() != start) {
+              let pressure = points.first().map_or(1.0, |point| point.pressure);
+              points.insert(
+                0,
+                StrokePoint::with_pressure(start, pressure)
+                  .expect("captured stroke pressure is normalized"),
+              );
+            }
+            points
+          } else {
+            Vec::new()
+          };
           self.interaction = Some(PointerInteraction::Draw {
             tool: self.tool,
             start,
             current: pointer_position.unwrap_or(start),
-            points: vec![start],
+            stroke_points,
           });
         }
       }
@@ -584,10 +716,10 @@ impl EditorController {
       && let Some(position) = pointer_position
     {
       match &mut self.interaction {
-        Some(PointerInteraction::Draw { current, points, tool, .. }) => {
+        Some(PointerInteraction::Draw { current, stroke_points, tool, .. }) => {
           *current = position;
-          if *tool == EditorTool::Stroke && points.last().copied() != Some(position) {
-            points.push(position);
+          if *tool == EditorTool::Stroke && stylus_frame.samples.is_empty() {
+            append_stroke_point(stroke_points, StrokePoint::new(position));
           }
         }
         Some(PointerInteraction::Move { current, .. })
@@ -599,7 +731,68 @@ impl EditorController {
 
     if response.drag_stopped() {
       self.finish_pointer_interaction(document, actions);
+      self.pending_stroke_points.clear();
+    } else if stylus_frame.ended && !response.clicked() {
+      self.pending_stroke_points.clear();
     }
+  }
+
+  fn take_stylus_frame(&mut self, transform: CanvasTransform) -> StylusFrame {
+    let mut frame = StylusFrame::default();
+    let mut last_point = match &self.interaction {
+      Some(PointerInteraction::Draw { tool: EditorTool::Stroke, stroke_points, .. }) => {
+        stroke_points.last().map(StrokePoint::point)
+      }
+      _ => self.pending_stroke_points.last().map(StrokePoint::point),
+    };
+    for event in std::mem::take(&mut self.queued_stylus_events) {
+      let point = transform.egui_to_document(event.position);
+      if self.active_stylus_id.is_none()
+        && (event.phase == TouchPhase::Start
+          || (event.phase == TouchPhase::Move && event.pressure > 0.0))
+        && point.is_some()
+      {
+        self.active_stylus_id = Some(event.id);
+      }
+      if self.active_stylus_id != Some(event.id) {
+        continue;
+      }
+
+      match event.phase {
+        TouchPhase::End => {
+          if let Some(point) = point.or(last_point) {
+            frame.samples.push(StylusSample {
+              phase: event.phase,
+              point,
+              pressure: event.pressure,
+            });
+          }
+          frame.ended = true;
+          self.active_stylus_id = None;
+        }
+        TouchPhase::Cancel => {
+          frame.cancelled = true;
+          self.active_stylus_id = None;
+        }
+        TouchPhase::Start | TouchPhase::Move => {
+          if let Some(point) = point {
+            frame.samples.push(StylusSample {
+              phase: event.phase,
+              point,
+              pressure: event.pressure,
+            });
+            last_point = Some(point);
+          }
+        }
+      }
+    }
+    frame
+  }
+
+  fn reset_stylus_input(&mut self) {
+    self.queued_stylus_events.clear();
+    self.active_stylus_id = None;
+    self.pending_stroke_points.clear();
   }
 
   fn begin_selection_drag(
@@ -648,7 +841,7 @@ impl EditorController {
     };
     self.released_preview_element = None;
     match interaction {
-      PointerInteraction::Draw { tool, start, current, mut points } => match tool {
+      PointerInteraction::Draw { tool, start, current, mut stroke_points } => match tool {
         EditorTool::Rectangle => {
           if let Some(element) = self.make_rectangle(document, start, current) {
             let element_id = element.element_id;
@@ -685,10 +878,10 @@ impl EditorController {
           }
         }
         EditorTool::Stroke => {
-          if points.last().copied() != Some(current) {
-            points.push(current);
+          if stroke_points.last().is_none_or(|point| point.point() != current) {
+            append_stroke_point(&mut stroke_points, StrokePoint::new(current));
           }
-          if let Some(element) = self.make_stroke(document, &points) {
+          if let Some(element) = self.make_stroke_points(document, &stroke_points) {
             let element_id = element.element_id;
             self.push_pointer_command(
               document,
@@ -871,11 +1064,21 @@ impl EditorController {
     Some(ArrowPayload { start_px, end_px, stroke_style, head })
   }
 
+  #[cfg(test)]
   fn make_stroke(&self, document: &BoardDocument, points: &[PointPx]) -> Option<Element> {
+    let points = points.iter().copied().map(StrokePoint::new).collect::<Vec<_>>();
+    self.make_stroke_points(document, &points)
+  }
+
+  fn make_stroke_points(
+    &self,
+    document: &BoardDocument,
+    points: &[StrokePoint],
+  ) -> Option<Element> {
     let style = self.tool_style(EditorTool::Stroke);
     let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
     let payload =
-      StrokePayload::from_raw_points_with_hardness(points, stroke_style, style.hardness).ok()?;
+      StrokePayload::from_stroke_points_with_hardness(points, stroke_style, style.hardness).ok()?;
     Element::new(
       ElementId::new(),
       document.elements.len() as i64,
@@ -1134,8 +1337,7 @@ impl EditorController {
               if self.text_editing.is_some() {
                 self.commit_text(document, actions);
               }
-              self.tool = tool;
-              self.interaction = None;
+              self.set_active_tool(tool);
             }
           }
           ui.separator();
@@ -1442,7 +1644,7 @@ impl EditorController {
       return;
     };
     match interaction {
-      PointerInteraction::Draw { tool, start, current, points } => match tool {
+      PointerInteraction::Draw { tool, start, current, stroke_points } => match tool {
         EditorTool::Rectangle => {
           if let Some(element) = self.make_rectangle_preview(document, *start, *current) {
             paint_element(painter, &transform, &element, 0.72);
@@ -1453,10 +1655,10 @@ impl EditorController {
             paint_element(painter, &transform, &element, 0.72);
           }
         }
-        EditorTool::Stroke => paint_raw_polyline(
+        EditorTool::Stroke => paint_raw_stroke_points(
           painter,
           &transform,
-          points,
+          stroke_points,
           self.tool_style(EditorTool::Stroke).color_rgba,
           self.tool_style(EditorTool::Stroke).width_px,
           self.tool_style(EditorTool::Stroke).hardness,
@@ -1557,6 +1759,79 @@ fn hit_test_element(
     ElementPayload::Text(_) | ElementPayload::SequenceMarker(_) => {
       contains(element.bounds_px.expanded(tolerance), point)
     }
+  }
+}
+
+fn append_stroke_point(points: &mut Vec<StrokePoint>, point: StrokePoint) {
+  if let Some(last) = points.last_mut()
+    && last.point() == point.point()
+  {
+    last.pressure = point.pressure;
+  } else {
+    points.push(point);
+  }
+}
+
+fn is_stylus_event(event: &Event) -> bool {
+  matches!(event, Event::Touch { force: Some(_), .. })
+}
+
+fn stylus_event(event: &Event) -> Option<StylusEvent> {
+  let Event::Touch { device_id, id, phase, pos, force: Some(force) } = event else {
+    return None;
+  };
+  let pressure = match phase {
+    TouchPhase::End | TouchPhase::Cancel => 0.0,
+    TouchPhase::Start | TouchPhase::Move => {
+      if force.is_finite() {
+        force.clamp(0.0, 1.0)
+      } else {
+        1.0
+      }
+    }
+  };
+  Some(StylusEvent {
+    id: StylusId { device_id: *device_id, touch_id: *id },
+    phase: *phase,
+    position: *pos,
+    pressure,
+  })
+}
+
+fn append_stylus_sample(points: &mut Vec<StrokePoint>, sample: StylusSample) {
+  match sample.phase {
+    TouchPhase::Cancel => {}
+    TouchPhase::End => {
+      if points.last().is_some_and(|point| point.point() == sample.point) && points.len() == 1 {
+        return;
+      }
+      append_stroke_point(
+        points,
+        StrokePoint::with_pressure(sample.point, 0.0)
+          .expect("captured stroke pressure is normalized"),
+      );
+    }
+    TouchPhase::Start | TouchPhase::Move => append_stroke_point(
+      points,
+      StrokePoint::with_pressure(sample.point, sample.pressure)
+        .expect("captured stroke pressure is normalized"),
+    ),
+  }
+}
+
+fn apply_release_taper(points: &mut [StrokePoint], width_px: f32) {
+  if points.len() < 2 || !width_px.is_finite() || width_px <= 0.0 {
+    return;
+  }
+  let taper_distance = width_px * RELEASE_TAPER_WIDTH_FACTOR;
+  let mut distance_from_tip = 0.0;
+  for index in (0..points.len() - 1).rev() {
+    distance_from_tip += points[index].point().distance_to(points[index + 1].point());
+    if distance_from_tip >= taper_distance {
+      break;
+    }
+    let pressure_cap = (distance_from_tip / taper_distance).clamp(0.0, 1.0);
+    points[index].pressure = points[index].pressure.min(pressure_cap);
   }
 }
 
@@ -2315,6 +2590,34 @@ mod tests {
     actions.expect("editor frame ran")
   }
 
+  fn run_stylus_editor_frame(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    events: Vec<Event>,
+  ) -> Vec<EditorAction> {
+    let mut input = raw_input(events, egui::vec2(800.0, 400.0));
+    controller.capture_stylus_input(&mut input);
+    let mut actions = None;
+    context
+      .run_ui(input, |ui| {
+        actions = Some(controller.show(ui, document, history, None));
+      })
+      .drop_without_applying_deltas();
+    actions.expect("editor frame ran")
+  }
+
+  fn touch_event(phase: TouchPhase, position: Pos2, pressure: f32) -> Event {
+    Event::Touch {
+      device_id: TouchDeviceId(7),
+      id: TouchId(11),
+      phase,
+      pos: position,
+      force: Some(pressure),
+    }
+  }
+
   fn rectangle(document: &BoardDocument, z_index: i64, start: PointPx, end: PointPx) -> Element {
     let style = StrokeStyle::default();
     Element::new(
@@ -2477,7 +2780,7 @@ mod tests {
       tool: EditorTool::Stroke,
       start: points[0],
       current: *points.last().unwrap(),
-      points: points.clone(),
+      stroke_points: points.iter().copied().map(StrokePoint::new).collect(),
     };
     let mut controller = EditorController {
       tool: EditorTool::Stroke,
@@ -2571,6 +2874,205 @@ mod tests {
     let mut changed = document.clone();
     batch.clone().apply(&mut changed).unwrap();
     assert_eq!(hit_test_document(&changed, point, 0.0), Some(element_id));
+  }
+
+  #[test]
+  fn stylus_release_tapers_the_saved_stroke_even_when_the_end_position_is_unchanged() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let mut controller = EditorController::default();
+    controller.set_active_tool(EditorTool::Stroke);
+    let start = Pos2::new(100.0, 100.0);
+    let middle = Pos2::new(150.0, 100.0);
+    let end = Pos2::new(200.0, 100.0);
+
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(start)],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![
+          touch_event(TouchPhase::Start, start, 0.9),
+          Event::PointerMoved(start),
+          Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+          },
+        ],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![touch_event(TouchPhase::Move, middle, 0.8), Event::PointerMoved(middle)],
+      )
+      .is_empty()
+    );
+    assert!(
+      matches!(
+        controller.interaction,
+        Some(PointerInteraction::Draw { tool: EditorTool::Stroke, .. })
+      ),
+      "stylus movement should start a stroke drag"
+    );
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![touch_event(TouchPhase::Move, end, 0.7), Event::PointerMoved(end)],
+      )
+      .is_empty()
+    );
+    let actions = run_stylus_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![
+        touch_event(TouchPhase::End, end, 0.0),
+        Event::PointerButton {
+          pos: end,
+          button: egui::PointerButton::Primary,
+          pressed: false,
+          modifiers: Modifiers::NONE,
+        },
+        Event::PointerGone,
+      ],
+    );
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one pressure stroke command, got {actions:?}");
+    };
+    let [DocumentCommand::AddElement { element }] = batch.commands() else {
+      panic!("expected AddElement");
+    };
+    let ElementPayload::Stroke(payload) = &element.payload else {
+      panic!("expected a stroke element");
+    };
+    assert!(payload.points.len() >= 3);
+    assert_eq!(payload.points.last().unwrap().pressure, 0.0);
+    let tail = &payload.points[payload.points.len() - 3..];
+    assert!(tail.windows(2).all(|points| points[0].pressure >= points[1].pressure));
+    assert!(tail[0].pressure > tail[1].pressure);
+  }
+
+  #[test]
+  fn stylus_tap_keeps_contact_pressure_instead_of_disappearing_on_release() {
+    let point = PointPx::new(20.0, 20.0);
+    let mut points = vec![StrokePoint::with_pressure(point, 0.35).unwrap()];
+    append_stylus_sample(
+      &mut points,
+      StylusSample { phase: TouchPhase::End, point, pressure: 0.0 },
+    );
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].pressure, 0.35);
+  }
+
+  #[test]
+  fn input_state_capture_routes_only_pressure_touch_events() {
+    let stylus = touch_event(TouchPhase::Move, Pos2::new(20.0, 30.0), 0.45);
+    let finger = Event::Touch {
+      device_id: TouchDeviceId(8),
+      id: TouchId(12),
+      phase: TouchPhase::Move,
+      pos: Pos2::new(40.0, 50.0),
+      force: None,
+    };
+    let mut input = egui::InputState::default();
+    input.events = vec![stylus.clone(), finger.clone()];
+    input.raw.events = vec![stylus, finger.clone()];
+    let mut controller = EditorController::default();
+
+    controller.capture_stylus_input_state(&mut input);
+
+    assert_eq!(controller.queued_stylus_events.len(), 1);
+    assert_eq!(controller.queued_stylus_events[0].pressure, 0.45);
+    assert_eq!(input.events, vec![finger.clone()]);
+    assert_eq!(input.raw.events, vec![finger]);
+  }
+
+  #[test]
+  fn focus_loss_discards_pressure_events_from_the_same_frame() {
+    let mut controller = EditorController::default();
+    let mut input = raw_input(
+      vec![
+        touch_event(TouchPhase::Start, Pos2::new(20.0, 30.0), 0.45),
+        Event::WindowFocused(false),
+      ],
+      egui::vec2(100.0, 100.0),
+    );
+
+    controller.capture_stylus_input(&mut input);
+
+    assert!(controller.queued_stylus_events.is_empty());
+    assert_eq!(input.events, vec![Event::WindowFocused(false)]);
+  }
+
+  #[test]
+  fn positive_move_can_start_stylus_capture_without_drawing_clamped_outside_moves() {
+    let transform = CanvasTransform::fit(
+      SizePx::new(100, 100),
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0)),
+    )
+    .unwrap();
+    let id = StylusId { device_id: TouchDeviceId(7), touch_id: TouchId(11) };
+    let inside = Pos2::new(80.0, 40.0);
+    let outside = Pos2::new(130.0, 70.0);
+    let mut controller = EditorController {
+      queued_stylus_events: vec![
+        StylusEvent { id, phase: TouchPhase::Move, position: inside, pressure: 0.6 },
+        StylusEvent { id, phase: TouchPhase::Move, position: outside, pressure: 0.5 },
+        StylusEvent { id, phase: TouchPhase::End, position: outside, pressure: 0.0 },
+      ],
+      ..Default::default()
+    };
+
+    let frame = controller.take_stylus_frame(transform);
+
+    assert!(frame.ended);
+    assert_eq!(frame.samples.len(), 2);
+    assert_eq!(frame.samples[0].point, PointPx::new(80.0, 40.0));
+    assert_eq!(frame.samples[1].point, PointPx::new(80.0, 40.0));
+    assert_eq!(frame.samples[1].pressure, 0.0);
+    assert!(controller.active_stylus_id.is_none());
+  }
+
+  #[test]
+  fn release_taper_reduces_pressure_before_a_nearby_tip() {
+    let mut points = vec![
+      StrokePoint::with_pressure(PointPx::new(10.0, 20.0), 0.8).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(36.0, 20.0), 0.8).unwrap(),
+      StrokePoint::with_pressure(PointPx::new(40.0, 20.0), 0.0).unwrap(),
+    ];
+
+    apply_release_taper(&mut points, 12.0);
+
+    assert_eq!(points[0].pressure, 0.8);
+    assert!(points[1].pressure < 0.8);
+    assert!(points[1].pressure > 0.0);
+    assert_eq!(points[2].pressure, 0.0);
+    let penultimate_radius = 12.0 * points[1].pressure / 2.0;
+    assert!(penultimate_radius < points[1].point().distance_to(points[2].point()));
   }
 
   #[test]
@@ -2747,7 +3249,7 @@ mod tests {
         tool: EditorTool::Rectangle,
         start,
         current: requested,
-        points: vec![start, requested],
+        stroke_points: Vec::new(),
       };
       let mut controller =
         EditorController { interaction: Some(interaction), ..Default::default() };
@@ -2825,7 +3327,7 @@ mod tests {
         tool: EditorTool::Arrow,
         start,
         current: requested,
-        points: vec![start, requested],
+        stroke_points: Vec::new(),
       };
       let mut controller =
         EditorController { interaction: Some(interaction), ..Default::default() };
