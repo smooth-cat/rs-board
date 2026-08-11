@@ -2831,7 +2831,10 @@ mod tests {
       let preview_rects =
         output.shapes.iter().map(|shape| shape.shape.visual_bounding_rect()).collect::<Vec<_>>();
       output.drop_without_applying_deltas();
-      assert_eq!(preview_shape_count + 1, baseline_shape_count, "endpoint={endpoint:?}");
+      assert!(
+        preview_shape_count < baseline_shape_count,
+        "raw endpoint preview must replace the arrowhead shapes: endpoint={endpoint:?}"
+      );
       assert_ne!(preview_rects, baseline_rects, "endpoint={endpoint:?}");
 
       let mut actions = Vec::new();

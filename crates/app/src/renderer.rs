@@ -6,7 +6,7 @@ use common::{
   RectangleLabelLayout, RectanglePayload, SizePx, TextAlign, TextStyle, rectangle_label_layout,
 };
 use eframe::egui::{
-  self, Align, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+  self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
 };
 use image::{Rgba, RgbaImage, imageops::FilterType};
 use imageproc::drawing::{draw_text_mut, text_size};
@@ -14,6 +14,7 @@ use imageproc::drawing::{draw_text_mut, text_size};
 use crate::editor::CanvasTransform;
 
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
+const ARROW_HEAD_NECK_LENGTH_FACTOR: f32 = 0.7;
 
 /// Read-only document surface shared by live documents and frozen snapshots.
 pub trait RenderDocument {
@@ -161,21 +162,29 @@ fn paint_arrow(
 ) {
   let color = egui_color(payload.stroke_style.color_rgba, opacity);
   let stroke = Stroke::new(payload.stroke_style.width_px * transform.scale(), color);
-  painter.line_segment(
-    [transform.document_to_egui(payload.start_px), transform.document_to_egui(payload.end_px)],
-    stroke,
-  );
-  if let Some([tip, left, right]) = arrow_head_points(payload) {
-    painter.add(Shape::convex_polygon(
-      vec![
-        transform.document_to_egui(tip),
-        transform.document_to_egui(left),
-        transform.document_to_egui(right),
-      ],
-      color,
-      Stroke::NONE,
-    ));
+  let Some(geometry) = arrow_geometry(payload) else {
+    painter.line_segment(
+      [transform.document_to_egui(payload.start_px), transform.document_to_egui(payload.end_px)],
+      stroke,
+    );
+    return;
+  };
+  if let Some(shaft_end) = geometry.shaft_end {
+    painter.line_segment(
+      [transform.document_to_egui(payload.start_px), transform.document_to_egui(shaft_end)],
+      stroke,
+    );
   }
+  let outline = geometry.head_outline().map(|point| transform.document_to_egui(point));
+  let mut mesh = Mesh::default();
+  for point in outline {
+    mesh.colored_vertex(point, color);
+  }
+  for [first, second, third] in ArrowGeometry::HEAD_TRIANGLE_INDICES {
+    mesh.add_triangle(first, second, third);
+  }
+  painter.add(Shape::mesh(mesh));
+  painter.add(Shape::closed_line(outline.to_vec(), Stroke::new(1.0, color)));
 }
 
 fn paint_rectangle(
@@ -304,15 +313,27 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
     }
     ElementPayload::Arrow(payload) => {
       let color = rgba(payload.stroke_style.color_rgba);
-      draw_thick_segment(
-        image,
-        payload.start_px,
-        payload.end_px,
-        payload.stroke_style.width_px,
-        color,
-      );
-      if let Some([tip, left, right]) = arrow_head_points(payload) {
-        fill_triangle(image, tip, left, right, color);
+      if let Some(geometry) = arrow_geometry(payload) {
+        if let Some(shaft_end) = geometry.shaft_end {
+          draw_thick_segment(
+            image,
+            payload.start_px,
+            shaft_end,
+            payload.stroke_style.width_px,
+            color,
+          );
+        }
+        for [first, second, third] in geometry.head_triangles() {
+          fill_triangle(image, first, second, third, color);
+        }
+      } else {
+        draw_thick_segment(
+          image,
+          payload.start_px,
+          payload.end_px,
+          payload.stroke_style.width_px,
+          color,
+        );
       }
     }
     ElementPayload::Rectangle(payload) => {
@@ -398,7 +419,32 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
   }
 }
 
-fn arrow_head_points(payload: &ArrowPayload) -> Option<[PointPx; 3]> {
+#[derive(Debug, Clone, Copy)]
+struct ArrowGeometry {
+  tip: PointPx,
+  left_wing: PointPx,
+  left_neck: PointPx,
+  right_neck: PointPx,
+  right_wing: PointPx,
+  shaft_end: Option<PointPx>,
+}
+
+impl ArrowGeometry {
+  const HEAD_TRIANGLE_INDICES: [[u32; 3]; 3] = [[0, 1, 2], [0, 2, 3], [0, 3, 4]];
+
+  fn head_outline(self) -> [PointPx; 5] {
+    [self.tip, self.left_wing, self.left_neck, self.right_neck, self.right_wing]
+  }
+
+  fn head_triangles(self) -> [[PointPx; 3]; 3] {
+    let points = self.head_outline();
+    Self::HEAD_TRIANGLE_INDICES.map(|indices| {
+      [points[indices[0] as usize], points[indices[1] as usize], points[indices[2] as usize]]
+    })
+  }
+}
+
+fn arrow_geometry(payload: &ArrowPayload) -> Option<ArrowGeometry> {
   let x = payload.end_px.x_px - payload.start_px.x_px;
   let y = payload.end_px.y_px - payload.start_px.y_px;
   let length = x.hypot(y);
@@ -407,22 +453,38 @@ fn arrow_head_points(payload: &ArrowPayload) -> Option<[PointPx; 3]> {
   }
   let unit = PointPx::new(x / length, y / length);
   let perpendicular = PointPx::new(-unit.y_px, unit.x_px);
-  let base = PointPx::new(
+  let wing_center = PointPx::new(
     payload.end_px.x_px - unit.x_px * payload.head.length_px,
     payload.end_px.y_px - unit.y_px * payload.head.length_px,
   );
-  let half_width = payload.head.width_px / 2.0;
-  Some([
-    payload.end_px,
-    PointPx::new(
-      base.x_px + perpendicular.x_px * half_width,
-      base.y_px + perpendicular.y_px * half_width,
+  let neck_length = payload.head.length_px * ARROW_HEAD_NECK_LENGTH_FACTOR;
+  let neck_center = PointPx::new(
+    payload.end_px.x_px - unit.x_px * neck_length,
+    payload.end_px.y_px - unit.y_px * neck_length,
+  );
+  let half_head_width = payload.head.width_px / 2.0;
+  let half_shaft_width = payload.stroke_style.width_px / 2.0;
+  Some(ArrowGeometry {
+    tip: payload.end_px,
+    left_wing: PointPx::new(
+      wing_center.x_px + perpendicular.x_px * half_head_width,
+      wing_center.y_px + perpendicular.y_px * half_head_width,
     ),
-    PointPx::new(
-      base.x_px - perpendicular.x_px * half_width,
-      base.y_px - perpendicular.y_px * half_width,
+    left_neck: PointPx::new(
+      neck_center.x_px + perpendicular.x_px * half_shaft_width,
+      neck_center.y_px + perpendicular.y_px * half_shaft_width,
     ),
-  ])
+    right_neck: PointPx::new(
+      neck_center.x_px - perpendicular.x_px * half_shaft_width,
+      neck_center.y_px - perpendicular.y_px * half_shaft_width,
+    ),
+    right_wing: PointPx::new(
+      wing_center.x_px - perpendicular.x_px * half_head_width,
+      wing_center.y_px - perpendicular.y_px * half_head_width,
+    ),
+    // Keeping the round shaft cap inside the recessed neck preserves the sharp tip.
+    shaft_end: (length > neck_length).then_some(neck_center),
+  })
 }
 
 fn draw_thick_segment(
@@ -662,8 +724,8 @@ mod tests {
   use chrono::{TimeZone, Utc};
   use common::{
     ArrowHead, ArrowPayload, CapturedDisplay, DocumentId, ElementId, GlobalBoundsPx,
-    LabelPlacementPreference, RectangleLabel, RectanglePayload, SequenceMarkerPayload, StrokeStyle,
-    TextPayload, TextStyle,
+    LabelPlacementPreference, PRESET_STROKE_WIDTHS_PX, RectangleLabel, RectanglePayload,
+    SequenceMarkerPayload, StrokeStyle, TextPayload, TextStyle,
   };
   use uuid::Uuid;
 
@@ -804,6 +866,92 @@ mod tests {
     assert_eq!(rendered.dimensions(), (100, 80));
     assert!(rendered.get_pixel(20, 45)[0] > 200);
     assert!(rendered.get_pixel(45, 45)[0] < 20);
+  }
+
+  #[test]
+  fn arrow_head_stays_sharp_and_hooked_for_every_stroke_width() {
+    let background_color = Rgba([0, 0, 0, 255]);
+    for width_px in PRESET_STROKE_WIDTHS_PX {
+      let mut document = document_with_size(240, 101);
+      let stroke_style = StrokeStyle::mvp(ColorRgba::RED, width_px).unwrap();
+      let payload = ArrowPayload {
+        start_px: PointPx::new(20.0, 50.5),
+        end_px: PointPx::new(180.0, 50.5),
+        head: ArrowHead::for_stroke_width(width_px).unwrap(),
+        stroke_style,
+      };
+      let geometry = arrow_geometry(&payload).unwrap();
+      let expected_neck_x = 180.0 - payload.head.length_px * ARROW_HEAD_NECK_LENGTH_FACTOR;
+      assert_eq!(
+        geometry.shaft_end,
+        Some(PointPx::new(expected_neck_x, 50.5)),
+        "shaft must stop inside the arrowhead neck for width {width_px}"
+      );
+      assert_eq!(geometry.left_wing.x_px, 180.0 - payload.head.length_px);
+      assert_eq!(geometry.left_neck.x_px, expected_neck_x);
+      assert!(geometry.left_neck.x_px > geometry.left_wing.x_px);
+      assert!(geometry.left_neck.y_px < geometry.left_wing.y_px);
+      assert_eq!(geometry.left_wing.y_px - geometry.right_wing.y_px, payload.head.width_px);
+      assert_eq!(geometry.left_neck.y_px - geometry.right_neck.y_px, payload.stroke_style.width_px);
+      document.elements.push(
+        Element::new(ElementId::new(), 0, ElementPayload::Arrow(payload), document.canvas_size_px)
+          .unwrap(),
+      );
+
+      let background = RgbaImage::from_pixel(240, 101, background_color);
+      let rendered = render_document_to_image(&document, &background);
+      let tip_pixels =
+        (0..rendered.height()).filter(|&y| rendered.get_pixel(179, y) != &background_color).count();
+      let pixels_past_tip = (180..rendered.width())
+        .flat_map(|x| (0..rendered.height()).map(move |y| (x, y)))
+        .filter(|&(x, y)| rendered.get_pixel(x, y) != &background_color)
+        .count();
+
+      assert_eq!(tip_pixels, 1, "arrow tip must narrow to one pixel for width {width_px}");
+      assert_eq!(pixels_past_tip, 0, "shaft cap must not extend past width {width_px} tip");
+    }
+  }
+
+  #[test]
+  fn screen_arrow_head_uses_one_mesh_and_only_an_outer_edge() {
+    let context = egui::Context::default();
+    let stroke_style = StrokeStyle::mvp(ColorRgba::RED, 4.0).unwrap();
+    let payload = ArrowPayload {
+      start_px: PointPx::new(20.0, 50.5),
+      end_px: PointPx::new(180.0, 50.5),
+      head: ArrowHead::for_stroke_width(stroke_style.width_px).unwrap(),
+      stroke_style,
+    };
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 101.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(SizePx::new(240, 101), ui.max_rect()).unwrap();
+        paint_arrow(ui.painter(), &transform, &payload, 1.0);
+      },
+    );
+
+    let head_meshes = output
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        Shape::Mesh(mesh) if mesh.indices.len() == 9 => Some(mesh),
+        _ => None,
+      })
+      .count();
+    let head_outlines = output
+      .shapes
+      .iter()
+      .filter(
+        |shape| matches!(&shape.shape, Shape::Path(path) if path.closed && path.points.len() == 5),
+      )
+      .count();
+
+    assert_eq!(head_meshes, 1, "arrowhead fill must not expose internal triangle edges");
+    assert_eq!(head_outlines, 1, "only the five-point outer edge should be anti-aliased");
+    output.drop_without_applying_deltas();
   }
 
   #[test]

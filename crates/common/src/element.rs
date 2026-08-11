@@ -267,8 +267,8 @@ impl ArrowHead {
       return Err(ElementError::InvalidArrowHead);
     }
     Ok(Self {
-      length_px: (width_px * 4.0).clamp(16.0, 64.0),
-      width_px: (width_px * 2.5).clamp(12.0, 48.0),
+      length_px: (width_px * 5.0).clamp(20.0, 60.0),
+      width_px: (width_px * 4.0).clamp(16.0, 48.0),
       min_body_length_px: (width_px * 3.0).max(12.0),
     })
   }
@@ -1137,6 +1137,17 @@ mod tests {
     .unwrap();
     assert!(arrow.bounds_px.width() > 160.0);
     assert!(arrow.bounds_px.height() > 160.0);
+  }
+
+  #[test]
+  fn arrow_head_uses_reference_proportions_for_every_stroke_width() {
+    for (width_px, expected_length, expected_width) in
+      [(4.0, 20.0, 16.0), (8.0, 40.0, 32.0), (12.0, 60.0, 48.0)]
+    {
+      let head = ArrowHead::for_stroke_width(width_px).unwrap();
+      assert_eq!(head.length_px, expected_length);
+      assert_eq!(head.width_px, expected_width);
+    }
   }
 
   #[test]
