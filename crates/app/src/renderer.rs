@@ -2,9 +2,10 @@ use std::sync::{Arc, OnceLock};
 
 use ab_glyph::{FontArc, PxScale};
 use common::{
-  ArrowPayload, BoardDocument, ColorRgba, DocumentSnapshot, Element, ElementPayload, PointPx,
-  RectangleLabelLayout, RectanglePayload, SizePx, StrokePoint, TextAlign, TextStyle,
-  rectangle_label_layout,
+  ArrowLabelLayout, ArrowPayload, BoardDocument, ColorRgba, DocumentSnapshot, Element,
+  ElementPayload, PointPx, RectangleLabelLayout, RectanglePayload, SizePx, StrokePoint, TextAlign,
+  TextStyle, arrow_label_layout, rectangle_label_layout, wrap_arrow_label_text_lines,
+  wrap_text_lines,
 };
 use eframe::egui::{
   self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
@@ -333,6 +334,33 @@ fn paint_arrow(
   payload: &ArrowPayload,
   opacity: f32,
 ) {
+  if let Some(layout) = paint_arrow_without_label_text(painter, transform, payload, opacity) {
+    let Some(text) = payload.label.visible_text() else {
+      return;
+    };
+    let label_rect = transform.document_rect_to_egui(layout.bounds_px);
+    let padding = payload.label.padding_px * transform.scale();
+    paint_arrow_label_text(
+      painter,
+      label_rect.min + egui::vec2(padding, padding),
+      text,
+      &payload.label.text_style,
+      TextPaintWidths {
+        wrap: layout.text_wrap_width_px * transform.scale(),
+        alignment: (label_rect.width() - padding * 2.0).max(1.0),
+      },
+      transform.scale(),
+      opacity,
+    );
+  }
+}
+
+pub(crate) fn paint_arrow_without_label_text(
+  painter: &Painter,
+  transform: &CanvasTransform,
+  payload: &ArrowPayload,
+  opacity: f32,
+) -> Option<ArrowLabelLayout> {
   let color = egui_color(payload.stroke_style.color_rgba, opacity);
   let stroke = Stroke::new(payload.stroke_style.width_px * transform.scale(), color);
   let Some(geometry) = arrow_geometry(payload) else {
@@ -340,7 +368,7 @@ fn paint_arrow(
       [transform.document_to_egui(payload.start_px), transform.document_to_egui(payload.end_px)],
       stroke,
     );
-    return;
+    return None;
   };
   if let Some(shaft_end) = geometry.shaft_end {
     painter.line_segment(
@@ -358,6 +386,12 @@ fn paint_arrow(
   }
   painter.add(Shape::mesh(mesh));
   painter.add(Shape::closed_line(outline.to_vec(), Stroke::new(1.0, color)));
+
+  let layout = arrow_label_layout(payload, transform.document_size()).ok().flatten()?;
+  let label_rect = transform.document_rect_to_egui(layout.bounds_px);
+  let radius = (5.0 * transform.scale()).clamp(0.0, 255.0) as u8;
+  painter.rect_filled(label_rect, egui::CornerRadius::same(radius), color);
+  Some(layout)
 }
 
 fn paint_rectangle(
@@ -367,12 +401,15 @@ fn paint_rectangle(
   opacity: f32,
 ) {
   if let Some(layout) = paint_rectangle_without_label_text(painter, transform, payload, opacity) {
+    let Some(text) = payload.label.visible_text() else {
+      return;
+    };
     let label_rect = transform.document_rect_to_egui(layout.bounds_px);
     let padding = payload.label.padding_px * transform.scale();
     paint_text(
       painter,
       label_rect.min + egui::vec2(padding, padding),
-      &payload.label.text,
+      text,
       &payload.label.text_style,
       TextPaintWidths {
         wrap: layout.text_wrap_width_px * transform.scale(),
@@ -402,7 +439,7 @@ pub(crate) fn paint_rectangle_without_label_text(
     StrokeKind::Middle,
   );
 
-  let layout = rectangle_label_layout(payload, transform.document_size()).ok()?;
+  let layout = rectangle_label_layout(payload, transform.document_size()).ok().flatten()?;
   let label_rect = transform.document_rect_to_egui(layout.bounds_px);
   let radius = (5.0 * transform.scale()).clamp(0.0, 255.0) as u8;
   painter.rect_filled(
@@ -422,8 +459,43 @@ fn paint_text(
   scale: f32,
   opacity: f32,
 ) {
+  paint_text_with_wrapping(painter, origin, text, style, widths, scale, opacity, wrap_text);
+}
+
+fn paint_arrow_label_text(
+  painter: &Painter,
+  origin: Pos2,
+  text: &str,
+  style: &TextStyle,
+  widths: TextPaintWidths,
+  scale: f32,
+  opacity: f32,
+) {
+  paint_text_with_wrapping(
+    painter,
+    origin,
+    text,
+    style,
+    widths,
+    scale,
+    opacity,
+    wrap_arrow_label_text,
+  );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_text_with_wrapping(
+  painter: &Painter,
+  origin: Pos2,
+  text: &str,
+  style: &TextStyle,
+  widths: TextPaintWidths,
+  scale: f32,
+  opacity: f32,
+  wrap: fn(&str, &TextStyle, f32) -> Vec<String>,
+) {
   let color = egui_color(style.color_rgba, opacity);
-  let galley = layout_egui_text(painter, text, style, widths.wrap, scale, opacity);
+  let galley = layout_painted_text(painter, text, style, widths.wrap, scale, opacity, wrap);
   let x = match style.align {
     TextAlign::Left => origin.x,
     TextAlign::Center => origin.x + widths.alignment / 2.0,
@@ -465,10 +537,25 @@ pub(crate) fn layout_egui_text(
     TextAlign::Right => Align::RIGHT,
   };
   job.keep_trailing_whitespace = true;
+  job.wrap.break_anywhere = true;
   for section in &mut job.sections {
     section.format.line_height = Some(style.line_height_px * scale);
   }
   painter.layout_job(job)
+}
+
+fn layout_painted_text(
+  painter: &Painter,
+  text: &str,
+  style: &TextStyle,
+  wrap_width: f32,
+  scale: f32,
+  opacity: f32,
+  wrap: fn(&str, &TextStyle, f32) -> Vec<String>,
+) -> Arc<egui::Galley> {
+  let document_wrap_width = wrap_width / scale.max(f32::EPSILON);
+  let wrapped_text = wrap(text, style, document_wrap_width).join("\n");
+  layout_egui_text(painter, &wrapped_text, style, f32::INFINITY, scale, opacity)
 }
 
 fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx) {
@@ -504,6 +591,24 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
           color,
         );
       }
+      if let Ok(Some(layout)) = arrow_label_layout(payload, canvas_size)
+        && let Some(text) = payload.label.visible_text()
+      {
+        fill_rounded_rect(image, layout.bounds_px, 5.0, color);
+        draw_wrapped_arrow_label_text(
+          image,
+          PointPx::new(
+            layout.bounds_px.min.x_px + payload.label.padding_px,
+            layout.bounds_px.min.y_px + payload.label.padding_px,
+          ),
+          text,
+          &payload.label.text_style,
+          TextPaintWidths {
+            wrap: layout.text_wrap_width_px,
+            alignment: (layout.bounds_px.width() - payload.label.padding_px * 2.0).max(1.0),
+          },
+        );
+      }
     }
     ElementPayload::Rectangle(payload) => {
       let color = rgba(payload.stroke_style.color_rgba);
@@ -537,7 +642,9 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
         color,
       );
 
-      if let Ok(layout) = rectangle_label_layout(payload, canvas_size) {
+      if let Ok(Some(layout)) = rectangle_label_layout(payload, canvas_size)
+        && let Some(text) = payload.label.visible_text()
+      {
         fill_rounded_rect(image, layout.bounds_px, 5.0, color);
         draw_wrapped_text(
           image,
@@ -545,7 +652,7 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
             layout.bounds_px.min.x_px + payload.label.padding_px,
             layout.bounds_px.min.y_px + payload.label.padding_px,
           ),
-          &payload.label.text,
+          text,
           &payload.label.text_style,
           TextPaintWidths {
             wrap: layout.text_wrap_width_px,
@@ -882,10 +989,31 @@ fn draw_wrapped_text(
   style: &TextStyle,
   widths: TextPaintWidths,
 ) {
+  draw_wrapped_text_with(image, origin, text, style, widths, wrap_text);
+}
+
+fn draw_wrapped_arrow_label_text(
+  image: &mut RgbaImage,
+  origin: PointPx,
+  text: &str,
+  style: &TextStyle,
+  widths: TextPaintWidths,
+) {
+  draw_wrapped_text_with(image, origin, text, style, widths, wrap_arrow_label_text);
+}
+
+fn draw_wrapped_text_with(
+  image: &mut RgbaImage,
+  origin: PointPx,
+  text: &str,
+  style: &TextStyle,
+  widths: TextPaintWidths,
+  wrap: fn(&str, &TextStyle, f32) -> Vec<String>,
+) {
   let Some(font) = cjk_font() else {
     return;
   };
-  let lines = wrap_text(text, style.font_size_px, widths.wrap);
+  let lines = wrap(text, style, widths.wrap);
   for (index, line) in lines.iter().enumerate() {
     let (width, _) = text_size(PxScale::from(style.font_size_px), font, line);
     let x = match style.align {
@@ -922,32 +1050,12 @@ fn draw_centered_text(image: &mut RgbaImage, center: PointPx, text: &str, style:
   );
 }
 
-fn wrap_text(text: &str, font_size: f32, maximum_width: f32) -> Vec<String> {
-  let mut lines = Vec::new();
-  let mut line = String::new();
-  let mut width = 0.0;
-  for character in text.chars() {
-    if character == '\n' {
-      lines.push(std::mem::take(&mut line));
-      width = 0.0;
-      continue;
-    }
-    let character_width = if character.is_ascii_whitespace() {
-      font_size * 0.33
-    } else if character.is_ascii() {
-      font_size * 0.6
-    } else {
-      font_size
-    };
-    if !line.is_empty() && width + character_width > maximum_width {
-      lines.push(std::mem::take(&mut line));
-      width = 0.0;
-    }
-    line.push(character);
-    width += character_width;
-  }
-  lines.push(line);
-  lines
+fn wrap_text(text: &str, style: &TextStyle, maximum_width: f32) -> Vec<String> {
+  wrap_text_lines(text, style, maximum_width).unwrap_or_else(|_| vec![text.to_owned()])
+}
+
+fn wrap_arrow_label_text(text: &str, style: &TextStyle, maximum_width: f32) -> Vec<String> {
+  wrap_arrow_label_text_lines(text, style, maximum_width).unwrap_or_else(|_| vec![text.to_owned()])
 }
 
 fn cjk_font() -> Option<&'static FontArc> {
@@ -1012,9 +1120,9 @@ fn rgba(color: ColorRgba) -> Rgba<u8> {
 mod tests {
   use chrono::{TimeZone, Utc};
   use common::{
-    ArrowHead, ArrowPayload, CapturedDisplay, DocumentId, ElementId, GlobalBoundsPx,
-    LabelPlacementPreference, PRESET_STROKE_WIDTHS_PX, RectangleLabel, RectanglePayload,
-    SequenceMarkerPayload, StrokePayload, StrokeStyle, TextPayload, TextStyle,
+    ArrowHead, ArrowPayload, CapturedDisplay, DocumentId, ElementId, ElementLabel, GlobalBoundsPx,
+    PRESET_STROKE_WIDTHS_PX, RectangleLabelAnchor, RectangleLabelEdge, RectangleLabelSide,
+    RectanglePayload, SequenceMarkerPayload, StrokePayload, StrokeStyle, TextPayload, TextStyle,
   };
   use uuid::Uuid;
 
@@ -1037,6 +1145,37 @@ mod tests {
     .unwrap()
   }
 
+  fn empty_arrow_label(stroke_style: &StrokeStyle) -> ElementLabel {
+    ElementLabel {
+      text: None,
+      max_width_px: 420.0,
+      padding_px: 8.0,
+      anchor_offset_px: 8.0,
+      text_style: TextStyle::mvp(stroke_style.color_rgba.contrasting_text(), 24.0).unwrap(),
+    }
+  }
+
+  fn labeled_arrow_payload(
+    start_px: PointPx,
+    end_px: PointPx,
+    text: impl Into<String>,
+  ) -> ArrowPayload {
+    let stroke_style = StrokeStyle::mvp(ColorRgba::BLUE, 4.0).unwrap();
+    ArrowPayload {
+      start_px,
+      end_px,
+      head: ArrowHead::for_stroke_width(stroke_style.width_px).unwrap(),
+      label: ElementLabel {
+        text: Some(text.into()),
+        max_width_px: 120.0,
+        padding_px: 6.0,
+        anchor_offset_px: 8.0,
+        text_style: TextStyle::mvp(stroke_style.color_rgba.contrasting_text(), 16.0).unwrap(),
+      },
+      stroke_style,
+    }
+  }
+
   fn rectangle_payload(
     start_px: PointPx,
     end_px: PointPx,
@@ -1048,14 +1187,18 @@ mod tests {
       end_px,
       stroke_style: stroke_style.clone(),
       fill_rgba: None,
-      label: RectangleLabel {
-        text: text.into(),
-        placement_preference: LabelPlacementPreference::Above,
+      label: ElementLabel {
+        text: Some(text.into()),
         max_width_px: 240.0,
         padding_px: 8.0,
         anchor_offset_px: 8.0,
         text_style: TextStyle::mvp(stroke_style.color_rgba.contrasting_text(), 24.0).unwrap(),
       },
+      label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
     }
   }
 
@@ -1080,7 +1223,7 @@ mod tests {
   fn rectangle_chrome_helper_paints_no_label_glyphs() {
     let context = egui::Context::default();
     let payload = rectangle_payload(PointPx::new(40.0, 80.0), PointPx::new(140.0, 140.0), "OK");
-    let expected = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap();
+    let expected = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap().unwrap();
     let output = context.run_ui(
       egui::RawInput {
         screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 180.0))),
@@ -1102,16 +1245,201 @@ mod tests {
   }
 
   #[test]
+  fn arrow_label_uses_the_shared_horizontal_layout_for_screen_and_png() {
+    let canvas = SizePx::new(240, 160);
+    let payload = labeled_arrow_payload(
+      PointPx::new(30.0, 130.0),
+      PointPx::new(210.0, 30.0),
+      "iiiiiiiiiiiiiiiiiiiiiiii",
+    );
+    let expected = arrow_label_layout(&payload, canvas).unwrap().unwrap();
+    assert_eq!(expected.bounds_px.center(), PointPx::new(120.0, 80.0));
+    let wrapped_lines = wrap_arrow_label_text(
+      payload.label.visible_text().unwrap(),
+      &payload.label.text_style,
+      expected.text_wrap_width_px,
+    );
+    assert_eq!(wrapped_lines, ["iiiiiiiiiii", "iiiiiiiiiii", "ii"]);
+    assert_eq!(expected.text_layout.line_count, wrapped_lines.len());
+
+    let context = egui::Context::default();
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 160.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(canvas, ui.max_rect()).unwrap();
+        let actual =
+          paint_arrow_without_label_text(ui.painter(), &transform, &payload, 1.0).unwrap();
+        assert_eq!(actual, expected);
+      },
+    );
+    let expected_rect = Rect::from_min_max(
+      egui::pos2(expected.bounds_px.min.x_px, expected.bounds_px.min.y_px),
+      egui::pos2(expected.bounds_px.max.x_px, expected.bounds_px.max.y_px),
+    );
+    assert!(output.shapes.iter().all(|shape| !matches!(shape.shape, Shape::Text(_))));
+    assert!(output.shapes.iter().any(|shape| match &shape.shape {
+      Shape::Rect(rectangle) => {
+        rectangle.fill == egui_color(payload.stroke_style.color_rgba, 1.0)
+          && rectangle.rect.min.distance(expected_rect.min) < 0.1
+          && rectangle.rect.max.distance(expected_rect.max) < 0.1
+      }
+      _ => false,
+    }));
+    output.drop_without_applying_deltas();
+
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 160.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(canvas, ui.max_rect()).unwrap();
+        paint_arrow(ui.painter(), &transform, &payload, 1.0);
+      },
+    );
+    let text_shape = output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        Shape::Text(text) => Some(text),
+        _ => None,
+      })
+      .expect("persistent arrow label must paint its text");
+    assert_eq!(text_shape.galley.job.text, wrapped_lines.join("\n"));
+    assert_eq!(text_shape.galley.rows.len(), expected.text_layout.line_count);
+    assert_eq!(text_shape.angle, 0.0);
+    output.drop_without_applying_deltas();
+
+    let mut document = document_with_size(canvas.width_px, canvas.height_px);
+    document.elements.push(
+      Element::new(
+        ElementId::new(),
+        0,
+        ElementPayload::Arrow(payload.clone()),
+        document.canvas_size_px,
+      )
+      .unwrap(),
+    );
+    let background = RgbaImage::from_pixel(canvas.width_px, canvas.height_px, Rgba([0, 0, 0, 255]));
+    let rendered = render_document_to_image(&document, &background);
+    let sample_x = (expected.bounds_px.min.x_px + 2.0).round() as u32;
+    let sample_y = expected.bounds_px.center().y_px.round() as u32;
+    assert_eq!(rendered.get_pixel(sample_x, sample_y), &rgba(payload.stroke_style.color_rgba));
+    let text_top = expected.bounds_px.min.y_px + payload.label.padding_px;
+    for line_index in 0..wrapped_lines.len() {
+      let start_y = (text_top + line_index as f32 * payload.label.text_style.line_height_px)
+        .floor()
+        .max(0.0) as u32;
+      let end_y = (text_top + (line_index + 1) as f32 * payload.label.text_style.line_height_px)
+        .ceil()
+        .min(canvas.height_px as f32) as u32;
+      let light_pixels = count_pixels_matching(&rendered, start_y..end_y, |pixel| {
+        pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] == 255
+      });
+      assert!(light_pixels > 2, "expected raster glyphs on wrapped line {line_index}");
+    }
+  }
+
+  #[test]
+  fn wide_ascii_arrow_label_glyphs_stay_inside_the_capsule() {
+    let canvas = SizePx::new(240, 160);
+    let payload = labeled_arrow_payload(
+      PointPx::new(30.0, 130.0),
+      PointPx::new(210.0, 30.0),
+      "@@@@@@@@@@@@@@@",
+    );
+    let layout = arrow_label_layout(&payload, canvas).unwrap().unwrap();
+    let wrapped_lines = wrap_arrow_label_text(
+      payload.label.visible_text().unwrap(),
+      &payload.label.text_style,
+      layout.text_wrap_width_px,
+    );
+    assert_eq!(wrapped_lines, ["@@@@@@", "@@@@@@", "@@@"]);
+    assert_eq!(layout.text_layout.line_count, wrapped_lines.len());
+    let inner_width = layout.bounds_px.width() - payload.label.padding_px * 2.0;
+
+    let context = egui::Context::default();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+      "rs-board-cjk".into(),
+      Arc::new(egui::FontData::from_owned(BUNDLED_CJK_FONT.to_vec())),
+    );
+    fonts
+      .families
+      .entry(egui::FontFamily::Proportional)
+      .or_default()
+      .insert(0, "rs-board-cjk".into());
+    context.set_fonts(fonts);
+    let output = context.run_ui(
+      egui::RawInput {
+        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 160.0))),
+        ..Default::default()
+      },
+      |ui| {
+        let transform = CanvasTransform::fit(canvas, ui.max_rect()).unwrap();
+        paint_arrow(ui.painter(), &transform, &payload, 1.0);
+      },
+    );
+    let text_shape = output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        Shape::Text(text) => Some(text),
+        _ => None,
+      })
+      .expect("persistent arrow label must paint its text");
+    assert_eq!(text_shape.galley.job.text, wrapped_lines.join("\n"));
+    let screen_row_widths = text_shape.galley.rows.iter().map(|row| row.size.x).collect::<Vec<_>>();
+    output.drop_without_applying_deltas();
+    assert!(
+      screen_row_widths.iter().all(|width| *width <= inner_width + 0.1),
+      "screen glyph rows {screen_row_widths:?} must fit capsule inner width {inner_width}"
+    );
+
+    let font = cjk_font().unwrap();
+    for line in &wrapped_lines {
+      let (width, _) = text_size(PxScale::from(payload.label.text_style.font_size_px), font, line);
+      assert!(
+        width as f32 <= inner_width + 0.1,
+        "PNG glyph row {line:?} must fit the capsule inner width"
+      );
+    }
+
+    let mut document = document_with_size(canvas.width_px, canvas.height_px);
+    document.elements.push(
+      Element::new(ElementId::new(), 0, ElementPayload::Arrow(payload), document.canvas_size_px)
+        .unwrap(),
+    );
+    let background = RgbaImage::from_pixel(canvas.width_px, canvas.height_px, Rgba([0, 0, 0, 255]));
+    let rendered = render_document_to_image(&document, &background);
+    let light_pixels = rendered
+      .enumerate_pixels()
+      .filter(|(_, _, pixel)| pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 && pixel[3] == 255)
+      .map(|(x, y, _)| (x, y))
+      .collect::<Vec<_>>();
+    assert!(!light_pixels.is_empty(), "PNG must contain arrow label glyphs");
+    assert!(light_pixels.iter().all(|&(x, y)| {
+      x as f32 >= layout.bounds_px.min.x_px.floor()
+        && x as f32 <= layout.bounds_px.max.x_px.ceil()
+        && y as f32 >= layout.bounds_px.min.y_px.floor()
+        && y as f32 <= layout.bounds_px.max.y_px.ceil()
+    }));
+  }
+
+  #[test]
   fn rectangle_label_egui_layout_uses_pre_shrink_wrap_width() {
     let context = egui::Context::default();
     let payload = rectangle_payload(PointPx::new(40.0, 80.0), PointPx::new(140.0, 140.0), "OK");
-    let layout = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap();
+    let layout = rectangle_label_layout(&payload, SizePx::new(200, 180)).unwrap().unwrap();
 
     context
       .run_ui(egui::RawInput::default(), |ui| {
         let galley = layout_egui_text(
           ui.painter(),
-          &payload.label.text,
+          payload.label.visible_text().unwrap(),
           &payload.label.text_style,
           layout.text_wrap_width_px,
           1.0,
@@ -1137,14 +1465,18 @@ mod tests {
           end_px: PointPx::new(70.0, 60.0),
           stroke_style: style,
           fill_rgba: None,
-          label: RectangleLabel {
-            text: "title".to_owned(),
-            placement_preference: LabelPlacementPreference::Above,
+          label: ElementLabel {
+            text: Some("title".to_owned()),
             max_width_px: 80.0,
             padding_px: 2.0,
             anchor_offset_px: 2.0,
             text_style: label_style,
           },
+          label_anchor: RectangleLabelAnchor::new(
+            RectangleLabelEdge::Top,
+            RectangleLabelSide::Outside,
+            0.0,
+          ),
         }),
         document.canvas_size_px,
       )
@@ -1333,6 +1665,7 @@ mod tests {
         start_px: PointPx::new(20.0, 50.5),
         end_px: PointPx::new(180.0, 50.5),
         head: ArrowHead::for_stroke_width(width_px).unwrap(),
+        label: empty_arrow_label(&stroke_style),
         stroke_style,
       };
       let geometry = arrow_geometry(&payload).unwrap();
@@ -1375,6 +1708,7 @@ mod tests {
       start_px: PointPx::new(20.0, 50.5),
       end_px: PointPx::new(180.0, 50.5),
       head: ArrowHead::for_stroke_width(stroke_style.width_px).unwrap(),
+      label: empty_arrow_label(&stroke_style),
       stroke_style,
     };
     let output = context.run_ui(
@@ -1497,14 +1831,18 @@ mod tests {
           end_px: PointPx::new(60.0, 45.0),
           stroke_style: style,
           fill_rgba: None,
-          label: RectangleLabel {
-            text: "标签".to_owned(),
-            placement_preference: LabelPlacementPreference::Above,
+          label: ElementLabel {
+            text: Some("标签".to_owned()),
             max_width_px: 60.0,
             padding_px: 2.0,
             anchor_offset_px: 2.0,
             text_style,
           },
+          label_anchor: RectangleLabelAnchor::new(
+            RectangleLabelEdge::Top,
+            RectangleLabelSide::Outside,
+            0.0,
+          ),
         }),
         document.canvas_size_px,
       )
@@ -1541,6 +1879,7 @@ mod tests {
         ElementPayload::Arrow(ArrowPayload {
           start_px: PointPx::new(24.0, 96.0),
           end_px: PointPx::new(132.0, 28.0),
+          label: empty_arrow_label(&stroke_style),
           stroke_style,
           head: ArrowHead::for_stroke_width(8.0).unwrap(),
         }),

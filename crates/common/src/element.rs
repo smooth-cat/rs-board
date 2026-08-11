@@ -324,12 +324,17 @@ pub struct ArrowPayload {
   pub end_px: PointPx,
   pub stroke_style: StrokeStyle,
   pub head: ArrowHead,
+  pub label: ElementLabel,
 }
 
 impl ArrowPayload {
   fn validate_for_bounds(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
     self.head.validate()?;
+    self.label.validate()?;
+    if self.label.text_style.color_rgba != self.stroke_style.color_rgba.contrasting_text() {
+      return Err(ElementError::InvalidContrastColor);
+    }
     if !self.start_px.is_finite() || !self.end_px.is_finite() {
       return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
     }
@@ -341,30 +346,28 @@ impl ArrowPayload {
     if self.start_px.distance_to(self.end_px) < self.head.min_body_length_px {
       return Err(ElementError::GeometryBelowMinimum);
     }
+    if self.label.text.is_some()
+      && self.start_px.distance_to(self.end_px) < arrow_minimum_length_for_label(self)?
+    {
+      return Err(ElementError::ArrowTooShortForLabel);
+    }
     Ok(())
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LabelPlacementPreference {
-  Above,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RectangleLabel {
-  pub text: String,
-  pub placement_preference: LabelPlacementPreference,
+pub struct ElementLabel {
+  pub text: Option<String>,
   pub max_width_px: f32,
   pub padding_px: f32,
   pub anchor_offset_px: f32,
   pub text_style: TextStyle,
 }
 
-impl RectangleLabel {
+impl ElementLabel {
   fn validate(&self) -> Result<(), ElementError> {
-    if self.text.trim().is_empty() {
+    if self.text.as_deref().is_some_and(|text| text.trim().is_empty()) {
       return Err(ElementError::EmptyText);
     }
     if !self.max_width_px.is_finite()
@@ -378,6 +381,47 @@ impl RectangleLabel {
     }
     self.text_style.validate()
   }
+
+  pub fn visible_text(&self) -> Option<&str> {
+    self.text.as_deref()
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RectangleLabelEdge {
+  Top,
+  Bottom,
+  Left,
+  Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RectangleLabelSide {
+  Inside,
+  Outside,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RectangleLabelAnchor {
+  pub edge: RectangleLabelEdge,
+  pub side: RectangleLabelSide,
+  pub position: f32,
+}
+
+impl RectangleLabelAnchor {
+  pub const fn new(edge: RectangleLabelEdge, side: RectangleLabelSide, position: f32) -> Self {
+    Self { edge, side, position }
+  }
+
+  fn validate(self) -> Result<(), ElementError> {
+    if !self.position.is_finite() || !(0.0..=1.0).contains(&self.position) {
+      return Err(ElementError::InvalidRectangleLabelAnchor);
+    }
+    Ok(())
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -387,13 +431,15 @@ pub struct RectanglePayload {
   pub end_px: PointPx,
   pub stroke_style: StrokeStyle,
   pub fill_rgba: Option<ColorRgba>,
-  pub label: RectangleLabel,
+  pub label: ElementLabel,
+  pub label_anchor: RectangleLabelAnchor,
 }
 
 impl RectanglePayload {
   fn validate_for_layout(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
     self.label.validate()?;
+    self.label_anchor.validate()?;
     if self.label.text_style.color_rgba != self.stroke_style.color_rgba.contrasting_text() {
       return Err(ElementError::InvalidContrastColor);
     }
@@ -637,6 +683,11 @@ impl Element {
         if change.width_px.is_some() {
           payload.head = ArrowHead::for_stroke_width(payload.stroke_style.width_px)?;
         }
+        if let Some(font_size_px) = change.font_size_px {
+          payload.label.text_style.font_size_px = font_size_px;
+          payload.label.text_style.line_height_px = font_size_px * 1.2;
+        }
+        payload.label.text_style.color_rgba = payload.stroke_style.color_rgba.contrasting_text();
       }
       ElementPayload::Rectangle(payload) => {
         apply_stroke_change(&mut payload.stroke_style, change);
@@ -717,14 +768,22 @@ impl Element {
       ElementPayload::Stroke(payload) => {
         payload.points.len().saturating_mul(std::mem::size_of::<StrokePoint>())
       }
-      ElementPayload::Rectangle(payload) => {
-        payload.label.text.len().saturating_add(payload.label.text_style.font_family.len())
-      }
+      ElementPayload::Arrow(payload) => payload
+        .label
+        .text
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(payload.label.text_style.font_family.len()),
+      ElementPayload::Rectangle(payload) => payload
+        .label
+        .text
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(payload.label.text_style.font_family.len()),
       ElementPayload::Text(payload) => {
         payload.text.len().saturating_add(payload.text_style.font_family.len())
       }
       ElementPayload::SequenceMarker(payload) => payload.text_style.font_family.len(),
-      ElementPayload::Arrow(_) => 0,
     };
     std::mem::size_of::<Self>().saturating_add(payload_bytes)
   }
@@ -749,11 +808,20 @@ impl Element {
         let points: Vec<_> = payload.points.iter().map(StrokePoint::point).collect();
         bounds_for_points(&points)?.expanded(payload.stroke_style.width_px / 2.0)
       }
-      ElementPayload::Arrow(payload) => arrow_bounds(payload)?,
+      ElementPayload::Arrow(payload) => {
+        let body = arrow_bounds(payload)?;
+        match arrow_label_layout(payload, canvas_size_px)? {
+          Some(label) => body.union(label.bounds_px),
+          None => body,
+        }
+      }
       ElementPayload::Rectangle(payload) => {
         let body = RectPx::from_points(payload.start_px, payload.end_px)
           .expanded(payload.stroke_style.width_px / 2.0);
-        body.union(rectangle_label_layout(payload, canvas_size_px)?.bounds_px)
+        match rectangle_label_layout(payload, canvas_size_px)? {
+          Some(label) => body.union(label.bounds_px),
+          None => body,
+        }
       }
       ElementPayload::Text(payload) => {
         let layout = layout_text(&payload.text, &payload.text_style, payload.box_width_px)?;
@@ -800,58 +868,294 @@ impl Element {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DerivedLabelPlacement {
-  Above,
-  Below,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrowLabelLayout {
+  pub bounds_px: RectPx,
+  pub text_layout: TextLayout,
+  pub text_wrap_width_px: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RectangleLabelLayout {
   pub bounds_px: RectPx,
-  pub placement: DerivedLabelPlacement,
+  pub anchor: RectangleLabelAnchor,
   pub text_layout: TextLayout,
   pub text_wrap_width_px: f32,
+}
+
+pub fn arrow_label_available_width(arrow: &ArrowPayload) -> Result<f32, ElementError> {
+  arrow.validate_for_bounds()?;
+  Ok(
+    (arrow.start_px.distance_to(arrow.end_px)
+      - arrow.head.length_px * 2.0
+      - arrow.label.anchor_offset_px * 2.0)
+      .max(0.0),
+  )
+}
+
+pub fn arrow_minimum_length_for_label(arrow: &ArrowPayload) -> Result<f32, ElementError> {
+  arrow.validate_for_bounds()?;
+  Ok(
+    arrow.head.length_px * 2.0
+      + arrow.label.anchor_offset_px * 2.0
+      + arrow.label.text_style.font_size_px
+      + arrow.label.padding_px * 2.0,
+  )
+}
+
+pub fn arrow_label_layout(
+  arrow: &ArrowPayload,
+  canvas_size_px: SizePx,
+) -> Result<Option<ArrowLabelLayout>, ElementError> {
+  canvas_size_px.validate()?;
+  arrow.validate_for_bounds()?;
+  let Some(text) = arrow.label.visible_text() else {
+    return Ok(None);
+  };
+  let minimum_width_px = arrow.label.text_style.font_size_px + arrow.label.padding_px * 2.0;
+  let maximum_width_px = arrow
+    .label
+    .max_width_px
+    .min(canvas_size_px.width_px as f32)
+    .min(arrow_label_available_width(arrow)?);
+  if maximum_width_px < minimum_width_px {
+    return Err(ElementError::ArrowTooShortForLabel);
+  }
+  let (text_layout, text_wrap_width_px, width_px, height_px) =
+    arrow_label_dimensions(&arrow.label, text, maximum_width_px)?;
+  let midpoint = PointPx::new(
+    (arrow.start_px.x_px + arrow.end_px.x_px) / 2.0,
+    (arrow.start_px.y_px + arrow.end_px.y_px) / 2.0,
+  );
+  let raw_bounds = RectPx::from_center_size(midpoint, width_px, height_px);
+  let bounds_px = fit_label_bounds_to_canvas(raw_bounds, canvas_size_px)?;
+  Ok(Some(ArrowLabelLayout { bounds_px, text_layout, text_wrap_width_px }))
 }
 
 pub fn rectangle_label_layout(
   rectangle: &RectanglePayload,
   canvas_size_px: SizePx,
+) -> Result<Option<RectangleLabelLayout>, ElementError> {
+  rectangle_label_layout_at_anchor(rectangle, rectangle.label_anchor, canvas_size_px)
+}
+
+pub fn rectangle_label_layout_at_anchor(
+  rectangle: &RectanglePayload,
+  anchor: RectangleLabelAnchor,
+  canvas_size_px: SizePx,
+) -> Result<Option<RectangleLabelLayout>, ElementError> {
+  canvas_size_px.validate()?;
+  rectangle.validate_for_layout()?;
+  anchor.validate()?;
+  let Some(_) = rectangle.label.visible_text() else {
+    return Ok(None);
+  };
+  let mut layout = raw_rectangle_label_layout(rectangle, anchor, canvas_size_px)?;
+  layout.bounds_px = fit_label_bounds_to_canvas(layout.bounds_px, canvas_size_px)?;
+  Ok(Some(layout))
+}
+
+pub fn choose_rectangle_label_anchor(
+  rectangle: &RectanglePayload,
+  canvas_size_px: SizePx,
+  obstacles: &[RectPx],
+) -> Result<RectangleLabelAnchor, ElementError> {
+  canvas_size_px.validate()?;
+  rectangle.validate_for_layout()?;
+  if rectangle.label.visible_text().is_none() {
+    return Err(ElementError::LabelIsHidden);
+  }
+  let candidates = [
+    RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0),
+    RectangleLabelAnchor::new(RectangleLabelEdge::Bottom, RectangleLabelSide::Outside, 0.0),
+    RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Outside, 0.0),
+    RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0),
+  ];
+  for anchor in candidates {
+    let layout = raw_rectangle_label_layout(rectangle, anchor, canvas_size_px)?;
+    if canvas_size_px.bounds().contains_rect(layout.bounds_px)
+      && obstacles.iter().all(|obstacle| !layout.bounds_px.intersects(*obstacle))
+    {
+      return Ok(anchor);
+    }
+  }
+  Ok(RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Inside, 0.0))
+}
+
+pub fn snap_rectangle_label_layout(
+  rectangle: &RectanglePayload,
+  canvas_size_px: SizePx,
+  desired_center_px: PointPx,
 ) -> Result<RectangleLabelLayout, ElementError> {
   canvas_size_px.validate()?;
   rectangle.validate_for_layout()?;
-  let canvas = canvas_size_px.bounds();
+  if !desired_center_px.is_finite() {
+    return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
+  }
+  let Some(text) = rectangle.label.visible_text() else {
+    return Err(ElementError::LabelIsHidden);
+  };
   let body = RectPx::from_points(rectangle.start_px, rectangle.end_px);
-  let maximum_width = rectangle
+  let maximum_width_px = rectangle
     .label
     .max_width_px
     .min(body.width() * 1.5)
-    .min(canvas.width())
+    .min(canvas_size_px.width_px as f32)
     .max(rectangle.label.padding_px * 2.0 + 1.0);
-  let text_wrap_width_px = (maximum_width - rectangle.label.padding_px * 2.0).max(1.0);
-  let text_layout =
-    layout_text(&rectangle.label.text, &rectangle.label.text_style, text_wrap_width_px)?;
-  let width_px =
-    (text_layout.width_px + rectangle.label.padding_px * 2.0).min(maximum_width).max(1.0);
-  let height_px = text_layout.height_px + rectangle.label.padding_px * 2.0;
-  let x_px = (body.min.x_px + rectangle.label.anchor_offset_px)
-    .clamp(0.0, (canvas.width() - width_px).max(0.0));
-  let margin = rectangle.label.anchor_offset_px;
-  let (placement, candidate_y) = if body.min.y_px - height_px - margin >= 0.0 {
-    (DerivedLabelPlacement::Above, body.min.y_px - height_px - margin)
-  } else {
-    (DerivedLabelPlacement::Below, body.max.y_px + margin)
+  let (_, _, width_px, height_px) = label_dimensions(&rectangle.label, text, maximum_width_px)?;
+  let horizontal_position =
+    ((desired_center_px.x_px - width_px / 2.0 - body.min.x_px - rectangle.label.anchor_offset_px)
+      / body.width())
+    .clamp(0.0, 1.0);
+  let vertical_position =
+    ((desired_center_px.y_px - height_px / 2.0 - body.min.y_px - rectangle.label.anchor_offset_px)
+      / body.height())
+    .clamp(0.0, 1.0);
+  let anchors = [
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Top,
+      RectangleLabelSide::Outside,
+      horizontal_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Top,
+      RectangleLabelSide::Inside,
+      horizontal_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Bottom,
+      RectangleLabelSide::Inside,
+      horizontal_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Bottom,
+      RectangleLabelSide::Outside,
+      horizontal_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Left,
+      RectangleLabelSide::Outside,
+      vertical_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Left,
+      RectangleLabelSide::Inside,
+      vertical_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Right,
+      RectangleLabelSide::Inside,
+      vertical_position,
+    ),
+    RectangleLabelAnchor::new(
+      RectangleLabelEdge::Right,
+      RectangleLabelSide::Outside,
+      vertical_position,
+    ),
+  ];
+  anchors
+    .into_iter()
+    .map(|anchor| {
+      let mut layout = raw_rectangle_label_layout(rectangle, anchor, canvas_size_px)?;
+      layout.bounds_px = fit_label_bounds_to_canvas(layout.bounds_px, canvas_size_px)?;
+      let center = layout.bounds_px.center();
+      let distance = center.distance_to(desired_center_px);
+      Ok((distance, layout))
+    })
+    .collect::<Result<Vec<_>, ElementError>>()?
+    .into_iter()
+    .min_by(|left, right| left.0.total_cmp(&right.0))
+    .map(|(_, layout)| layout)
+    .ok_or(ElementError::InvalidLabelLayout)
+}
+
+fn raw_rectangle_label_layout(
+  rectangle: &RectanglePayload,
+  anchor: RectangleLabelAnchor,
+  canvas_size_px: SizePx,
+) -> Result<RectangleLabelLayout, ElementError> {
+  anchor.validate()?;
+  let text = rectangle.label.visible_text().ok_or(ElementError::LabelIsHidden)?;
+  let body = RectPx::from_points(rectangle.start_px, rectangle.end_px);
+  let maximum_width_px = rectangle
+    .label
+    .max_width_px
+    .min(body.width() * 1.5)
+    .min(canvas_size_px.width_px as f32)
+    .max(rectangle.label.padding_px * 2.0 + 1.0);
+  let (text_layout, text_wrap_width_px, width_px, height_px) =
+    label_dimensions(&rectangle.label, text, maximum_width_px)?;
+  let gap = rectangle.label.anchor_offset_px;
+  let (x_px, y_px) = match anchor.edge {
+    RectangleLabelEdge::Top | RectangleLabelEdge::Bottom => {
+      let x_px = body.min.x_px + gap + body.width() * anchor.position;
+      let y_px = match (anchor.edge, anchor.side) {
+        (RectangleLabelEdge::Top, RectangleLabelSide::Outside) => body.min.y_px - gap - height_px,
+        (RectangleLabelEdge::Top, RectangleLabelSide::Inside) => body.min.y_px + gap,
+        (RectangleLabelEdge::Bottom, RectangleLabelSide::Inside) => body.max.y_px - gap - height_px,
+        (RectangleLabelEdge::Bottom, RectangleLabelSide::Outside) => body.max.y_px + gap,
+        _ => unreachable!(),
+      };
+      (x_px, y_px)
+    }
+    RectangleLabelEdge::Left | RectangleLabelEdge::Right => {
+      let y_px = body.min.y_px + gap + body.height() * anchor.position;
+      let x_px = match (anchor.edge, anchor.side) {
+        (RectangleLabelEdge::Left, RectangleLabelSide::Outside) => body.min.x_px - gap - width_px,
+        (RectangleLabelEdge::Left, RectangleLabelSide::Inside) => body.min.x_px + gap,
+        (RectangleLabelEdge::Right, RectangleLabelSide::Inside) => body.max.x_px - gap - width_px,
+        (RectangleLabelEdge::Right, RectangleLabelSide::Outside) => body.max.x_px + gap,
+        _ => unreachable!(),
+      };
+      (x_px, y_px)
+    }
   };
-  let y_px = candidate_y.clamp(0.0, (canvas.height() - height_px).max(0.0));
   Ok(RectangleLabelLayout {
     bounds_px: RectPx::from_min_max(
       PointPx::new(x_px, y_px),
       PointPx::new(x_px + width_px, y_px + height_px),
     ),
-    placement,
+    anchor,
     text_layout,
     text_wrap_width_px,
   })
+}
+
+fn label_dimensions(
+  label: &ElementLabel,
+  text: &str,
+  maximum_width_px: f32,
+) -> Result<(TextLayout, f32, f32, f32), ElementError> {
+  label_dimensions_with(text, label, maximum_width_px, layout_text)
+}
+
+fn arrow_label_dimensions(
+  label: &ElementLabel,
+  text: &str,
+  maximum_width_px: f32,
+) -> Result<(TextLayout, f32, f32, f32), ElementError> {
+  label_dimensions_with(text, label, maximum_width_px, layout_arrow_label_text)
+}
+
+fn label_dimensions_with(
+  text: &str,
+  label: &ElementLabel,
+  maximum_width_px: f32,
+  layout: fn(&str, &TextStyle, f32) -> Result<TextLayout, ElementError>,
+) -> Result<(TextLayout, f32, f32, f32), ElementError> {
+  let text_wrap_width_px = (maximum_width_px - label.padding_px * 2.0).max(1.0);
+  let text_layout = layout(text, &label.text_style, text_wrap_width_px)?;
+  let width_px = (text_layout.width_px + label.padding_px * 2.0).min(maximum_width_px).max(1.0);
+  let height_px = text_layout.height_px + label.padding_px * 2.0;
+  Ok((text_layout, text_wrap_width_px, width_px, height_px))
+}
+
+fn fit_label_bounds_to_canvas(
+  bounds_px: RectPx,
+  canvas_size_px: SizePx,
+) -> Result<RectPx, ElementError> {
+  let correction = bounds_px.translation_to_fit(canvas_size_px)?;
+  Ok(bounds_px.translated(correction))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -866,36 +1170,82 @@ pub fn layout_text(
   style: &TextStyle,
   maximum_width_px: f32,
 ) -> Result<TextLayout, ElementError> {
+  layout_text_with_width(text, style, maximum_width_px, character_width)
+}
+
+fn layout_arrow_label_text(
+  text: &str,
+  style: &TextStyle,
+  maximum_width_px: f32,
+) -> Result<TextLayout, ElementError> {
+  layout_text_with_width(text, style, maximum_width_px, arrow_label_character_width)
+}
+
+fn layout_text_with_width(
+  text: &str,
+  style: &TextStyle,
+  maximum_width_px: f32,
+  character_width: fn(char, f32) -> f32,
+) -> Result<TextLayout, ElementError> {
+  let lines = wrap_text_lines_with_width(text, style, maximum_width_px, character_width)?;
+  let maximum_line_width = lines
+    .iter()
+    .map(|line| line.chars().map(|character| character_width(character, style.font_size_px)).sum())
+    .fold(0.0f32, f32::max);
+  Ok(TextLayout {
+    width_px: maximum_line_width.min(maximum_width_px).max(1.0),
+    height_px: style.line_height_px * lines.len() as f32,
+    line_count: lines.len(),
+  })
+}
+
+pub fn wrap_text_lines(
+  text: &str,
+  style: &TextStyle,
+  maximum_width_px: f32,
+) -> Result<Vec<String>, ElementError> {
+  wrap_text_lines_with_width(text, style, maximum_width_px, character_width)
+}
+
+pub fn wrap_arrow_label_text_lines(
+  text: &str,
+  style: &TextStyle,
+  maximum_width_px: f32,
+) -> Result<Vec<String>, ElementError> {
+  wrap_text_lines_with_width(text, style, maximum_width_px, arrow_label_character_width)
+}
+
+fn wrap_text_lines_with_width(
+  text: &str,
+  style: &TextStyle,
+  maximum_width_px: f32,
+  character_width: fn(char, f32) -> f32,
+) -> Result<Vec<String>, ElementError> {
   style.validate()?;
   if !maximum_width_px.is_finite() || maximum_width_px <= 0.0 {
     return Err(ElementError::InvalidTextBoxWidth);
   }
 
-  let mut line_width = 0.0f32;
-  let mut maximum_line_width = 0.0f32;
-  let mut line_count = 1usize;
+  let mut lines = Vec::new();
+  let mut line = String::new();
+  let mut line_width = 0.0;
   for character in text.chars() {
     if character == '\n' {
-      maximum_line_width = maximum_line_width.max(line_width);
+      lines.push(std::mem::take(&mut line));
       line_width = 0.0;
-      line_count += 1;
       continue;
     }
-    let character_width = character_width(character, style.font_size_px);
-    if line_width > 0.0 && line_width + character_width > maximum_width_px {
-      maximum_line_width = maximum_line_width.max(line_width);
-      line_width = character_width.min(maximum_width_px);
-      line_count += 1;
+    let width_px = character_width(character, style.font_size_px);
+    if line_width > 0.0 && line_width + width_px > maximum_width_px {
+      lines.push(std::mem::take(&mut line));
+      line_width = width_px.min(maximum_width_px);
     } else {
-      line_width = (line_width + character_width).min(maximum_width_px);
+      line_width = (line_width + width_px).min(maximum_width_px);
     }
+    line.push(character);
   }
-  maximum_line_width = maximum_line_width.max(line_width);
-  Ok(TextLayout {
-    width_px: maximum_line_width.max(1.0),
-    height_px: style.line_height_px * line_count as f32,
-    line_count,
-  })
+  lines.push(line);
+  Ok(lines)
 }
 
 fn character_width(character: char, font_size_px: f32) -> f32 {
@@ -908,6 +1258,20 @@ fn character_width(character: char, font_size_px: f32) -> f32 {
   } else {
     font_size_px
   }
+}
+
+fn arrow_label_character_width(character: char, font_size_px: f32) -> f32 {
+  // Conservative advances for the bundled font's Latin glyphs that exceed the generic 0.6 em.
+  let factor = match character {
+    '\t' | '%' | '@' | 'm' => 1.0,
+    'M' | 'W' | 'w' => 0.9,
+    'H' | 'N' | 'O' | 'Q' | 'U' => 0.8,
+    '&' | 'A' | 'B' | 'C' | 'D' | 'G' | 'K' | 'P' | 'R' | 'Z' | 'b' | 'd' | 'h' | 'n' | 'o'
+    | 'p' | 'q' | 'u' => 0.72,
+    'S' | 'T' | '`' => 0.64,
+    _ => return character_width(character, font_size_px),
+  };
+  font_size_px * factor
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -1069,8 +1433,14 @@ pub enum ElementError {
   InvalidTextBoxWidth,
   #[error("text box width must not exceed the canvas width")]
   TextBoxWiderThanCanvas,
-  #[error("rectangle labels require positive finite layout dimensions")]
+  #[error("element labels require positive finite layout dimensions")]
   InvalidLabelLayout,
+  #[error("rectangle label anchors require a finite position between 0.0 and 1.0")]
+  InvalidRectangleLabelAnchor,
+  #[error("the element label is hidden")]
+  LabelIsHidden,
+  #[error("arrow is too short for its visible label")]
+  ArrowTooShortForLabel,
   #[error("rectangle fill is not supported in the MVP")]
   RectangleFillNotSupported,
   #[error("arrow head dimensions must be finite and positive")]
@@ -1177,35 +1547,187 @@ mod tests {
     TextStyle::mvp(color, 24.0).unwrap()
   }
 
+  fn label(color: ColorRgba, text: Option<&str>) -> ElementLabel {
+    ElementLabel {
+      text: text.map(str::to_owned),
+      max_width_px: 240.0,
+      padding_px: 4.0,
+      anchor_offset_px: 4.0,
+      text_style: text_style(color.contrasting_text()),
+    }
+  }
+
   fn rectangle(start: PointPx, end: PointPx) -> RectanglePayload {
     RectanglePayload {
       start_px: start,
       end_px: end,
       stroke_style: StrokeStyle::default(),
       fill_rgba: None,
-      label: RectangleLabel {
-        text: "标题".to_owned(),
-        placement_preference: LabelPlacementPreference::Above,
-        max_width_px: 240.0,
-        padding_px: 4.0,
-        anchor_offset_px: 4.0,
-        text_style: text_style(ColorRgba::RED.contrasting_text()),
-      },
+      label: label(ColorRgba::RED, Some("标题")),
+      label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
+    }
+  }
+
+  fn arrow_payload(start: PointPx, end: PointPx, text: Option<&str>) -> ArrowPayload {
+    let stroke_style = StrokeStyle::mvp(ColorRgba::RED, 4.0).unwrap();
+    ArrowPayload {
+      start_px: start,
+      end_px: end,
+      head: ArrowHead::for_stroke_width(stroke_style.width_px).unwrap(),
+      label: label(stroke_style.color_rgba, text),
+      stroke_style,
     }
   }
 
   #[test]
-  fn rectangle_label_moves_below_at_top_edge() {
+  fn hidden_labels_are_excluded_from_layout_and_element_bounds() {
+    let canvas = SizePx::new(300, 200);
+    let mut rectangle = rectangle(PointPx::new(80.0, 80.0), PointPx::new(180.0, 150.0));
+    rectangle.label.text = None;
+    assert_eq!(rectangle_label_layout(&rectangle, canvas).unwrap(), None);
+    let element =
+      Element::new(ElementId::new(), 0, ElementPayload::Rectangle(rectangle.clone()), canvas)
+        .unwrap();
+    assert_eq!(
+      element.bounds_px,
+      RectPx::from_points(rectangle.start_px, rectangle.end_px)
+        .expanded(rectangle.stroke_style.width_px / 2.0)
+    );
+
+    let arrow = arrow_payload(PointPx::new(40.0, 40.0), PointPx::new(240.0, 100.0), None);
+    assert_eq!(arrow_label_layout(&arrow, canvas).unwrap(), None);
+  }
+
+  #[test]
+  fn blank_present_labels_are_rejected_but_original_nonblank_whitespace_is_preserved() {
+    let canvas = SizePx::new(300, 200);
+    let mut blank_rectangle = rectangle(PointPx::new(80.0, 80.0), PointPx::new(180.0, 150.0));
+    blank_rectangle.label.text = Some(" \n\t ".to_owned());
+    assert_eq!(
+      Element::new(ElementId::new(), 0, ElementPayload::Rectangle(blank_rectangle), canvas),
+      Err(ElementError::EmptyText)
+    );
+
+    let mut spaced_rectangle = rectangle(PointPx::new(80.0, 80.0), PointPx::new(180.0, 150.0));
+    spaced_rectangle.label.text = Some("  标题\n ".to_owned());
+    let element =
+      Element::new(ElementId::new(), 0, ElementPayload::Rectangle(spaced_rectangle), canvas)
+        .unwrap();
+    let ElementPayload::Rectangle(spaced_rectangle) = element.payload else {
+      unreachable!();
+    };
+    assert_eq!(spaced_rectangle.label.text.as_deref(), Some("  标题\n "));
+  }
+
+  #[test]
+  fn arrow_label_uses_geometric_midpoint_and_length_cap() {
+    let canvas = SizePx::new(500, 300);
+    let arrow = arrow_payload(
+      PointPx::new(80.0, 70.0),
+      PointPx::new(400.0, 230.0),
+      Some("很长的箭头标签会自动换行"),
+    );
+    let layout = arrow_label_layout(&arrow, canvas).unwrap().unwrap();
+    assert_eq!(layout.bounds_px.center(), PointPx::new(240.0, 150.0));
+    assert!(layout.bounds_px.width() <= arrow_label_available_width(&arrow).unwrap());
+    assert!(layout.text_layout.line_count > 1);
+  }
+
+  #[test]
+  fn visible_arrow_label_enforces_minimum_length_for_geometry_and_style_changes() {
+    let canvas = SizePx::new(300, 200);
+    let payload = arrow_payload(PointPx::new(60.0, 100.0), PointPx::new(130.0, 100.0), Some("字"));
+    assert_eq!(arrow_minimum_length_for_label(&payload).unwrap(), 80.0);
+    assert_eq!(
+      Element::new(ElementId::new(), 0, ElementPayload::Arrow(payload), canvas),
+      Err(ElementError::ArrowTooShortForLabel)
+    );
+
+    let mut arrow = Element::new(
+      ElementId::new(),
+      0,
+      ElementPayload::Arrow(arrow_payload(
+        PointPx::new(60.0, 100.0),
+        PointPx::new(160.0, 100.0),
+        Some("字"),
+      )),
+      canvas,
+    )
+    .unwrap();
+    let before = arrow.clone();
+    assert_eq!(
+      arrow.set_style(&StyleChange { font_size_px: Some(64.0), ..StyleChange::default() }, canvas,),
+      Err(ElementError::ArrowTooShortForLabel)
+    );
+    assert_eq!(arrow, before);
+  }
+
+  #[test]
+  fn rectangle_auto_anchor_checks_candidates_in_top_bottom_left_right_order() {
+    let canvas = SizePx::new(500, 400);
+    let rectangle = rectangle(PointPx::new(180.0, 150.0), PointPx::new(300.0, 260.0));
+    let candidates = [
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0),
+      RectangleLabelAnchor::new(RectangleLabelEdge::Bottom, RectangleLabelSide::Outside, 0.0),
+      RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Outside, 0.0),
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0),
+    ];
+    let candidate_bounds = candidates
+      .iter()
+      .map(|anchor| raw_rectangle_label_layout(&rectangle, *anchor, canvas).unwrap().bounds_px)
+      .collect::<Vec<_>>();
+    for blocked_count in 0..=candidates.len() {
+      let selected =
+        choose_rectangle_label_anchor(&rectangle, canvas, &candidate_bounds[..blocked_count])
+          .unwrap();
+      let expected = candidates.get(blocked_count).copied().unwrap_or(RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Inside,
+        0.0,
+      ));
+      assert_eq!(selected, expected);
+    }
+  }
+
+  #[test]
+  fn rectangle_snap_exposes_all_eight_continuous_tracks() {
+    let canvas = SizePx::new(600, 500);
+    let rectangle = rectangle(PointPx::new(220.0, 180.0), PointPx::new(380.0, 330.0));
+    for edge in [
+      RectangleLabelEdge::Top,
+      RectangleLabelEdge::Bottom,
+      RectangleLabelEdge::Left,
+      RectangleLabelEdge::Right,
+    ] {
+      for side in [RectangleLabelSide::Inside, RectangleLabelSide::Outside] {
+        let anchor = RectangleLabelAnchor::new(edge, side, 0.35);
+        let expected =
+          rectangle_label_layout_at_anchor(&rectangle, anchor, canvas).unwrap().unwrap();
+        let snapped =
+          snap_rectangle_label_layout(&rectangle, canvas, expected.bounds_px.center()).unwrap();
+        assert_eq!(snapped.anchor.edge, edge);
+        assert_eq!(snapped.anchor.side, side);
+        assert!((snapped.anchor.position - 0.35).abs() < 0.001);
+      }
+    }
+  }
+
+  #[test]
+  fn rectangle_label_is_canvas_corrected_without_changing_its_anchor() {
     let rectangle = rectangle(PointPx::new(20.0, 5.0), PointPx::new(120.0, 80.0));
-    let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 120)).unwrap();
-    assert_eq!(layout.placement, DerivedLabelPlacement::Below);
+    let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 120)).unwrap().unwrap();
+    assert_eq!(layout.anchor, rectangle.label_anchor);
     assert!(SizePx::new(200, 120).bounds().contains_rect(layout.bounds_px));
   }
 
   #[test]
   fn rectangle_label_exposes_pre_shrink_text_wrap_width() {
     let rectangle = rectangle(PointPx::new(20.0, 40.0), PointPx::new(120.0, 100.0));
-    let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 140)).unwrap();
+    let layout = rectangle_label_layout(&rectangle, SizePx::new(200, 140)).unwrap().unwrap();
 
     // The body-derived outer cap is 150 px; the text wraps inside its 4 px padding.
     assert_eq!(layout.text_wrap_width_px, 142.0);
@@ -1220,6 +1742,13 @@ mod tests {
     let layout = layout_text("这是一个很长的中文标签", &style, 72.0).unwrap();
     assert!(layout.line_count > 1);
     assert!(layout.width_px <= 72.0);
+  }
+
+  #[test]
+  fn arrow_label_wrap_reserves_space_for_wide_latin_glyphs() {
+    let style = text_style(ColorRgba::BLACK);
+    assert_eq!(wrap_text_lines("WWWWWW", &style, 75.0).unwrap(), ["WWWWW", "W"]);
+    assert_eq!(wrap_arrow_label_text_lines("WWWWWW", &style, 75.0).unwrap(), ["WWW", "WWW"]);
   }
 
   #[test]
@@ -1263,6 +1792,7 @@ mod tests {
         start_px: PointPx::new(40.0, 40.0),
         end_px: PointPx::new(200.0, 200.0),
         head: ArrowHead::for_stroke_width(style.width_px).unwrap(),
+        label: label(style.color_rgba, None),
         stroke_style: style,
       }),
       canvas,
@@ -1288,7 +1818,7 @@ mod tests {
     let canvas = SizePx::new(300, 200);
     for end_px in [PointPx::new(41.0, 61.0), PointPx::new(40.0, 60.0)] {
       let payload = rectangle(PointPx::new(40.0, 60.0), end_px);
-      let layout = rectangle_label_layout(&payload, canvas).unwrap();
+      let layout = rectangle_label_layout(&payload, canvas).unwrap().unwrap();
       assert_eq!(layout.bounds_px.validate(), Ok(()));
       assert!(layout.text_wrap_width_px.is_finite());
       assert!(layout.text_layout.width_px.is_finite());
@@ -1321,6 +1851,7 @@ mod tests {
         end_px,
         stroke_style: style.clone(),
         head: head.clone(),
+        label: label(style.color_rgba, None),
       };
       let mut transient = Element {
         element_id: ElementId::new(),
@@ -1395,6 +1926,7 @@ mod tests {
         start_px: PointPx::new(50.0, 50.0),
         end_px: PointPx::new(80.0, 50.0),
         head: ArrowHead::for_stroke_width(style.width_px).unwrap(),
+        label: label(style.color_rgba, None),
         stroke_style: style,
       }),
       canvas,

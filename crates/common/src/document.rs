@@ -11,7 +11,7 @@ use crate::{
   geometry::{GeometryError, SizePx},
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const MAX_ELEMENTS: usize = 10_000;
 pub const MAX_STROKE_POINTS: usize = 1_000_000;
 
@@ -425,7 +425,10 @@ mod tests {
 
   use super::*;
   use crate::{
-    element::{ArrowHead, ArrowPayload, ElementPayload, StrokePayload, StrokePoint, StrokeStyle},
+    element::{
+      ArrowHead, ArrowPayload, ElementLabel, ElementPayload, StrokePayload, StrokePoint,
+      StrokeStyle, TextStyle,
+    },
     geometry::PointPx,
   };
 
@@ -495,6 +498,13 @@ mod tests {
         start_px: PointPx::new(100.0, 100.0),
         end_px: PointPx::new(300.0, 200.0),
         head: ArrowHead::for_stroke_width(style.width_px).unwrap(),
+        label: ElementLabel {
+          text: None,
+          max_width_px: 420.0,
+          padding_px: 8.0,
+          anchor_offset_px: 8.0,
+          text_style: TextStyle::mvp(style.color_rgba.contrasting_text(), 24.0).unwrap(),
+        },
         stroke_style: style,
       }),
       SizePx::new(1920, 1080),

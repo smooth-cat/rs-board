@@ -563,6 +563,7 @@ mod tests {
       || {
         let state = lock_unpoisoned(&loader.shared.state);
         state.pending.is_empty()
+          && state.tracked.len() == MAX_PENDING_PREVIEWS
           && state.tracked.values().all(|request| request.phase == RequestPhase::Completed)
       },
       "preview workers did not settle after filling the result channel",

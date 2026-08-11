@@ -3,7 +3,10 @@ use thiserror::Error;
 
 use crate::{
   document::{BoardDocument, DocumentError, MAX_ELEMENTS},
-  element::{Element, ElementError, ElementId, ElementKind, ElementPayload, StyleChange},
+  element::{
+    Element, ElementError, ElementId, ElementKind, ElementPayload, RectangleLabelAnchor,
+    StyleChange,
+  },
   geometry::PointPx,
 };
 
@@ -22,7 +25,8 @@ pub enum DocumentCommand {
   ChangeElementStyle { element_id: ElementId, change: StyleChange },
   ResizeRectangle { element_id: ElementId, start_px: PointPx, end_px: PointPx },
   UpdateArrowEndpoint { element_id: ElementId, endpoint: ArrowEndpoint, position_px: PointPx },
-  UpdateRectangleLabel { element_id: ElementId, text: String },
+  UpdateElementLabel { element_id: ElementId, text: Option<String> },
+  UpdateRectangleLabelAnchor { element_id: ElementId, anchor: RectangleLabelAnchor },
   SetNextSequenceNumber { next_sequence_number: u64 },
   BringForward { element_id: ElementId },
   SendBackward { element_id: ElementId },
@@ -298,15 +302,29 @@ fn prepare_command(
         Ok(element)
       })
     }
-    DocumentCommand::UpdateRectangleLabel { element_id, text } => {
+    DocumentCommand::UpdateElementLabel { element_id, text } => {
+      prepare_replace(document, element_id, |mut element, canvas| {
+        let actual = element.kind();
+        let label = match &mut element.payload {
+          ElementPayload::Arrow(payload) => &mut payload.label,
+          ElementPayload::Rectangle(payload) => &mut payload.label,
+          _ => return Err(CommandError::LabelNotSupported(actual)),
+        };
+        label.text = text.filter(|text| !text.trim().is_empty());
+        element.refresh_bounds(canvas)?;
+        element.constrain_to_canvas(canvas, true)?;
+        element.validate(canvas)?;
+        Ok(element)
+      })
+    }
+    DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor } => {
       prepare_replace(document, element_id, |mut element, canvas| {
         let actual = element.kind();
         let ElementPayload::Rectangle(payload) = &mut element.payload else {
           return Err(CommandError::WrongElementKind { expected: ElementKind::Rectangle, actual });
         };
-        payload.label.text = text;
+        payload.label_anchor = anchor;
         element.refresh_bounds(canvas)?;
-        element.constrain_to_canvas(canvas, true)?;
         element.validate(canvas)?;
         Ok(element)
       })
@@ -454,6 +472,8 @@ pub enum CommandError {
   DuplicateElementId(ElementId),
   #[error("expected {expected:?}, found {actual:?}")]
   WrongElementKind { expected: ElementKind, actual: ElementKind },
+  #[error("{0:?} elements do not support labels")]
+  LabelNotSupported(ElementKind),
   #[error("command does not change document content")]
   NoChange,
   #[error("command batch must not be empty")]
@@ -477,8 +497,9 @@ mod tests {
   use crate::{
     document::{CapturedDisplay, DocumentId, GlobalBoundsPx},
     element::{
-      ArrowHead, ArrowPayload, ColorRgba, ElementPayload, LabelPlacementPreference, RectangleLabel,
-      RectanglePayload, SequenceMarkerPayload, StrokeStyle, TextPayload, TextStyle,
+      ArrowHead, ArrowPayload, ColorRgba, ElementLabel, ElementPayload, RectangleLabelAnchor,
+      RectangleLabelEdge, RectangleLabelSide, RectanglePayload, SequenceMarkerPayload, StrokeStyle,
+      TextPayload, TextStyle,
     },
     geometry::SizePx,
   };
@@ -503,8 +524,15 @@ mod tests {
       0,
       ElementPayload::Arrow(ArrowPayload {
         start_px: PointPx::new(50.0, 50.0),
-        end_px: PointPx::new(150.0, 100.0),
+        end_px: PointPx::new(180.0, 100.0),
         head: ArrowHead::for_stroke_width(style.width_px).unwrap(),
+        label: ElementLabel {
+          text: None,
+          max_width_px: 180.0,
+          padding_px: 4.0,
+          anchor_offset_px: 4.0,
+          text_style: TextStyle::mvp(style.color_rgba.contrasting_text(), 24.0).unwrap(),
+        },
         stroke_style: style,
       }),
       SizePx::new(500, 300),
@@ -541,14 +569,18 @@ mod tests {
         end_px: PointPx::new(320.0, 220.0),
         stroke_style: StrokeStyle::default(),
         fill_rgba: None,
-        label: RectangleLabel {
-          text: "标题".to_owned(),
-          placement_preference: LabelPlacementPreference::Above,
+        label: ElementLabel {
+          text: Some("标题".to_owned()),
           max_width_px: 180.0,
           padding_px: 4.0,
           anchor_offset_px: 4.0,
           text_style: TextStyle::mvp(color.contrasting_text(), 24.0).unwrap(),
         },
+        label_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
       }),
       SizePx::new(500, 300),
     )
@@ -751,9 +783,20 @@ mod tests {
     );
     assert_content_round_trip(
       base.clone(),
-      DocumentCommand::UpdateRectangleLabel {
+      DocumentCommand::UpdateElementLabel {
         element_id: rectangle_id,
-        text: "更新后的标签".to_owned(),
+        text: Some("更新后的标签".to_owned()),
+      },
+    );
+    assert_content_round_trip(
+      base.clone(),
+      DocumentCommand::UpdateRectangleLabelAnchor {
+        element_id: rectangle_id,
+        anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Right,
+          RectangleLabelSide::Inside,
+          0.5,
+        ),
       },
     );
     assert_content_round_trip(
@@ -772,6 +815,82 @@ mod tests {
       base,
       DocumentCommand::SetNextSequenceNumber { next_sequence_number: 8 },
     );
+  }
+
+  #[test]
+  fn generic_label_command_updates_arrows_and_rectangles_and_normalizes_blank_text() {
+    let arrow_id = ElementId::new();
+    let rectangle_id = ElementId::new();
+    let mut document = document();
+    for element in [arrow(arrow_id), rectangle(rectangle_id)] {
+      DocumentCommand::AddElement { element }.apply(&mut document).unwrap();
+    }
+
+    DocumentCommand::UpdateElementLabel {
+      element_id: arrow_id,
+      text: Some("  箭头\n标签  ".to_owned()),
+    }
+    .apply(&mut document)
+    .unwrap();
+    let ElementPayload::Arrow(arrow) = &document.element(arrow_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(arrow.label.text.as_deref(), Some("  箭头\n标签  "));
+
+    let applied = DocumentCommand::UpdateElementLabel {
+      element_id: rectangle_id,
+      text: Some(" \n\t ".to_owned()),
+    }
+    .apply(&mut document)
+    .unwrap();
+    let ElementPayload::Rectangle(rectangle) = &document.element(rectangle_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(rectangle.label.text, None);
+    applied.undo(&mut document).unwrap();
+    let ElementPayload::Rectangle(rectangle) = &document.element(rectangle_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(rectangle.label.text.as_deref(), Some("标题"));
+  }
+
+  #[test]
+  fn rectangle_label_text_and_anchor_can_be_recreated_in_one_revision() {
+    let rectangle_id = ElementId::new();
+    let mut document = document();
+    DocumentCommand::AddElement { element: rectangle(rectangle_id) }.apply(&mut document).unwrap();
+    DocumentCommand::UpdateElementLabel { element_id: rectangle_id, text: None }
+      .apply(&mut document)
+      .unwrap();
+    let before_revision = document.revision;
+    let anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Inside, 0.75);
+    let batch = CommandBatch::new(vec![
+      DocumentCommand::UpdateElementLabel {
+        element_id: rectangle_id,
+        text: Some("重新展示".to_owned()),
+      },
+      DocumentCommand::UpdateRectangleLabelAnchor { element_id: rectangle_id, anchor },
+    ])
+    .unwrap();
+    let applied = batch.apply(&mut document).unwrap();
+    assert_eq!(document.revision, before_revision + 1);
+    let ElementPayload::Rectangle(rectangle) = &document.element(rectangle_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(rectangle.label.text.as_deref(), Some("重新展示"));
+    assert_eq!(rectangle.label_anchor, anchor);
+
+    applied.undo(&mut document).unwrap();
+    let ElementPayload::Rectangle(rectangle) = &document.element(rectangle_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(rectangle.label.text, None);
+    assert_ne!(rectangle.label_anchor, anchor);
   }
 
   #[test]
@@ -794,6 +913,60 @@ mod tests {
     applied.undo(&mut document).unwrap();
     assert_eq!(document.elements.len(), 1);
     assert_eq!(document.elements[0].element_id, source_id);
+  }
+
+  #[test]
+  fn paste_copy_preserves_shared_labels_and_rectangle_anchors() {
+    let document = document();
+
+    let mut source_arrow = arrow(ElementId::new());
+    let ElementPayload::Arrow(source_payload) = &mut source_arrow.payload else {
+      unreachable!();
+    };
+    source_payload.label.text = Some("箭头标签".to_owned());
+    source_arrow.refresh_bounds(document.canvas_size_px).unwrap();
+    let arrow_copy = DocumentCommand::paste_copy(
+      &source_arrow,
+      ElementId::new(),
+      PointPx::new(250.0, 150.0),
+      &document,
+    )
+    .unwrap();
+    let DocumentCommand::AddElement { element: arrow_copy } = arrow_copy else {
+      unreachable!();
+    };
+    let (ElementPayload::Arrow(source), ElementPayload::Arrow(copy)) =
+      (&source_arrow.payload, &arrow_copy.payload)
+    else {
+      unreachable!();
+    };
+    assert_eq!(copy.label, source.label);
+
+    let mut source_rectangle = rectangle(ElementId::new());
+    let ElementPayload::Rectangle(source_payload) = &mut source_rectangle.payload else {
+      unreachable!();
+    };
+    source_payload.label.text = None;
+    source_payload.label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Inside, 0.75);
+    source_rectangle.refresh_bounds(document.canvas_size_px).unwrap();
+    let rectangle_copy = DocumentCommand::paste_copy(
+      &source_rectangle,
+      ElementId::new(),
+      PointPx::new(250.0, 150.0),
+      &document,
+    )
+    .unwrap();
+    let DocumentCommand::AddElement { element: rectangle_copy } = rectangle_copy else {
+      unreachable!();
+    };
+    let (ElementPayload::Rectangle(source), ElementPayload::Rectangle(copy)) =
+      (&source_rectangle.payload, &rectangle_copy.payload)
+    else {
+      unreachable!();
+    };
+    assert_eq!(copy.label, source.label);
+    assert_eq!(copy.label_anchor, source.label_anchor);
   }
 
   #[test]

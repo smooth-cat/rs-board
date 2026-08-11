@@ -200,7 +200,10 @@ mod tests {
   use crate::{
     command::DocumentCommand,
     document::{CapturedDisplay, DocumentId, GlobalBoundsPx},
-    element::{ArrowHead, ArrowPayload, Element, ElementId, ElementPayload, StrokeStyle},
+    element::{
+      ArrowHead, ArrowPayload, Element, ElementId, ElementLabel, ElementPayload, StrokeStyle,
+      TextStyle,
+    },
     geometry::{PointPx, SizePx},
   };
 
@@ -226,6 +229,13 @@ mod tests {
         start_px: PointPx::new(50.0 + offset, 50.0),
         end_px: PointPx::new(150.0 + offset, 100.0),
         head: ArrowHead::for_stroke_width(style.width_px).unwrap(),
+        label: ElementLabel {
+          text: None,
+          max_width_px: 420.0,
+          padding_px: 8.0,
+          anchor_offset_px: 8.0,
+          text_style: TextStyle::mvp(style.color_rgba.contrasting_text(), 24.0).unwrap(),
+        },
         stroke_style: style,
       }),
       SizePx::new(500, 300),

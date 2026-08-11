@@ -1,10 +1,11 @@
 use common::{
   ArrowEndpoint, ArrowHead, ArrowPayload, BoardDocument, ColorRgba, CommandBatch, CommandHistory,
-  DocumentCommand, Element, ElementId, ElementPayload, LabelPlacementPreference,
-  PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx,
-  RectangleLabel, RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokePoint,
-  StrokeStyle, StyleChange, TextAlign, TextPayload, TextStyle, minimum_geometry_extent,
-  rectangle_label_layout,
+  DocumentCommand, Element, ElementId, ElementLabel, ElementPayload, PRESET_BRUSH_HARDNESSES,
+  PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx, RectangleLabelAnchor,
+  RectangleLabelEdge, RectangleLabelSide, RectanglePayload, SequenceMarkerPayload, SizePx,
+  StrokePayload, StrokePoint, StrokeStyle, StyleChange, TextAlign, TextPayload, TextStyle,
+  arrow_label_layout, arrow_minimum_length_for_label, choose_rectangle_label_anchor,
+  minimum_geometry_extent, rectangle_label_layout, snap_rectangle_label_layout,
 };
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FontId, Id, ImeEvent, Key, KeyboardShortcut, Modifiers,
@@ -13,12 +14,13 @@ use eframe::egui::{
 };
 
 use crate::renderer::{
-  layout_egui_text, paint_document, paint_element, paint_raw_stroke_points,
-  paint_rectangle_without_label_text,
+  layout_egui_text, paint_arrow_without_label_text, paint_document, paint_element,
+  paint_raw_stroke_points, paint_rectangle_without_label_text,
 };
 
 const DEFAULT_RECTANGLE_LABEL: &str = "标题";
-const EMPTY_RECTANGLE_LABEL_DRAFT: &str = "\u{200b}";
+const EMPTY_LABEL_DRAFT: &str = "\u{200b}";
+const ARROW_LABEL_TOO_SHORT_TOAST: &str = "箭头过短无法插入文字";
 const COLOR_SWATCH_FONT_SIZE_PT: f32 = 20.0;
 const FLOATING_CONTROL_HEIGHT_PT: f32 = 32.0;
 const FLOATING_MENU_MAX_HEIGHT_PT: f32 = f32::INFINITY;
@@ -105,6 +107,7 @@ impl Default for ToolStyle {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
   Command(CommandBatch),
+  Toast(String),
   Undo,
   Redo,
   Save,
@@ -205,6 +208,11 @@ enum PointerInteraction {
     endpoint: ArrowEndpoint,
     current: PointPx,
   },
+  DragRectangleLabel {
+    element_id: ElementId,
+    current: PointPx,
+    grab_offset_px: PointPx,
+  },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +259,7 @@ enum RectangleHandle {
 enum TextTarget {
   NewText { anchor_px: PointPx },
   ExistingText { element_id: ElementId },
+  ArrowLabel { element_id: ElementId },
   RectangleLabel { element_id: ElementId },
 }
 
@@ -262,6 +271,7 @@ struct TextEditing {
   ime: InlineImeState,
   request_focus: bool,
   select_all: bool,
+  auto_place_rectangle: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -495,6 +505,12 @@ impl EditorController {
     self.show(ui, document, history, background)
   }
 
+  pub(crate) fn commit_pending_text(&mut self, document: &BoardDocument) -> Vec<EditorAction> {
+    let mut actions = Vec::new();
+    self.commit_text(document, &mut actions);
+    actions
+  }
+
   fn handle_keyboard(
     &mut self,
     ctx: &egui::Context,
@@ -626,7 +642,9 @@ impl EditorController {
         hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale())
     {
       self.selected_element_id = Some(element_id);
-      self.start_editing_existing(document, element_id);
+      if double_click_starts_editing(document, element_id, position) {
+        self.start_editing_existing(document, element_id, true, actions);
+      }
       return;
     }
 
@@ -635,8 +653,13 @@ impl EditorController {
     {
       match self.tool {
         EditorTool::Select => {
-          self.selected_element_id =
-            hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale());
+          if let Some(element_id) = hit_test_visible_element_label(document, position) {
+            self.selected_element_id = Some(element_id);
+            self.start_editing_existing(document, element_id, false, actions);
+          } else {
+            self.selected_element_id =
+              hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale());
+          }
         }
         EditorTool::Text => {
           let style = self.tool_style(EditorTool::Text);
@@ -648,6 +671,7 @@ impl EditorController {
             ime: InlineImeState::default(),
             request_focus: true,
             select_all: false,
+            auto_place_rectangle: false,
           });
         }
         EditorTool::Sequence => self.insert_sequence(document, position, actions),
@@ -727,7 +751,8 @@ impl EditorController {
         }
         Some(PointerInteraction::Move { current, .. })
         | Some(PointerInteraction::ResizeRectangle { current, .. })
-        | Some(PointerInteraction::UpdateArrowEndpoint { current, .. }) => *current = position,
+        | Some(PointerInteraction::UpdateArrowEndpoint { current, .. })
+        | Some(PointerInteraction::DragRectangleLabel { current, .. }) => *current = position,
         None => {}
       }
     }
@@ -804,6 +829,25 @@ impl EditorController {
     transform: CanvasTransform,
     document: &BoardDocument,
   ) {
+    if let Some(element_id) = hit_test_visible_rectangle_label(document, position) {
+      self.selected_element_id = Some(element_id);
+      let grab_offset_px = document
+        .element(element_id)
+        .and_then(|element| match &element.payload {
+          ElementPayload::Rectangle(payload) => {
+            rectangle_label_layout(payload, document.canvas_size_px).ok().flatten()
+          }
+          _ => None,
+        })
+        .map_or(PointPx::ZERO, |layout| layout.bounds_px.center() - position);
+      self.interaction = Some(PointerInteraction::DragRectangleLabel {
+        element_id,
+        current: position,
+        grab_offset_px,
+      });
+      return;
+    }
+
     if let Some(element_id) = self.selected_element_id
       && let Some(element) = document.element(element_id)
     {
@@ -866,18 +910,38 @@ impl EditorController {
               ime: InlineImeState::default(),
               request_focus: true,
               select_all: true,
+              auto_place_rectangle: true,
             });
           }
         }
         EditorTool::Arrow => {
           if let Some(element) = self.make_arrow(document, start, current) {
             let element_id = element.element_id;
+            let ElementPayload::Arrow(payload) = &element.payload else {
+              unreachable!("arrow tool created a non-arrow element");
+            };
+            let can_edit_label = arrow_can_host_label(payload, document.canvas_size_px);
+            let text_style = payload.label.text_style.clone();
             self.push_pointer_command(
               document,
               actions,
               DocumentCommand::AddElement { element },
               element_id,
             );
+            self.selected_element_id = Some(element_id);
+            if can_edit_label {
+              self.text_editing = Some(TextEditing {
+                target: TextTarget::ArrowLabel { element_id },
+                buffer: String::new(),
+                text_style,
+                ime: InlineImeState::default(),
+                request_focus: true,
+                select_all: false,
+                auto_place_rectangle: false,
+              });
+            } else {
+              actions.push(EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned()));
+            }
           }
         }
         EditorTool::Stroke => {
@@ -925,7 +989,8 @@ impl EditorController {
         if let Some(element) = document.element(element_id)
           && let ElementPayload::Arrow(payload) = &element.payload
         {
-          let position_px = clamped_arrow_endpoint(payload, endpoint, current);
+          let (position_px, constrained_for_label) =
+            clamped_arrow_endpoint(payload, endpoint, current);
           let original_position_px = match endpoint {
             ArrowEndpoint::Start => payload.start_px,
             ArrowEndpoint::End => payload.end_px,
@@ -938,6 +1003,24 @@ impl EditorController {
               element_id,
             );
           }
+          if constrained_for_label {
+            actions.push(EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned()));
+          }
+        }
+      }
+      PointerInteraction::DragRectangleLabel { element_id, current, grab_offset_px } => {
+        if let Some(element) = document.element(element_id)
+          && let ElementPayload::Rectangle(payload) = &element.payload
+          && let Ok(layout) =
+            snap_rectangle_label_layout(payload, document.canvas_size_px, current + grab_offset_px)
+          && layout.anchor != payload.label_anchor
+        {
+          self.push_pointer_command(
+            document,
+            actions,
+            DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor: layout.anchor },
+            element_id,
+          );
         }
       }
     }
@@ -967,7 +1050,10 @@ impl EditorController {
       coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0),
       coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0),
     );
-    let payload = self.rectangle_payload(start_px, end_px)?;
+    let mut payload = self.rectangle_payload(start_px, end_px)?;
+    let obstacles = rectangle_label_obstacles(document, None);
+    payload.label_anchor =
+      choose_rectangle_label_anchor(&payload, document.canvas_size_px, &obstacles).ok()?;
     Element::new(
       ElementId::new(),
       document.elements.len() as i64,
@@ -1009,14 +1095,18 @@ impl EditorController {
       end_px,
       stroke_style,
       fill_rgba: None,
-      label: RectangleLabel {
-        text: DEFAULT_RECTANGLE_LABEL.to_owned(),
-        placement_preference: LabelPlacementPreference::Above,
+      label: ElementLabel {
+        text: Some(DEFAULT_RECTANGLE_LABEL.to_owned()),
         max_width_px: 420.0,
         padding_px: 8.0,
         anchor_offset_px: 8.0,
         text_style,
       },
+      label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
     })
   }
 
@@ -1064,7 +1154,21 @@ impl EditorController {
     let style = self.tool_style(EditorTool::Arrow);
     let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
     let head = ArrowHead::for_stroke_width(style.width_px).ok()?;
-    Some(ArrowPayload { start_px, end_px, stroke_style, head })
+    let text_style =
+      TextStyle::mvp(style.color_rgba.contrasting_text(), style.font_size_px).ok()?;
+    Some(ArrowPayload {
+      start_px,
+      end_px,
+      stroke_style,
+      head,
+      label: ElementLabel {
+        text: None,
+        max_width_px: 420.0,
+        padding_px: 8.0,
+        anchor_offset_px: 8.0,
+        text_style,
+      },
+    })
   }
 
   #[cfg(test)]
@@ -1130,7 +1234,13 @@ impl EditorController {
     }
   }
 
-  fn start_editing_existing(&mut self, document: &BoardDocument, element_id: ElementId) {
+  fn start_editing_existing(
+    &mut self,
+    document: &BoardDocument,
+    element_id: ElementId,
+    recreate_hidden_label: bool,
+    actions: &mut Vec<EditorAction>,
+  ) {
     let Some(element) = document.element(element_id) else {
       return;
     };
@@ -1143,16 +1253,36 @@ impl EditorController {
           ime: InlineImeState::default(),
           request_focus: true,
           select_all: false,
+          auto_place_rectangle: false,
         });
       }
-      ElementPayload::Rectangle(payload) => {
+      ElementPayload::Arrow(payload) if payload.label.text.is_some() || recreate_hidden_label => {
+        if payload.label.text.is_none() && !arrow_can_host_label(payload, document.canvas_size_px) {
+          actions.push(EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned()));
+          return;
+        }
         self.text_editing = Some(TextEditing {
-          target: TextTarget::RectangleLabel { element_id },
-          buffer: payload.label.text.clone(),
+          target: TextTarget::ArrowLabel { element_id },
+          buffer: payload.label.text.clone().unwrap_or_default(),
           text_style: payload.label.text_style.clone(),
           ime: InlineImeState::default(),
           request_focus: true,
           select_all: false,
+          auto_place_rectangle: false,
+        });
+      }
+      ElementPayload::Rectangle(payload) => {
+        if payload.label.text.is_none() && !recreate_hidden_label {
+          return;
+        }
+        self.text_editing = Some(TextEditing {
+          target: TextTarget::RectangleLabel { element_id },
+          buffer: payload.label.text.clone().unwrap_or_default(),
+          text_style: payload.label.text_style.clone(),
+          ime: InlineImeState::default(),
+          request_focus: true,
+          select_all: false,
+          auto_place_rectangle: payload.label.text.is_none(),
         });
       }
       _ => {}
@@ -1163,11 +1293,11 @@ impl EditorController {
     let Some(editing) = self.text_editing.take() else {
       return;
     };
-    if editing.buffer.trim().is_empty() {
-      return;
-    }
     match editing.target {
       TextTarget::NewText { anchor_px } => {
+        if editing.buffer.trim().is_empty() {
+          return;
+        }
         let box_width_px = text_width_to_canvas_edge(anchor_px, document.canvas_size_px);
         let Ok(element) = Element::new(
           ElementId::new(),
@@ -1185,6 +1315,9 @@ impl EditorController {
         actions.push(command_action(DocumentCommand::AddElement { element }));
       }
       TextTarget::ExistingText { element_id } => {
+        if editing.buffer.trim().is_empty() {
+          return;
+        }
         let Some(element) = document.element(element_id) else {
           return;
         };
@@ -1203,6 +1336,18 @@ impl EditorController {
           payload: ElementPayload::Text(payload),
         }));
       }
+      TextTarget::ArrowLabel { element_id } => {
+        let Some(element) = document.element(element_id) else {
+          return;
+        };
+        let ElementPayload::Arrow(payload) = &element.payload else {
+          return;
+        };
+        let text = normalized_label_text(editing.buffer);
+        if payload.label.text != text {
+          actions.push(command_action(DocumentCommand::UpdateElementLabel { element_id, text }));
+        }
+      }
       TextTarget::RectangleLabel { element_id } => {
         let Some(element) = document.element(element_id) else {
           return;
@@ -1210,11 +1355,25 @@ impl EditorController {
         let ElementPayload::Rectangle(payload) = &element.payload else {
           return;
         };
-        if payload.label.text != editing.buffer {
-          actions.push(command_action(DocumentCommand::UpdateRectangleLabel {
-            element_id,
-            text: editing.buffer,
-          }));
+        let text = normalized_label_text(editing.buffer);
+        let anchor = if editing.auto_place_rectangle && text.is_some() {
+          let mut draft = payload.clone();
+          draft.label.text = text.clone();
+          let obstacles = rectangle_label_obstacles(document, Some(element_id));
+          choose_rectangle_label_anchor(&draft, document.canvas_size_px, &obstacles)
+            .unwrap_or(payload.label_anchor)
+        } else {
+          payload.label_anchor
+        };
+        let mut commands = Vec::with_capacity(2);
+        if payload.label.text != text {
+          commands.push(DocumentCommand::UpdateElementLabel { element_id, text });
+        }
+        if payload.label_anchor != anchor {
+          commands.push(DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor });
+        }
+        if let Ok(batch) = CommandBatch::new(commands) {
+          actions.push(EditorAction::Command(batch));
         }
       }
     }
@@ -1226,9 +1385,24 @@ impl EditorController {
     transform: CanvasTransform,
     document: &BoardDocument,
   ) -> bool {
-    let Some(editing) = self.text_editing.as_ref() else {
+    if self.text_editing.is_none() {
       return false;
-    };
+    }
+    let cancel = ctx.input_mut(|input| {
+      input
+        .events
+        .iter()
+        .position(|event| {
+          matches!(event, Event::Key { key: Key::Escape, pressed: true, modifiers, .. } if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd)
+        })
+        .map(|position| input.events.remove(position))
+        .is_some()
+    });
+    if cancel {
+      self.text_editing = None;
+      return false;
+    }
+    let editing = self.text_editing.as_ref().expect("text editing checked above");
     let Some(geometry) = inline_text_geometry(editing, document) else {
       return false;
     };
@@ -1566,7 +1740,6 @@ impl EditorController {
       match element.payload {
         ElementPayload::Stroke(_) => change.font_size_px = None,
         ElementPayload::Arrow(_) => {
-          change.font_size_px = None;
           change.hardness = None;
         }
         ElementPayload::Text(_) => {
@@ -1578,6 +1751,24 @@ impl EditorController {
         }
       }
       if change != StyleChange::default() {
+        let pending_label_text = pending_element_label_text(actions, element_id);
+        let effective_arrow_label_text = match &element.payload {
+          ElementPayload::Arrow(payload) => {
+            Some(pending_label_text.unwrap_or_else(|| payload.label.text.clone()))
+          }
+          _ => None,
+        };
+        if let Some(Some(label_text)) = effective_arrow_label_text {
+          let mut staged = element.clone();
+          let ElementPayload::Arrow(payload) = &mut staged.payload else {
+            unreachable!("effective arrow label only exists for arrows");
+          };
+          payload.label.text = Some(label_text);
+          if staged.set_style(&change, document.canvas_size_px).is_err() {
+            actions.push(EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned()));
+            return;
+          }
+        }
         actions.push(command_action(DocumentCommand::ChangeElementStyle { element_id, change }));
       }
       return;
@@ -1619,12 +1810,20 @@ impl EditorController {
       }
       match self.text_editing.as_ref().map(|editing| &editing.target) {
         Some(TextTarget::ExistingText { element_id }) if *element_id == element.element_id => {}
+        Some(TextTarget::ArrowLabel { element_id }) if *element_id == element.element_id => {
+          let ElementPayload::Arrow(payload) = &element.payload else {
+            continue;
+          };
+          let editing = self.text_editing.as_ref().expect("text editing target checked above");
+          let draft = arrow_label_draft(payload, editing);
+          paint_arrow_without_label_text(&painter, &transform, &draft, 1.0);
+        }
         Some(TextTarget::RectangleLabel { element_id }) if *element_id == element.element_id => {
           let ElementPayload::Rectangle(payload) = &element.payload else {
             continue;
           };
           let editing = self.text_editing.as_ref().expect("text editing target checked above");
-          let draft = rectangle_label_draft(payload, editing);
+          let draft = rectangle_label_draft(payload, editing, document, *element_id);
           paint_rectangle_without_label_text(&painter, &transform, &draft, 1.0);
         }
         _ => paint_element(&painter, &transform, element, 1.0),
@@ -1670,7 +1869,8 @@ impl EditorController {
       },
       PointerInteraction::Move { .. }
       | PointerInteraction::ResizeRectangle { .. }
-      | PointerInteraction::UpdateArrowEndpoint { .. } => {}
+      | PointerInteraction::UpdateArrowEndpoint { .. }
+      | PointerInteraction::DragRectangleLabel { .. } => {}
     }
   }
 
@@ -1730,6 +1930,98 @@ pub fn hit_test_document(
     .map(|element| element.element_id)
 }
 
+fn hit_test_visible_element_label(
+  document: &BoardDocument,
+  position_px: PointPx,
+) -> Option<ElementId> {
+  document
+    .elements
+    .iter()
+    .filter(|element| match &element.payload {
+      ElementPayload::Arrow(payload) => arrow_label_layout(payload, document.canvas_size_px)
+        .ok()
+        .flatten()
+        .is_some_and(|layout| contains(layout.bounds_px, position_px)),
+      ElementPayload::Rectangle(payload) => {
+        rectangle_label_layout(payload, document.canvas_size_px)
+          .ok()
+          .flatten()
+          .is_some_and(|layout| contains(layout.bounds_px, position_px))
+      }
+      _ => false,
+    })
+    .max_by_key(|element| element.z_index)
+    .map(|element| element.element_id)
+}
+
+fn double_click_starts_editing(
+  document: &BoardDocument,
+  element_id: ElementId,
+  position_px: PointPx,
+) -> bool {
+  let Some(element) = document.element(element_id) else {
+    return false;
+  };
+  match &element.payload {
+    ElementPayload::Text(_) => true,
+    ElementPayload::Arrow(payload) => {
+      payload.label.text.is_none()
+        || arrow_label_layout(payload, document.canvas_size_px)
+          .ok()
+          .flatten()
+          .is_some_and(|layout| contains(layout.bounds_px, position_px))
+    }
+    ElementPayload::Rectangle(payload) => {
+      payload.label.text.is_none()
+        || rectangle_label_layout(payload, document.canvas_size_px)
+          .ok()
+          .flatten()
+          .is_some_and(|layout| contains(layout.bounds_px, position_px))
+    }
+    _ => false,
+  }
+}
+
+fn hit_test_visible_rectangle_label(
+  document: &BoardDocument,
+  position_px: PointPx,
+) -> Option<ElementId> {
+  document
+    .elements
+    .iter()
+    .filter(|element| {
+      let ElementPayload::Rectangle(payload) = &element.payload else {
+        return false;
+      };
+      rectangle_label_layout(payload, document.canvas_size_px)
+        .ok()
+        .flatten()
+        .is_some_and(|layout| contains(layout.bounds_px, position_px))
+    })
+    .max_by_key(|element| element.z_index)
+    .map(|element| element.element_id)
+}
+
+fn rectangle_label_obstacles(
+  document: &BoardDocument,
+  current_element_id: Option<ElementId>,
+) -> Vec<RectPx> {
+  let mut obstacles = Vec::new();
+  for element in &document.elements {
+    if Some(element.element_id) == current_element_id {
+      continue;
+    }
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      continue;
+    };
+    obstacles.push(RectPx::from_points(payload.start_px, payload.end_px));
+    if let Ok(Some(layout)) = rectangle_label_layout(payload, document.canvas_size_px) {
+      obstacles.push(layout.bounds_px);
+    }
+  }
+  obstacles
+}
+
 fn hit_test_element(
   element: &Element,
   point: PointPx,
@@ -1750,19 +2042,65 @@ fn hit_test_element(
       }),
     },
     ElementPayload::Arrow(payload) => {
-      distance_to_segment(point, payload.start_px, payload.end_px)
-        <= payload.stroke_style.width_px / 2.0 + tolerance
-        || contains(element.bounds_px.expanded(tolerance), point)
+      hit_arrow_body(payload, point, tolerance)
+        || arrow_label_layout(payload, canvas_size)
+          .ok()
+          .flatten()
+          .is_some_and(|layout| contains(layout.bounds_px.expanded(tolerance), point))
     }
     ElementPayload::Rectangle(payload) => {
       contains(RectPx::from_points(payload.start_px, payload.end_px).expanded(tolerance), point)
         || rectangle_label_layout(payload, canvas_size)
-          .is_ok_and(|layout| contains(layout.bounds_px.expanded(tolerance), point))
+          .ok()
+          .flatten()
+          .is_some_and(|layout| contains(layout.bounds_px.expanded(tolerance), point))
     }
     ElementPayload::Text(_) | ElementPayload::SequenceMarker(_) => {
       contains(element.bounds_px.expanded(tolerance), point)
     }
   }
+}
+
+fn hit_arrow_body(payload: &ArrowPayload, point: PointPx, tolerance: f32) -> bool {
+  if distance_to_segment(point, payload.start_px, payload.end_px)
+    <= payload.stroke_style.width_px / 2.0 + tolerance
+  {
+    return true;
+  }
+  let direction = payload.end_px - payload.start_px;
+  let length = payload.start_px.distance_to(payload.end_px);
+  if length <= f32::EPSILON {
+    return false;
+  }
+  let unit = PointPx::new(direction.x_px / length, direction.y_px / length);
+  let perpendicular = PointPx::new(-unit.y_px, unit.x_px);
+  let base = PointPx::new(
+    payload.end_px.x_px - unit.x_px * payload.head.length_px,
+    payload.end_px.y_px - unit.y_px * payload.head.length_px,
+  );
+  let half_width = payload.head.width_px / 2.0 + tolerance;
+  let left = PointPx::new(
+    base.x_px + perpendicular.x_px * half_width,
+    base.y_px + perpendicular.y_px * half_width,
+  );
+  let right = PointPx::new(
+    base.x_px - perpendicular.x_px * half_width,
+    base.y_px - perpendicular.y_px * half_width,
+  );
+  point_in_triangle(point, payload.end_px, left, right)
+}
+
+fn point_in_triangle(point: PointPx, first: PointPx, second: PointPx, third: PointPx) -> bool {
+  fn sign(point: PointPx, first: PointPx, second: PointPx) -> f32 {
+    (point.x_px - second.x_px) * (first.y_px - second.y_px)
+      - (first.x_px - second.x_px) * (point.y_px - second.y_px)
+  }
+  let first_sign = sign(point, first, second);
+  let second_sign = sign(point, second, third);
+  let third_sign = sign(point, third, first);
+  let has_negative = first_sign < 0.0 || second_sign < 0.0 || third_sign < 0.0;
+  let has_positive = first_sign > 0.0 || second_sign > 0.0 || third_sign > 0.0;
+  !(has_negative && has_positive)
 }
 
 fn append_stroke_point(points: &mut Vec<StrokePoint>, point: StrokePoint) {
@@ -1949,9 +2287,14 @@ fn interaction_preview_element(
         let ElementPayload::Arrow(payload) = &mut preview.payload else {
           return None;
         };
+        let current = if payload.label.text.is_some() {
+          clamped_arrow_endpoint(payload, *endpoint, *current).0
+        } else {
+          *current
+        };
         match endpoint {
-          ArrowEndpoint::Start => payload.start_px = *current,
-          ArrowEndpoint::End => payload.end_px = *current,
+          ArrowEndpoint::Start => payload.start_px = current,
+          ArrowEndpoint::End => payload.end_px = current,
         }
         payload.start_px.distance_to(payload.end_px) >= payload.head.min_body_length_px
       };
@@ -1959,6 +2302,18 @@ fn interaction_preview_element(
       if meets_minimum {
         preview.constrain_to_canvas(document.canvas_size_px, true).ok()?;
       }
+      Some(preview)
+    }
+    PointerInteraction::DragRectangleLabel { element_id, current, grab_offset_px } => {
+      let mut preview = document.element(*element_id)?.clone();
+      let ElementPayload::Rectangle(payload) = &mut preview.payload else {
+        return None;
+      };
+      payload.label_anchor =
+        snap_rectangle_label_layout(payload, document.canvas_size_px, *current + *grab_offset_px)
+          .ok()?
+          .anchor;
+      preview.refresh_bounds(document.canvas_size_px).ok()?;
       Some(preview)
     }
   }
@@ -2053,17 +2408,26 @@ fn clamped_arrow_endpoint(
   payload: &ArrowPayload,
   endpoint: ArrowEndpoint,
   requested_px: PointPx,
-) -> PointPx {
+) -> (PointPx, bool) {
   let (original_px, fixed_px) = match endpoint {
     ArrowEndpoint::Start => (payload.start_px, payload.end_px),
     ArrowEndpoint::End => (payload.end_px, payload.start_px),
   };
-  point_at_minimum_distance(
-    fixed_px,
-    requested_px,
-    payload.head.min_body_length_px,
-    original_px - fixed_px,
+  let label_minimum =
+    payload.label.text.as_ref().and_then(|_| arrow_minimum_length_for_label(payload).ok());
+  let minimum = label_minimum.unwrap_or(payload.head.min_body_length_px);
+  let constrained_for_label =
+    label_minimum.is_some_and(|minimum| requested_px.distance_to(fixed_px) < minimum);
+  (
+    point_at_minimum_distance(fixed_px, requested_px, minimum, original_px - fixed_px),
+    constrained_for_label,
   )
+}
+
+fn arrow_can_host_label(payload: &ArrowPayload, canvas_size_px: SizePx) -> bool {
+  let mut draft = payload.clone();
+  draft.label.text = Some(EMPTY_LABEL_DRAFT.to_owned());
+  arrow_label_layout(&draft, canvas_size_px).is_ok_and(|layout| layout.is_some())
 }
 
 fn map_shortcut(key: Key, modifiers: Modifiers, text_editing: bool) -> Option<ShortcutAction> {
@@ -2132,38 +2496,90 @@ fn inline_text_geometry(
         wrap_width_px: text_width_to_canvas_edge(payload.anchor_px, document.canvas_size_px),
       })
     }
+    TextTarget::ArrowLabel { element_id } => {
+      let ElementPayload::Arrow(payload) = &document.element(element_id)?.payload else {
+        return None;
+      };
+      let draft = arrow_label_draft(payload, editing);
+      let layout = arrow_label_layout(&draft, document.canvas_size_px).ok()??;
+      Some(inline_label_geometry(
+        layout.bounds_px,
+        layout.text_wrap_width_px,
+        draft.label.padding_px,
+        editing.text_style.align,
+      ))
+    }
     TextTarget::RectangleLabel { element_id } => {
       // A newly-created rectangle is added after this frame. Waiting for it to
       // enter the document avoids briefly placing its editor at the origin.
       let ElementPayload::Rectangle(payload) = &document.element(element_id)?.payload else {
         return None;
       };
-      let draft = rectangle_label_draft(payload, editing);
-      let layout = rectangle_label_layout(&draft, document.canvas_size_px).ok()?;
-      let alignment_width_px = (layout.bounds_px.width() - draft.label.padding_px * 2.0).max(1.0);
-      let alignment_offset_px = match editing.text_style.align {
-        TextAlign::Left => 0.0,
-        TextAlign::Center => (alignment_width_px - layout.text_wrap_width_px) / 2.0,
-        TextAlign::Right => alignment_width_px - layout.text_wrap_width_px,
-      };
-      Some(InlineTextGeometry {
-        origin_px: layout.bounds_px.min
-          + PointPx::new(draft.label.padding_px + alignment_offset_px, draft.label.padding_px),
-        wrap_width_px: layout.text_wrap_width_px,
-      })
+      let draft = rectangle_label_draft(payload, editing, document, element_id);
+      let layout = rectangle_label_layout(&draft, document.canvas_size_px).ok()??;
+      Some(inline_label_geometry(
+        layout.bounds_px,
+        layout.text_wrap_width_px,
+        draft.label.padding_px,
+        editing.text_style.align,
+      ))
     }
   }
 }
 
-fn rectangle_label_draft(payload: &RectanglePayload, editing: &TextEditing) -> RectanglePayload {
+fn inline_label_geometry(
+  bounds_px: RectPx,
+  text_wrap_width_px: f32,
+  padding_px: f32,
+  align: TextAlign,
+) -> InlineTextGeometry {
+  let alignment_width_px = (bounds_px.width() - padding_px * 2.0).max(1.0);
+  let alignment_offset_px = match align {
+    TextAlign::Left => 0.0,
+    TextAlign::Center => (alignment_width_px - text_wrap_width_px) / 2.0,
+    TextAlign::Right => alignment_width_px - text_wrap_width_px,
+  };
+  InlineTextGeometry {
+    origin_px: bounds_px.min + PointPx::new(padding_px + alignment_offset_px, padding_px),
+    wrap_width_px: text_wrap_width_px,
+  }
+}
+
+fn arrow_label_draft(payload: &ArrowPayload, editing: &TextEditing) -> ArrowPayload {
   let mut draft = payload.clone();
-  draft.label.text = if editing.buffer.trim().is_empty() {
-    EMPTY_RECTANGLE_LABEL_DRAFT.to_owned()
+  draft.label.text = Some(if editing.buffer.trim().is_empty() {
+    EMPTY_LABEL_DRAFT.to_owned()
   } else {
     editing.buffer.clone()
-  };
+  });
   draft.label.text_style = editing.text_style.clone();
   draft
+}
+
+fn rectangle_label_draft(
+  payload: &RectanglePayload,
+  editing: &TextEditing,
+  document: &BoardDocument,
+  element_id: ElementId,
+) -> RectanglePayload {
+  let mut draft = payload.clone();
+  draft.label.text = Some(if editing.buffer.trim().is_empty() {
+    EMPTY_LABEL_DRAFT.to_owned()
+  } else {
+    editing.buffer.clone()
+  });
+  draft.label.text_style = editing.text_style.clone();
+  if editing.auto_place_rectangle {
+    let obstacles = rectangle_label_obstacles(document, Some(element_id));
+    if let Ok(anchor) = choose_rectangle_label_anchor(&draft, document.canvas_size_px, &obstacles) {
+      draft.label_anchor = anchor;
+    }
+  }
+  draft
+}
+
+fn normalized_label_text(text: String) -> Option<String> {
+  (!text.trim().is_empty()).then_some(text)
 }
 
 fn translate_inline_text_layer(
@@ -2330,7 +2746,7 @@ fn style_for_element(element: &Element) -> ToolStyle {
     ElementPayload::Arrow(payload) => ToolStyle {
       color_rgba: payload.stroke_style.color_rgba,
       width_px: payload.stroke_style.width_px,
-      font_size_px: 24.0,
+      font_size_px: payload.label.text_style.font_size_px,
       hardness: 1.0,
     },
     ElementPayload::Rectangle(payload) => ToolStyle {
@@ -2360,6 +2776,25 @@ fn hardness_percent(hardness: f32) -> i32 {
 
 fn command_action(command: DocumentCommand) -> EditorAction {
   EditorAction::Command(CommandBatch::single(command))
+}
+
+fn pending_element_label_text(
+  actions: &[EditorAction],
+  element_id: ElementId,
+) -> Option<Option<String>> {
+  actions.iter().rev().find_map(|action| {
+    let EditorAction::Command(batch) = action else {
+      return None;
+    };
+    batch.commands().iter().rev().find_map(|command| match command {
+      DocumentCommand::UpdateElementLabel { element_id: updated_id, text }
+        if *updated_id == element_id =>
+      {
+        Some(text.clone())
+      }
+      _ => None,
+    })
+  })
 }
 
 fn preview_element_after_batch(
@@ -2631,14 +3066,18 @@ mod tests {
         end_px: end,
         stroke_style: style.clone(),
         fill_rgba: None,
-        label: RectangleLabel {
-          text: DEFAULT_RECTANGLE_LABEL.to_owned(),
-          placement_preference: LabelPlacementPreference::Above,
+        label: ElementLabel {
+          text: Some(DEFAULT_RECTANGLE_LABEL.to_owned()),
           max_width_px: 200.0,
           padding_px: 8.0,
           anchor_offset_px: 8.0,
           text_style: TextStyle::mvp(style.color_rgba.contrasting_text(), 24.0).unwrap(),
         },
+        label_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
       }),
       document.canvas_size_px,
     )
@@ -2651,7 +3090,19 @@ mod tests {
     Element::new(
       ElementId::new(),
       z_index,
-      ElementPayload::Arrow(ArrowPayload { start_px: start, end_px: end, stroke_style, head }),
+      ElementPayload::Arrow(ArrowPayload {
+        start_px: start,
+        end_px: end,
+        label: ElementLabel {
+          text: None,
+          max_width_px: 420.0,
+          padding_px: 8.0,
+          anchor_offset_px: 8.0,
+          text_style: TextStyle::mvp(stroke_style.color_rgba.contrasting_text(), 24.0).unwrap(),
+        },
+        stroke_style,
+        head,
+      }),
       document.canvas_size_px,
     )
     .unwrap()
@@ -3314,7 +3765,11 @@ mod tests {
       };
       assert_eq!(preview_payload.start_px, start, "case={case}");
       assert_eq!(preview_payload.end_px, requested, "case={case}");
-      assert_eq!(preview_payload.label.text, DEFAULT_RECTANGLE_LABEL, "case={case}");
+      assert_eq!(
+        preview_payload.label.text.as_deref(),
+        Some(DEFAULT_RECTANGLE_LABEL),
+        "case={case}"
+      );
       let raw = RectPx::from_points(preview_payload.start_px, preview_payload.end_px);
       assert!(raw.width() < minimum && raw.height() < minimum, "case={case}");
       preview.bounds_px.validate().unwrap();
@@ -3413,9 +3868,10 @@ mod tests {
 
       let mut actions = Vec::new();
       controller.finish_pointer_interaction(&document, &mut actions);
-      let [EditorAction::Command(batch)] = actions.as_slice() else {
-        panic!("expected one added arrow for {case}, got {actions:?}");
+      let [EditorAction::Command(batch), EditorAction::Toast(message)] = actions.as_slice() else {
+        panic!("expected an added arrow and short-label toast for {case}, got {actions:?}");
       };
+      assert_eq!(message, ARROW_LABEL_TOO_SHORT_TOAST);
       let [DocumentCommand::AddElement { element }] = batch.commands() else {
         panic!("expected AddElement for {case}");
       };
@@ -3589,12 +4045,12 @@ mod tests {
     ];
 
     for (endpoint, requested, expected) in cases {
-      assert_point_close(clamped_arrow_endpoint(payload, endpoint, requested), expected);
+      assert_point_close(clamped_arrow_endpoint(payload, endpoint, requested).0, expected);
     }
 
     let mut degenerate = payload.clone();
     degenerate.end_px = degenerate.start_px;
-    let fallback = clamped_arrow_endpoint(&degenerate, ArrowEndpoint::End, degenerate.start_px);
+    let fallback = clamped_arrow_endpoint(&degenerate, ArrowEndpoint::End, degenerate.start_px).0;
     assert!(fallback.is_finite());
     assert_point_close(
       fallback,
@@ -3619,7 +4075,7 @@ mod tests {
         ArrowEndpoint::Start => payload.end_px,
         ArrowEndpoint::End => payload.start_px,
       };
-      let expected_position = clamped_arrow_endpoint(payload, endpoint, requested);
+      let expected_position = clamped_arrow_endpoint(payload, endpoint, requested).0;
       document.elements.push(element);
       let interaction =
         PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current: requested };
@@ -4113,6 +4569,51 @@ mod tests {
     assert_eq!(map_shortcut(Key::Enter, Modifiers::SHIFT, true), None);
   }
 
+  #[test]
+  fn escape_without_text_editing_reaches_the_keyboard_handler() {
+    let document = document();
+    let history = CommandHistory::new();
+    let escape = Event::Key {
+      key: Key::Escape,
+      physical_key: Some(Key::Escape),
+      pressed: true,
+      repeat: false,
+      modifiers: Modifiers::NONE,
+    };
+
+    let mut idle = EditorController::default();
+    assert_eq!(
+      run_editor_frame(
+        &egui::Context::default(),
+        &mut idle,
+        &document,
+        &history,
+        vec![escape.clone()],
+      ),
+      vec![EditorAction::Close]
+    );
+
+    let mut interacting = EditorController {
+      interaction: Some(PointerInteraction::Move {
+        element_id: ElementId::new(),
+        start: PointPx::new(10.0, 10.0),
+        current: PointPx::new(20.0, 20.0),
+      }),
+      ..Default::default()
+    };
+    assert!(
+      run_editor_frame(
+        &egui::Context::default(),
+        &mut interacting,
+        &document,
+        &history,
+        vec![escape],
+      )
+      .is_empty()
+    );
+    assert!(interacting.interaction.is_none());
+  }
+
   fn enter_event(modifiers: Modifiers) -> Event {
     Event::Key {
       key: Key::Enter,
@@ -4316,6 +4817,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: true,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4395,6 +4897,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: true,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4442,7 +4945,7 @@ mod tests {
     };
     assert!(matches!(
       batch.commands(),
-      [DocumentCommand::UpdateRectangleLabel { element_id: updated, text }]
+      [DocumentCommand::UpdateElementLabel { element_id: updated, text: Some(text) }]
         if *updated == element_id && text == "OK"
     ));
   }
@@ -4465,6 +4968,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: false,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4508,6 +5012,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: false,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4547,6 +5052,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: false,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4583,14 +5089,15 @@ mod tests {
       ime: InlineImeState::default(),
       request_focus: false,
       select_all: false,
+      auto_place_rectangle: false,
     };
 
     let geometry = inline_text_geometry(&editing, &document).unwrap();
     let ElementPayload::Rectangle(payload) = &document.element(element_id).unwrap().payload else {
       unreachable!();
     };
-    let draft = rectangle_label_draft(payload, &editing);
-    let layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap();
+    let draft = rectangle_label_draft(payload, &editing, &document, element_id);
+    let layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap().unwrap();
     assert_eq!(geometry.wrap_width_px, layout.text_wrap_width_px);
     assert_eq!(
       geometry.origin_px,
@@ -4600,10 +5107,11 @@ mod tests {
     assert!(layout.text_wrap_width_px > layout.bounds_px.width() - draft.label.padding_px * 2.0);
 
     editing.buffer.clear();
-    let empty_draft = rectangle_label_draft(payload, &editing);
-    let empty_layout = rectangle_label_layout(&empty_draft, document.canvas_size_px).unwrap();
+    let empty_draft = rectangle_label_draft(payload, &editing, &document, element_id);
+    let empty_layout =
+      rectangle_label_layout(&empty_draft, document.canvas_size_px).unwrap().unwrap();
     let empty_geometry = inline_text_geometry(&editing, &document).unwrap();
-    assert_eq!(empty_draft.label.text, EMPTY_RECTANGLE_LABEL_DRAFT);
+    assert_eq!(empty_draft.label.text.as_deref(), Some(EMPTY_LABEL_DRAFT));
     assert_eq!(empty_layout.text_layout.width_px, 1.0);
     assert_eq!(empty_geometry.wrap_width_px, empty_layout.text_wrap_width_px);
   }
@@ -4618,6 +5126,7 @@ mod tests {
       ime: InlineImeState::default(),
       request_focus: true,
       select_all: true,
+      auto_place_rectangle: false,
     };
 
     assert!(inline_text_geometry(&editing, &document).is_none());
@@ -4630,7 +5139,7 @@ mod tests {
     let element_id = element.element_id;
     document.elements.push(element);
     let mut controller = EditorController::default();
-    controller.start_editing_existing(&document, element_id);
+    controller.start_editing_existing(&document, element_id, false, &mut Vec::new());
     let transform = CanvasTransform::fit(
       document.canvas_size_px,
       Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 200.0)),
@@ -4679,6 +5188,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: true,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4715,6 +5225,7 @@ mod tests {
       unreachable!();
     };
     payload.label.anchor_offset_px = 30.0;
+    payload.label_anchor.position = 0.5;
     element.refresh_bounds(document.canvas_size_px).unwrap();
     let element_id = element.element_id;
     let ElementPayload::Rectangle(payload) = &element.payload else {
@@ -4730,6 +5241,7 @@ mod tests {
         ime: InlineImeState::default(),
         request_focus: true,
         select_all: false,
+        auto_place_rectangle: false,
       }),
       ..Default::default()
     };
@@ -4782,8 +5294,8 @@ mod tests {
     let ElementPayload::Rectangle(payload) = &document.element(element_id).unwrap().payload else {
       unreachable!();
     };
-    let draft = rectangle_label_draft(payload, editing);
-    let expected_layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap();
+    let draft = rectangle_label_draft(payload, editing, &document, element_id);
+    let expected_layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap().unwrap();
     let expected_label_rect = transform.document_rect_to_egui(expected_layout.bounds_px);
     let expected_geometry = inline_text_geometry(editing, &document).unwrap();
     let expected_text_position = transform.document_to_egui(expected_geometry.origin_px);
@@ -4830,6 +5342,477 @@ mod tests {
     assert_eq!(text_clip_rects.len(), 1);
     assert!(text_clip_rects[0].min.distance(transform.canvas_rect().min) < 0.1);
     assert!(text_clip_rects[0].max.distance(transform.canvas_rect().max) < 0.1);
+  }
+
+  #[test]
+  fn long_new_arrow_enters_empty_label_editing_and_blank_submit_keeps_only_the_arrow() {
+    let mut document = document();
+    let interaction = PointerInteraction::Draw {
+      tool: EditorTool::Arrow,
+      start: PointPx::new(40.0, 100.0),
+      current: PointPx::new(360.0, 100.0),
+      stroke_points: Vec::new(),
+    };
+    let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
+    let mut actions = Vec::new();
+
+    controller.finish_pointer_interaction(&document, &mut actions);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one arrow add, got {actions:?}");
+    };
+    let [DocumentCommand::AddElement { element }] = batch.commands() else {
+      panic!("expected AddElement");
+    };
+    let element_id = element.element_id;
+    assert!(matches!(
+      controller.text_editing.as_ref(),
+      Some(TextEditing { target: TextTarget::ArrowLabel { element_id: editing_id }, buffer, .. })
+        if *editing_id == element_id && buffer.is_empty()
+    ));
+
+    batch.clone().apply(&mut document).unwrap();
+    let mut commit_actions = Vec::new();
+    controller.commit_text(&document, &mut commit_actions);
+    assert!(commit_actions.is_empty());
+    let ElementPayload::Arrow(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text, None);
+  }
+
+  #[test]
+  fn pending_arrow_label_commit_makes_a_clean_document_dirty_before_quit_decision() {
+    let mut document = document();
+    let mut element = arrow(&document, 0, PointPx::new(30.0, 100.0), PointPx::new(370.0, 100.0));
+    let element_id = element.element_id;
+    let ElementPayload::Arrow(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.label.text = Some("原内容".to_owned());
+    element.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(element);
+    document.validate().unwrap();
+    let baseline = document.dirty_baseline();
+    let revision = document.revision;
+    let mut history = CommandHistory::new();
+    let mut controller = EditorController::new(EditorTool::Select);
+    let mut edit_actions = Vec::new();
+    controller.start_editing_existing(&document, element_id, false, &mut edit_actions);
+    assert!(edit_actions.is_empty());
+    controller.text_editing.as_mut().unwrap().buffer = "退出前提交".to_owned();
+
+    let actions = controller.commit_pending_text(&document);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one pending label update, got {actions:?}");
+    };
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    assert!(controller.text_editing.is_none());
+    assert_eq!(document.revision, revision + 1);
+    assert!(document.is_dirty_against(baseline));
+    let ElementPayload::Arrow(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text.as_deref(), Some("退出前提交"));
+  }
+
+  #[test]
+  fn arrow_label_click_edit_clear_and_escape_preserve_the_expected_content() {
+    let mut document = document();
+    let mut element = arrow(&document, 0, PointPx::new(30.0, 100.0), PointPx::new(370.0, 100.0));
+    let element_id = element.element_id;
+    let ElementPayload::Arrow(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.label.text = Some("原内容".to_owned());
+    element.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(element);
+    document.validate().unwrap();
+    let label_center = arrow_label_layout(
+      match &document.element(element_id).unwrap().payload {
+        ElementPayload::Arrow(payload) => payload,
+        _ => unreachable!(),
+      },
+      document.canvas_size_px,
+    )
+    .unwrap()
+    .unwrap()
+    .bounds_px
+    .center();
+    assert_eq!(hit_test_visible_element_label(&document, label_center), Some(element_id));
+
+    let mut controller = EditorController::new(EditorTool::Select);
+    let context = egui::Context::default();
+    let history = CommandHistory::new();
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+    let pointer = transform.document_to_egui(label_center);
+    assert!(
+      run_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(pointer)],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerButton {
+          pos: pointer,
+          button: egui::PointerButton::Primary,
+          pressed: true,
+          modifiers: Modifiers::NONE,
+        }],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerButton {
+          pos: pointer,
+          button: egui::PointerButton::Primary,
+          pressed: false,
+          modifiers: Modifiers::NONE,
+        }],
+      )
+      .is_empty()
+    );
+    assert!(matches!(
+      controller.text_editing.as_ref().map(|editing| &editing.target),
+      Some(TextTarget::ArrowLabel { element_id: editing_id }) if *editing_id == element_id
+    ));
+    controller.text_editing.as_mut().unwrap().buffer = "临时修改".to_owned();
+    let escape_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::Key {
+        key: Key::Escape,
+        physical_key: Some(Key::Escape),
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+      }],
+    );
+    assert!(escape_actions.is_empty());
+    assert!(controller.text_editing.is_none());
+
+    let mut actions = Vec::new();
+    controller.start_editing_existing(&document, element_id, false, &mut actions);
+    controller.text_editing.as_mut().unwrap().buffer = " \n\t ".to_owned();
+    controller.commit_text(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one label clear, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::UpdateElementLabel { element_id: updated, text: None }]
+        if *updated == element_id
+    ));
+    batch.clone().apply(&mut document).unwrap();
+    let ElementPayload::Arrow(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text, None);
+  }
+
+  #[test]
+  fn short_hidden_arrow_double_click_request_emits_one_toast() {
+    let mut document = document();
+    let element = arrow(&document, 0, PointPx::new(100.0, 100.0), PointPx::new(130.0, 100.0));
+    let element_id = element.element_id;
+    document.elements.push(element);
+    let mut controller = EditorController::new(EditorTool::Select);
+    let mut actions = Vec::new();
+
+    controller.start_editing_existing(&document, element_id, true, &mut actions);
+
+    assert_eq!(actions, vec![EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned())]);
+    assert!(controller.text_editing.is_none());
+  }
+
+  #[test]
+  fn visible_arrow_endpoint_and_style_constraints_emit_one_toast_without_invalid_commands() {
+    let mut document = document();
+    let mut element = arrow(&document, 0, PointPx::new(40.0, 100.0), PointPx::new(190.0, 100.0));
+    let element_id = element.element_id;
+    let ElementPayload::Arrow(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.label.text = Some("标签".to_owned());
+    element.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(element);
+    document.validate().unwrap();
+
+    let mut controller = EditorController {
+      selected_element_id: Some(element_id),
+      interaction: Some(PointerInteraction::UpdateArrowEndpoint {
+        element_id,
+        endpoint: ArrowEndpoint::End,
+        current: PointPx::new(50.0, 100.0),
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+    let [EditorAction::Command(batch), EditorAction::Toast(message)] = actions.as_slice() else {
+      panic!("expected a clamped endpoint and one toast, got {actions:?}");
+    };
+    assert_eq!(message, ARROW_LABEL_TOO_SHORT_TOAST);
+    let before_revision = document.revision;
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    assert_eq!(document.revision, before_revision + 1);
+    let ElementPayload::Arrow(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert!(
+      (payload.start_px.distance_to(payload.end_px)
+        - arrow_minimum_length_for_label(payload).unwrap())
+      .abs()
+        < 0.001
+    );
+    assert!(history.undo(&mut document).unwrap());
+
+    let before = document.clone();
+    for change in [
+      StyleChange { font_size_px: Some(64.0), ..StyleChange::default() },
+      StyleChange { width_px: Some(12.0), ..StyleChange::default() },
+    ] {
+      let mut style_actions = Vec::new();
+      controller.apply_style_change(&document, change, &mut style_actions);
+      assert_eq!(style_actions, vec![EditorAction::Toast(ARROW_LABEL_TOO_SHORT_TOAST.to_owned())]);
+    }
+    assert_eq!(document, before);
+  }
+
+  #[test]
+  fn arrow_style_preflight_uses_a_label_commit_queued_in_the_same_frame() {
+    let mut document = document();
+    let element = arrow(&document, 0, PointPx::new(40.0, 100.0), PointPx::new(190.0, 100.0));
+    let element_id = element.element_id;
+    document.elements.push(element);
+    let mut controller =
+      EditorController { selected_element_id: Some(element_id), ..Default::default() };
+
+    let mut reveal_actions = Vec::new();
+    controller.start_editing_existing(&document, element_id, true, &mut reveal_actions);
+    controller.text_editing.as_mut().unwrap().buffer = "新标签".to_owned();
+    controller.commit_text(&document, &mut reveal_actions);
+    controller.apply_style_change(
+      &document,
+      StyleChange { font_size_px: Some(64.0), ..StyleChange::default() },
+      &mut reveal_actions,
+    );
+    assert!(matches!(
+      reveal_actions.as_slice(),
+      [
+        EditorAction::Command(label_batch),
+        EditorAction::Toast(message),
+      ] if matches!(
+        label_batch.commands(),
+        [DocumentCommand::UpdateElementLabel { element_id: updated, text: Some(text) }]
+          if *updated == element_id && text == "新标签"
+      ) && message == ARROW_LABEL_TOO_SHORT_TOAST
+    ));
+    let EditorAction::Command(label_batch) = &reveal_actions[0] else {
+      unreachable!();
+    };
+    label_batch.clone().apply(&mut document).unwrap();
+
+    let mut clear_actions = Vec::new();
+    controller.start_editing_existing(&document, element_id, false, &mut clear_actions);
+    controller.text_editing.as_mut().unwrap().buffer = " \n\t ".to_owned();
+    controller.commit_text(&document, &mut clear_actions);
+    controller.apply_style_change(
+      &document,
+      StyleChange { font_size_px: Some(64.0), ..StyleChange::default() },
+      &mut clear_actions,
+    );
+    let [EditorAction::Command(clear_batch), EditorAction::Command(style_batch)] =
+      clear_actions.as_slice()
+    else {
+      panic!("expected clear then style commands, got {clear_actions:?}");
+    };
+    clear_batch.clone().apply(&mut document).unwrap();
+    style_batch.clone().apply(&mut document).unwrap();
+    let ElementPayload::Arrow(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text, None);
+    assert_eq!(payload.label.text_style.font_size_px, 64.0);
+  }
+
+  #[test]
+  fn rectangle_collision_inputs_ignore_non_rectangles_and_label_drag_is_one_command() {
+    let mut document = document();
+    let rectangle = rectangle(&document, 0, PointPx::new(120.0, 80.0), PointPx::new(240.0, 160.0));
+    let rectangle_id = rectangle.element_id;
+    document.elements.push(rectangle);
+    document.elements.push(arrow(
+      &document,
+      1,
+      PointPx::new(20.0, 20.0),
+      PointPx::new(380.0, 180.0),
+    ));
+    document.elements.push(text_element(&document, PointPx::new(40.0, 40.0), "不参与碰撞", 160.0));
+    assert!(rectangle_label_obstacles(&document, Some(rectangle_id)).is_empty());
+
+    let ElementPayload::Rectangle(payload) = &document.element(rectangle_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    let current_layout = rectangle_label_layout(payload, document.canvas_size_px).unwrap().unwrap();
+    let desired_center = PointPx::new(payload.end_px.x_px + 30.0, payload.end_px.y_px - 20.0);
+    let expected =
+      snap_rectangle_label_layout(payload, document.canvas_size_px, desired_center).unwrap();
+    let mut controller = EditorController {
+      interaction: Some(PointerInteraction::DragRectangleLabel {
+        element_id: rectangle_id,
+        current: desired_center,
+        grab_offset_px: PointPx::ZERO,
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one anchor command, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor }]
+        if *element_id == rectangle_id && *anchor == expected.anchor
+    ));
+    assert_ne!(expected.bounds_px, current_layout.bounds_px);
+    let before_revision = document.revision;
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    assert_eq!(document.revision, before_revision + 1);
+    assert!(history.undo(&mut document).unwrap());
+  }
+
+  #[test]
+  fn hidden_rectangle_label_reappears_with_an_atomic_collision_aware_anchor() {
+    let mut document = document();
+    let mut current =
+      rectangle(&document, 0, PointPx::new(150.0, 90.0), PointPx::new(270.0, 170.0));
+    let current_id = current.element_id;
+    let ElementPayload::Rectangle(payload) = &mut current.payload else {
+      unreachable!();
+    };
+    payload.label.text = None;
+    payload.label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Inside, 0.8);
+    current.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(current);
+    let blocker = rectangle(&document, 1, PointPx::new(140.0, 20.0), PointPx::new(310.0, 78.0));
+    let blocker_before = blocker.clone();
+    document.elements.push(blocker);
+    document.validate().unwrap();
+
+    let mut controller = EditorController::new(EditorTool::Select);
+    let mut actions = Vec::new();
+    controller.start_editing_existing(&document, current_id, true, &mut actions);
+    let editing = controller.text_editing.as_mut().unwrap();
+    assert!(editing.auto_place_rectangle);
+    editing.buffer = "重新展示".to_owned();
+    controller.commit_text(&document, &mut actions);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one atomic label batch, got {actions:?}");
+    };
+    let [
+      DocumentCommand::UpdateElementLabel { element_id: text_id, text: Some(text) },
+      DocumentCommand::UpdateRectangleLabelAnchor { element_id: anchor_id, anchor },
+    ] = batch.commands()
+    else {
+      panic!("expected text and anchor commands, got {:?}", batch.commands());
+    };
+    assert_eq!(*text_id, current_id);
+    assert_eq!(*anchor_id, current_id);
+    assert_eq!(text, "重新展示");
+    assert_ne!(anchor.edge, RectangleLabelEdge::Top);
+
+    let before_revision = document.revision;
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    assert_eq!(document.revision, before_revision + 1);
+    assert_eq!(document.elements[1], blocker_before);
+    let ElementPayload::Rectangle(payload) = &document.element(current_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text.as_deref(), Some("重新展示"));
+    assert_eq!(payload.label_anchor, *anchor);
+    assert!(history.undo(&mut document).unwrap());
+    let ElementPayload::Rectangle(payload) = &document.element(current_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label.text, None);
+    assert_eq!(
+      payload.label_anchor,
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Inside, 0.8,)
+    );
+  }
+
+  #[test]
+  fn rectangle_bodies_overlap_without_reflowing_any_existing_label() {
+    let mut document = document();
+    let first = rectangle(&document, 0, PointPx::new(30.0, 80.0), PointPx::new(130.0, 160.0));
+    let first_id = first.element_id;
+    let first_anchor = match &first.payload {
+      ElementPayload::Rectangle(payload) => payload.label_anchor,
+      _ => unreachable!(),
+    };
+    document.elements.push(first);
+    let second = rectangle(&document, 1, PointPx::new(190.0, 80.0), PointPx::new(330.0, 165.0));
+    let second_before = second.clone();
+    document.elements.push(second);
+    document.validate().unwrap();
+
+    DocumentCommand::MoveElement { element_id: first_id, delta_px: PointPx::new(170.0, 0.0) }
+      .apply(&mut document)
+      .unwrap();
+    let ElementPayload::Rectangle(first) = &document.element(first_id).unwrap().payload else {
+      unreachable!();
+    };
+    let ElementPayload::Rectangle(second) = &second_before.payload else {
+      unreachable!();
+    };
+    assert!(
+      RectPx::from_points(first.start_px, first.end_px)
+        .intersects(RectPx::from_points(second.start_px, second.end_px))
+    );
+    assert_eq!(first.label_anchor, first_anchor);
+    assert_eq!(document.elements[1], second_before);
+
+    DocumentCommand::ResizeRectangle {
+      element_id: first_id,
+      start_px: PointPx::new(175.0, 70.0),
+      end_px: PointPx::new(350.0, 175.0),
+    }
+    .apply(&mut document)
+    .unwrap();
+    let ElementPayload::Rectangle(first) = &document.element(first_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(first.label_anchor, first_anchor);
+    assert_eq!(document.elements[1], second_before);
   }
 
   #[test]

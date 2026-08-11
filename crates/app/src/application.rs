@@ -812,6 +812,7 @@ impl RsBoardApp {
     if self.phase != Phase::Editing {
       return;
     }
+    self.commit_pending_editor_text(context);
     let started_at = Instant::now();
     let Some(session) = self.session.as_mut() else {
       return;
@@ -1898,6 +1899,7 @@ impl RsBoardApp {
             self.persistent_error = Some(error.to_string());
           }
         }
+        EditorAction::Toast(message) => self.set_toast(message),
         EditorAction::Undo => {
           if let Some(session) = self.session.as_mut()
             && let Err(error) = session.history.undo(&mut session.document)
@@ -1955,10 +1957,19 @@ impl RsBoardApp {
     }
   }
 
+  fn commit_pending_editor_text(&mut self, context: &egui::Context) {
+    let actions = self
+      .session
+      .as_mut()
+      .map_or_else(Vec::new, |session| session.editor.commit_pending_text(&session.document));
+    self.handle_editor_actions(actions, context);
+  }
+
   fn close_editor(&mut self, context: &egui::Context) {
     if matches!(self.phase, Phase::ShowingSaveSuccess { .. }) {
       return;
     }
+    self.commit_pending_editor_text(context);
     let Some(session) = self.session.as_ref() else {
       return;
     };
@@ -2182,12 +2193,13 @@ impl RsBoardApp {
         self.quit_after_persist = true;
       }
       Phase::Editing | Phase::ConfirmingDiscard => {
+        self.phase = Phase::Editing;
+        self.commit_pending_editor_text(context);
         let Some(session) = self.session.as_ref() else {
           return;
         };
         match session.origin {
           SessionOrigin::NewCapture | SessionOrigin::LatestDraft { .. } => {
-            self.phase = Phase::Editing;
             self.start_stash(context);
             if self.phase == Phase::Idle {
               self.allow_close = true;
@@ -2195,7 +2207,6 @@ impl RsBoardApp {
             }
           }
           SessionOrigin::ExistingDocument if session.is_dirty() => {
-            self.phase = Phase::Editing;
             self.exit_dialog = true;
           }
           SessionOrigin::ExistingDocument => {

@@ -12,12 +12,15 @@ pub use document::{
   MAX_ELEMENTS, MAX_STROKE_POINTS, Revision,
 };
 pub use element::{
-  ArrowHead, ArrowPayload, ColorRgba, DerivedLabelPlacement, Element, ElementError, ElementId,
-  ElementKind, ElementPayload, FONT_FAMILY, LabelPlacementPreference, LineCap, LineJoin,
-  PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, RectangleLabel,
-  RectangleLabelLayout, RectanglePayload, SequenceMarkerPayload, StrokePayload, StrokePoint,
-  StrokeStyle, StyleChange, TextAlign, TextLayout, TextPayload, TextStyle, layout_text,
-  rectangle_label_layout,
+  ArrowHead, ArrowLabelLayout, ArrowPayload, ColorRgba, Element, ElementError, ElementId,
+  ElementKind, ElementLabel, ElementPayload, FONT_FAMILY, LineCap, LineJoin,
+  PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, RectangleLabelAnchor,
+  RectangleLabelEdge, RectangleLabelLayout, RectangleLabelSide, RectanglePayload,
+  SequenceMarkerPayload, StrokePayload, StrokePoint, StrokeStyle, StyleChange, TextAlign,
+  TextLayout, TextPayload, TextStyle, arrow_label_available_width, arrow_label_layout,
+  arrow_minimum_length_for_label, choose_rectangle_label_anchor, layout_text,
+  rectangle_label_layout, rectangle_label_layout_at_anchor, snap_rectangle_label_layout,
+  wrap_arrow_label_text_lines, wrap_text_lines,
 };
 pub use format::{
   FormatError, ResourceNameError, decode_document, decode_snapshot, encode_document,
