@@ -23,8 +23,8 @@ pub use format::{
   encode_snapshot, validate_managed_resource_names, validate_resource_name,
 };
 pub use geometry::{
-  GeometryError, MAX_CANVAS_DIMENSION_PX, PointPx, RectPx, SizePx, StrokeProcessingOptions,
-  minimum_geometry_extent, process_stroke_points,
+  GeometryError, MAX_CANVAS_DIMENSION_PX, PointPx, RectPx, SizePx, minimum_geometry_extent,
+  process_stroke_points,
 };
 pub use history::{
   CommandHistory, HistoryError, HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES,

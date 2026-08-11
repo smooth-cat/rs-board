@@ -238,11 +238,14 @@ impl StrokePayload {
 
   fn validate(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
-    if self.points.len() < 2 {
+    if self.points.is_empty() {
       return Err(ElementError::Geometry(GeometryError::TooFewPoints));
     }
     for point in &self.points {
       point.validate()?;
+    }
+    if self.points.len() == 1 {
+      return Ok(());
     }
     let path_length: f32 =
       self.points.windows(2).map(|points| points[0].point().distance_to(points[1].point())).sum();
@@ -1039,6 +1042,20 @@ pub enum ElementError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_single_point_stroke_is_a_valid_dot() {
+    let canvas = SizePx::new(200, 120);
+    let point = PointPx::new(80.0, 60.0);
+    let payload = StrokePayload::from_raw_points(&[point], StrokeStyle::default()).unwrap();
+    assert_eq!(payload.points.iter().map(StrokePoint::point).collect::<Vec<_>>(), vec![point]);
+
+    let element =
+      Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), canvas).unwrap();
+    assert_eq!(element.bounds_px.center(), point);
+    assert_eq!(element.bounds_px.width(), 8.0);
+    assert_eq!(element.bounds_px.height(), 8.0);
+  }
 
   fn text_style(color: ColorRgba) -> TextStyle {
     TextStyle::mvp(color, 24.0).unwrap()

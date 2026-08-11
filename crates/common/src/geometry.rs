@@ -184,24 +184,6 @@ impl RectPx {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StrokeProcessingOptions {
-  pub distance_filter_px: f32,
-  pub simplify_tolerance_px: f32,
-}
-
-impl StrokeProcessingOptions {
-  pub fn for_line_width(width_px: f32) -> Result<Self, GeometryError> {
-    if !width_px.is_finite() || width_px <= 0.0 {
-      return Err(GeometryError::InvalidDimension);
-    }
-    Ok(Self {
-      distance_filter_px: (width_px * 0.25).max(1.0),
-      simplify_tolerance_px: (width_px * 0.2).max(0.5),
-    })
-  }
-}
-
 pub fn minimum_geometry_extent(width_px: f32) -> Result<f32, GeometryError> {
   if !width_px.is_finite() || width_px <= 0.0 {
     return Err(GeometryError::InvalidDimension);
@@ -216,90 +198,13 @@ pub fn process_stroke_points(
   if points.iter().any(|point| !point.is_finite()) {
     return Err(GeometryError::NonFiniteCoordinate);
   }
-  if points.len() < 2 {
+  if points.is_empty() {
     return Err(GeometryError::TooFewPoints);
   }
-  let options = StrokeProcessingOptions::for_line_width(width_px)?;
-  let filtered = distance_filter(points, options.distance_filter_px);
-  let simplified = simplify_ramer_douglas_peucker(&filtered, options.simplify_tolerance_px);
-  Ok(smooth_points(&simplified))
-}
-
-fn distance_filter(points: &[PointPx], minimum_distance: f32) -> Vec<PointPx> {
-  let mut filtered = Vec::with_capacity(points.len());
-  filtered.push(points[0]);
-  let mut last_kept = points[0];
-  for point in &points[1..points.len() - 1] {
-    if last_kept.distance_to(*point) >= minimum_distance {
-      filtered.push(*point);
-      last_kept = *point;
-    }
+  if !width_px.is_finite() || width_px <= 0.0 {
+    return Err(GeometryError::InvalidDimension);
   }
-  let last = points[points.len() - 1];
-  if filtered.last().copied() != Some(last) {
-    filtered.push(last);
-  }
-  filtered
-}
-
-fn simplify_ramer_douglas_peucker(points: &[PointPx], tolerance: f32) -> Vec<PointPx> {
-  if points.len() <= 2 {
-    return points.to_vec();
-  }
-
-  let mut keep = vec![false; points.len()];
-  keep[0] = true;
-  keep[points.len() - 1] = true;
-  let mut ranges = vec![(0usize, points.len() - 1)];
-  while let Some((start, end)) = ranges.pop() {
-    if end <= start + 1 {
-      continue;
-    }
-    let mut maximum_distance = -1.0f32;
-    let mut maximum_index = start + 1;
-    for index in start + 1..end {
-      let distance = perpendicular_distance(points[index], points[start], points[end]);
-      if distance > maximum_distance {
-        maximum_distance = distance;
-        maximum_index = index;
-      }
-    }
-    if maximum_distance > tolerance {
-      keep[maximum_index] = true;
-      ranges.push((maximum_index, end));
-      ranges.push((start, maximum_index));
-    }
-  }
-
-  points.iter().zip(keep).filter_map(|(point, keep)| keep.then_some(*point)).collect()
-}
-
-fn perpendicular_distance(point: PointPx, start: PointPx, end: PointPx) -> f32 {
-  let length = start.distance_to(end);
-  if length <= f32::EPSILON {
-    return point.distance_to(start);
-  }
-  let numerator = ((end.y_px - start.y_px) * point.x_px - (end.x_px - start.x_px) * point.y_px
-    + end.x_px * start.y_px
-    - end.y_px * start.x_px)
-    .abs();
-  numerator / length
-}
-
-fn smooth_points(points: &[PointPx]) -> Vec<PointPx> {
-  if points.len() <= 2 {
-    return points.to_vec();
-  }
-  let mut smoothed = Vec::with_capacity(points.len());
-  smoothed.push(points[0]);
-  for window in points.windows(3) {
-    smoothed.push(PointPx::new(
-      (window[0].x_px + 2.0 * window[1].x_px + window[2].x_px) / 4.0,
-      (window[0].y_px + 2.0 * window[1].y_px + window[2].y_px) / 4.0,
-    ));
-  }
-  smoothed.push(points[points.len() - 1]);
-  smoothed
+  Ok(points.to_vec())
 }
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -316,7 +221,7 @@ pub enum GeometryError {
   InvalidDimension,
   #[error("geometry is larger than the canvas")]
   GeometryTooLargeForCanvas,
-  #[error("at least two points are required")]
+  #[error("at least one point is required")]
   TooFewPoints,
 }
 
@@ -334,18 +239,20 @@ mod tests {
   }
 
   #[test]
-  fn stroke_processing_is_deterministic_and_keeps_endpoints() {
+  fn stroke_processing_preserves_every_input_point() {
     let points = vec![
       PointPx::new(0.0, 0.0),
       PointPx::new(0.1, 0.1),
       PointPx::new(4.0, 2.0),
       PointPx::new(8.0, 0.0),
     ];
-    let first = process_stroke_points(&points, 4.0).unwrap();
-    let second = process_stroke_points(&points, 4.0).unwrap();
-    assert_eq!(first, second);
-    assert_eq!(first.first(), points.first());
-    assert_eq!(first.last(), points.last());
+    assert_eq!(process_stroke_points(&points, 4.0).unwrap(), points);
+  }
+
+  #[test]
+  fn stroke_processing_accepts_a_single_point() {
+    let points = [PointPx::new(4.0, 2.0)];
+    assert_eq!(process_stroke_points(&points, 4.0).unwrap(), points);
   }
 
   #[test]

@@ -541,7 +541,18 @@ impl EditorController {
           });
         }
         EditorTool::Sequence => self.insert_sequence(document, position, actions),
-        EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Stroke => {}
+        EditorTool::Stroke => {
+          if let Some(element) = self.make_stroke(document, &[position]) {
+            let element_id = element.element_id;
+            self.push_pointer_command(
+              document,
+              actions,
+              DocumentCommand::AddElement { element },
+              element_id,
+            );
+          }
+        }
+        EditorTool::Rectangle | EditorTool::Arrow => {}
       }
     }
 
@@ -574,9 +585,7 @@ impl EditorController {
       match &mut self.interaction {
         Some(PointerInteraction::Draw { current, points, tool, .. }) => {
           *current = position;
-          if *tool == EditorTool::Stroke
-            && points.last().is_none_or(|last| last.distance_to(position) >= 0.75)
-          {
+          if *tool == EditorTool::Stroke && points.last().copied() != Some(position) {
             points.push(position);
           }
         }
@@ -1476,10 +1485,15 @@ fn hit_test_element(
     return false;
   }
   match &element.payload {
-    ElementPayload::Stroke(payload) => payload.points.windows(2).any(|points| {
-      distance_to_segment(point, points[0].point(), points[1].point())
-        <= payload.stroke_style.width_px / 2.0 + tolerance
-    }),
+    ElementPayload::Stroke(payload) => match payload.points.as_slice() {
+      [stroke_point] => {
+        point.distance_to(stroke_point.point()) <= payload.stroke_style.width_px / 2.0 + tolerance
+      }
+      points => points.windows(2).any(|points| {
+        distance_to_segment(point, points[0].point(), points[1].point())
+          <= payload.stroke_style.width_px / 2.0 + tolerance
+      }),
+    },
     ElementPayload::Arrow(payload) => {
       distance_to_segment(point, payload.start_px, payload.end_px)
         <= payload.stroke_style.width_px / 2.0 + tolerance
@@ -2331,6 +2345,115 @@ mod tests {
         );
       }
     }
+  }
+
+  #[test]
+  fn stroke_release_preserves_the_preview_points_and_opacity() {
+    let document = document();
+    let points = vec![
+      PointPx::new(40.0, 40.0),
+      PointPx::new(40.2, 40.1),
+      PointPx::new(52.0, 47.0),
+      PointPx::new(61.0, 43.0),
+    ];
+    let interaction = PointerInteraction::Draw {
+      tool: EditorTool::Stroke,
+      start: points[0],
+      current: *points.last().unwrap(),
+      points: points.clone(),
+    };
+    let mut controller = EditorController {
+      tool: EditorTool::Stroke,
+      interaction: Some(interaction),
+      ..Default::default()
+    };
+
+    let preview = paint_canvas_output(&controller, &document);
+    let preview_strokes = preview
+      .shapes
+      .iter()
+      .filter_map(|shape| match &shape.shape {
+        egui::Shape::LineSegment { stroke, .. } => Some(stroke),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(preview_strokes.len(), points.len() - 1);
+    assert!(preview_strokes.iter().all(|stroke| stroke.color.a() == u8::MAX));
+    preview.drop_without_applying_deltas();
+
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one stroke command, got {actions:?}");
+    };
+    let [DocumentCommand::AddElement { element }] = batch.commands() else {
+      panic!("expected AddElement");
+    };
+    let ElementPayload::Stroke(payload) = &element.payload else {
+      panic!("expected a stroke element");
+    };
+    assert_eq!(payload.points.iter().map(|point| point.point()).collect::<Vec<_>>(), points);
+  }
+
+  #[test]
+  fn clicking_with_the_stroke_tool_adds_a_dot() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let mut controller = EditorController::default();
+    controller.set_active_tool(EditorTool::Stroke);
+    let pointer = Pos2::new(100.0, 100.0);
+
+    let warmup = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerMoved(pointer)],
+    );
+    assert!(warmup.is_empty());
+
+    let pressed = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerButton {
+        pos: pointer,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::default(),
+      }],
+    );
+    assert!(pressed.is_empty());
+
+    let actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerButton {
+        pos: pointer,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::default(),
+      }],
+    );
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one dot command, got {actions:?}");
+    };
+    let [DocumentCommand::AddElement { element }] = batch.commands() else {
+      panic!("expected AddElement");
+    };
+    let ElementPayload::Stroke(payload) = &element.payload else {
+      panic!("expected a stroke element");
+    };
+    assert_eq!(payload.points.len(), 1);
+    let point = payload.points[0].point();
+    let element_id = element.element_id;
+    let mut changed = document.clone();
+    batch.clone().apply(&mut changed).unwrap();
+    assert_eq!(hit_test_document(&changed, point, 0.0), Some(element_id));
   }
 
   #[test]

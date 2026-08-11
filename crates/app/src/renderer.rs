@@ -82,14 +82,25 @@ pub(crate) fn paint_element(
     ElementPayload::Stroke(payload) => {
       let color = egui_color(payload.stroke_style.color_rgba, opacity);
       let stroke = Stroke::new(payload.stroke_style.width_px * transform.scale(), color);
-      for points in payload.points.windows(2) {
-        painter.line_segment(
-          [
-            transform.document_to_egui(points[0].point()),
-            transform.document_to_egui(points[1].point()),
-          ],
-          stroke,
-        );
+      match payload.points.as_slice() {
+        [point] => {
+          painter.circle_filled(
+            transform.document_to_egui(point.point()),
+            stroke.width / 2.0,
+            color,
+          );
+        }
+        points => {
+          for points in points.windows(2) {
+            painter.line_segment(
+              [
+                transform.document_to_egui(points[0].point()),
+                transform.document_to_egui(points[1].point()),
+              ],
+              stroke,
+            );
+          }
+        }
       }
     }
     ElementPayload::Arrow(payload) => paint_arrow(painter, transform, payload, opacity),
@@ -145,7 +156,12 @@ pub(crate) fn paint_raw_polyline(
   color: ColorRgba,
   width_px: f32,
 ) {
-  let stroke = Stroke::new(width_px * transform.scale(), egui_color(color, 0.72));
+  let color = egui_color(color, 1.0);
+  let stroke = Stroke::new(width_px * transform.scale(), color);
+  if let [point] = points {
+    painter.circle_filled(transform.document_to_egui(*point), stroke.width / 2.0, color);
+    return;
+  }
   for points in points.windows(2) {
     painter.line_segment(
       [transform.document_to_egui(points[0]), transform.document_to_egui(points[1])],
@@ -300,17 +316,26 @@ pub(crate) fn layout_egui_text(
 
 fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx) {
   match &element.payload {
-    ElementPayload::Stroke(payload) => {
-      for points in payload.points.windows(2) {
-        draw_thick_segment(
-          image,
-          points[0].point(),
-          points[1].point(),
-          payload.stroke_style.width_px,
-          rgba(payload.stroke_style.color_rgba),
-        );
+    ElementPayload::Stroke(payload) => match payload.points.as_slice() {
+      [point] => draw_thick_segment(
+        image,
+        point.point(),
+        point.point(),
+        payload.stroke_style.width_px,
+        rgba(payload.stroke_style.color_rgba),
+      ),
+      points => {
+        for points in points.windows(2) {
+          draw_thick_segment(
+            image,
+            points[0].point(),
+            points[1].point(),
+            payload.stroke_style.width_px,
+            rgba(payload.stroke_style.color_rgba),
+          );
+        }
       }
-    }
+    },
     ElementPayload::Arrow(payload) => {
       let color = rgba(payload.stroke_style.color_rgba);
       if let Some(geometry) = arrow_geometry(payload) {
@@ -725,7 +750,7 @@ mod tests {
   use common::{
     ArrowHead, ArrowPayload, CapturedDisplay, DocumentId, ElementId, GlobalBoundsPx,
     LabelPlacementPreference, PRESET_STROKE_WIDTHS_PX, RectangleLabel, RectanglePayload,
-    SequenceMarkerPayload, StrokeStyle, TextPayload, TextStyle,
+    SequenceMarkerPayload, StrokePayload, StrokeStyle, TextPayload, TextStyle,
   };
   use uuid::Uuid;
 
@@ -866,6 +891,22 @@ mod tests {
     assert_eq!(rendered.dimensions(), (100, 80));
     assert!(rendered.get_pixel(20, 45)[0] > 200);
     assert!(rendered.get_pixel(45, 45)[0] < 20);
+  }
+
+  #[test]
+  fn raster_renderer_draws_a_single_point_stroke_as_a_dot() {
+    let mut document = document();
+    let point = PointPx::new(50.0, 40.0);
+    let payload = StrokePayload::from_raw_points(&[point], StrokeStyle::default()).unwrap();
+    document.elements.push(
+      Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), document.canvas_size_px)
+        .unwrap(),
+    );
+
+    let background = RgbaImage::from_pixel(100, 80, Rgba([0, 0, 0, 255]));
+    let rendered = render_document_to_image(&document, &background);
+    assert_eq!(rendered.get_pixel(50, 40), &Rgba([255, 59, 48, 255]));
+    assert_eq!(rendered.get_pixel(56, 40), &Rgba([0, 0, 0, 255]));
   }
 
   #[test]
