@@ -202,7 +202,7 @@ pub enum DisplayRefreshOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayWindowReadiness {
   Ready,
-  Pending,
+  Pending(&'static str),
   Failed,
 }
 
@@ -573,7 +573,7 @@ mod macos {
     NSScreenSaverWindowLevel, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
     NSWindowLevel, NSWindowOrderingMode, NSWindowSharingType, NSWindowStyleMask,
   };
-  use objc2_foundation::{NSNumber, NSString};
+  use objc2_foundation::{NSNumber, NSRect, NSString};
   use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
 
   use super::{
@@ -698,7 +698,7 @@ mod macos {
     acquire_overlay_window(mtm, display.display_id, overlay_window);
     let Some(overlay_window) = overlay_window.as_mut() else {
       conceal_frozen_panel(frozen_panel);
-      return OverlayWindowReadiness::Pending;
+      return OverlayWindowReadiness::Pending("overlay_window_unavailable");
     };
     let window = &overlay_window.window;
     if overlay_window.ready
@@ -712,15 +712,12 @@ mod macos {
     if window.styleMask() != NSWindowStyleMask::Borderless {
       window.setStyleMask(NSWindowStyleMask::Borderless);
     }
-    // AppKit can clear the responder when the style mask changes; winit's view owns key and IME input.
+    // Winit's content view owns key and IME input. Keep it retained while AppKit finishes moving
+    // the window to the target display; a cross-DPI frame change can clear the first responder.
     let Some(content_view) = window.contentView() else {
       prepare_window_pair_retry(window, frozen_panel);
-      return OverlayWindowReadiness::Pending;
+      return OverlayWindowReadiness::Pending("content_view_unavailable");
     };
-    if !window.makeFirstResponder(Some(&content_view)) {
-      prepare_window_pair_retry(window, frozen_panel);
-      return OverlayWindowReadiness::Pending;
-    }
     window.setFrame_display(screen.frame(), false);
     window.setOpaque(false);
     window.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -743,25 +740,40 @@ mod macos {
     application.activateIgnoringOtherApps(true);
     window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
-    if !application.isActive() || !window.isVisible() || !window.isKeyWindow() {
+    if !application.isActive() {
       prepare_window_pair_retry(window, frozen_panel);
-      return OverlayWindowReadiness::Pending;
+      return OverlayWindowReadiness::Pending("application_inactive");
+    }
+    if !window.isVisible() {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending("overlay_window_invisible");
+    }
+    if !window.isKeyWindow() {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending("overlay_window_not_key");
     }
 
-    attach_frozen_panel_below(window, frozen_panel);
+    attach_frozen_panel_below(window, frozen_panel, screen.frame());
     frozen_panel.present();
     window.makeKeyAndOrderFront(None);
     window.orderFrontRegardless();
+    if !window.makeFirstResponder(Some(&content_view)) {
+      prepare_window_pair_retry(window, frozen_panel);
+      return OverlayWindowReadiness::Pending("first_responder_rejected");
+    }
 
-    let ready = window_pair_is_structurally_ready(&application, &screen, window, frozen_panel)
-      && overlay_input_target_is_ready(false, content_view_is_first_responder(window));
-    if ready {
+    let pending_reason = window_pair_pending_reason(&application, &screen, window, frozen_panel)
+      .or_else(|| {
+        (!overlay_input_target_is_ready(false, content_view_is_first_responder(window)))
+          .then_some("content_view_not_first_responder")
+      });
+    if let Some(reason) = pending_reason {
+      prepare_window_pair_retry(window, frozen_panel);
+      OverlayWindowReadiness::Pending(reason)
+    } else {
       window.setIgnoresMouseEvents(false);
       overlay_window.ready = true;
       OverlayWindowReadiness::Ready
-    } else {
-      prepare_window_pair_retry(window, frozen_panel);
-      OverlayWindowReadiness::Pending
     }
   }
 
@@ -802,8 +814,13 @@ mod macos {
     NSNormalWindowLevel
   }
 
-  fn attach_frozen_panel_below(window: &NSWindow, frozen_panel: &FrozenImagePanel) {
+  fn attach_frozen_panel_below(
+    window: &NSWindow,
+    frozen_panel: &FrozenImagePanel,
+    desired_frame: NSRect,
+  ) {
     if frozen_panel_is_child_of(window, frozen_panel) {
+      frozen_panel.panel.setFrame_display(desired_frame, false);
       return;
     }
     detach_frozen_panel(frozen_panel);
@@ -811,6 +828,9 @@ mod macos {
     unsafe {
       window.addChildWindow_ordered(&frozen_panel.panel, NSWindowOrderingMode::Below);
     }
+    // AppKit offsets the panel's detached frame when establishing the child relationship.
+    // Apply the final screen-space frame only after the panel is attached.
+    frozen_panel.panel.setFrame_display(desired_frame, false);
   }
 
   fn detach_frozen_panel(frozen_panel: &FrozenImagePanel) {
@@ -886,16 +906,37 @@ mod macos {
     window: &NSWindow,
     frozen_panel: &FrozenImagePanel,
   ) -> bool {
+    window_pair_pending_reason(application, screen, window, frozen_panel).is_none()
+  }
+
+  fn window_pair_pending_reason(
+    application: &NSApplication,
+    screen: &NSScreen,
+    window: &NSWindow,
+    frozen_panel: &FrozenImagePanel,
+  ) -> Option<&'static str> {
     let screen_frame = screen.frame();
-    application.isActive()
-      && frozen_panel.panel.isVisible()
-      && frozen_panel.panel.level() == frozen_panel_window_level()
-      && frozen_panel.panel.frame() == screen_frame
-      && window.isVisible()
-      && window.isKeyWindow()
-      && window.level() == editor_overlay_window_level()
-      && window.frame() == screen_frame
-      && frozen_panel_is_child_of(window, frozen_panel)
+    if !application.isActive() {
+      Some("application_inactive")
+    } else if !frozen_panel.panel.isVisible() {
+      Some("frozen_panel_invisible")
+    } else if frozen_panel.panel.level() != frozen_panel_window_level() {
+      Some("frozen_panel_wrong_level")
+    } else if frozen_panel.panel.frame() != screen_frame {
+      Some("frozen_panel_wrong_frame")
+    } else if !window.isVisible() {
+      Some("overlay_window_invisible")
+    } else if !window.isKeyWindow() {
+      Some("overlay_window_not_key")
+    } else if window.level() != editor_overlay_window_level() {
+      Some("overlay_window_wrong_level")
+    } else if window.frame() != screen_frame {
+      Some("overlay_window_wrong_frame")
+    } else if !frozen_panel_is_child_of(window, frozen_panel) {
+      Some("frozen_panel_detached")
+    } else {
+      None
+    }
   }
 
   fn acquire_overlay_window(

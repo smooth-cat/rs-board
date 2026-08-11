@@ -3049,10 +3049,11 @@ impl RsBoardApp {
         let viewport_context = ui.ctx().clone();
         match self.capture_surfaces.configure_active_overlay_window() {
           OverlayWindowReadiness::Ready => self.overlay_readiness_started_at = None,
-          OverlayWindowReadiness::Pending => {
+          OverlayWindowReadiness::Pending(reason) => {
             if overlay_readiness_can_retry(&mut self.overlay_readiness_started_at, Instant::now()) {
               request_immediate_viewport_retry(&viewport_context, viewport_id);
             } else {
+              eprintln!("capture overlay readiness timed out: {reason}");
               self.fail_editor_presentation(
                 &viewport_context,
                 "截图编辑窗口激活超时，请重新打开或重新截图",
