@@ -320,7 +320,7 @@ mod tests {
     let decoded = decode_document(&encoded).unwrap();
     assert_eq!(decoded, document);
     let json = String::from_utf8(encoded).unwrap();
-    assert!(json.contains("\"schema_version\": 1"));
+    assert!(json.contains("\"schema_version\": 2"));
     assert!(json.contains("\"document_id\": \"00000000-0000-0000-0000-000000000000\""));
     assert!(!json.contains("history"));
     assert!(!json.contains("selection"));
@@ -347,6 +347,16 @@ mod tests {
     assert_eq!(
       decode_document(bytes),
       Err(FormatError::UnsupportedSchema { found: 999, supported: CURRENT_SCHEMA_VERSION })
+    );
+  }
+
+  #[test]
+  fn schema_one_documents_are_rejected_after_brush_hardness_is_added() {
+    let mut value = serde_json::to_value(document()).unwrap();
+    value["schema_version"] = 1.into();
+    assert_eq!(
+      decode_document(&serde_json::to_vec(&value).unwrap()),
+      Err(FormatError::UnsupportedSchema { found: 1, supported: CURRENT_SCHEMA_VERSION })
     );
   }
 
@@ -382,13 +392,14 @@ mod tests {
   }
 
   #[test]
-  fn all_element_payloads_round_trip_with_v1_tagged_shape() {
+  fn all_element_payloads_round_trip_with_tagged_shape() {
     let document = document_with_all_elements();
     let encoded = encode_document(&document).unwrap();
     let json = String::from_utf8(encoded.clone()).unwrap();
     for kind in ["stroke", "arrow", "rectangle", "text", "sequence_marker"] {
       assert!(json.contains(&format!("\"kind\": \"{kind}\"")));
     }
+    assert!(json.contains("\"hardness\": 1.0"));
     assert!(json.contains("第一行\\n第二行"));
     assert_eq!(decode_document(&encoded).unwrap(), document);
   }

@@ -15,6 +15,15 @@ use crate::editor::CanvasTransform;
 
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
 const ARROW_HEAD_NECK_LENGTH_FACTOR: f32 = 0.7;
+const SOFT_BRUSH_LAYER_COUNT: usize = 6;
+
+#[derive(Clone, Copy)]
+struct BrushPaintStyle {
+  color: ColorRgba,
+  width_px: f32,
+  hardness: f32,
+  opacity: f32,
+}
 
 /// Read-only document surface shared by live documents and frozen snapshots.
 pub trait RenderDocument {
@@ -80,28 +89,18 @@ pub(crate) fn paint_element(
 ) {
   match &element.payload {
     ElementPayload::Stroke(payload) => {
-      let color = egui_color(payload.stroke_style.color_rgba, opacity);
-      let stroke = Stroke::new(payload.stroke_style.width_px * transform.scale(), color);
-      match payload.points.as_slice() {
-        [point] => {
-          painter.circle_filled(
-            transform.document_to_egui(point.point()),
-            stroke.width / 2.0,
-            color,
-          );
-        }
-        points => {
-          for points in points.windows(2) {
-            painter.line_segment(
-              [
-                transform.document_to_egui(points[0].point()),
-                transform.document_to_egui(points[1].point()),
-              ],
-              stroke,
-            );
-          }
-        }
-      }
+      paint_brush_polyline(
+        painter,
+        transform,
+        payload.points.len(),
+        |index| payload.points[index].point(),
+        BrushPaintStyle {
+          color: payload.stroke_style.color_rgba,
+          width_px: payload.stroke_style.width_px,
+          hardness: payload.hardness,
+          opacity,
+        },
+      );
     }
     ElementPayload::Arrow(payload) => paint_arrow(painter, transform, payload, opacity),
     ElementPayload::Rectangle(payload) => paint_rectangle(painter, transform, payload, opacity),
@@ -155,18 +154,62 @@ pub(crate) fn paint_raw_polyline(
   points: &[PointPx],
   color: ColorRgba,
   width_px: f32,
+  hardness: f32,
 ) {
-  let color = egui_color(color, 1.0);
-  let stroke = Stroke::new(width_px * transform.scale(), color);
-  if let [point] = points {
-    painter.circle_filled(transform.document_to_egui(*point), stroke.width / 2.0, color);
+  paint_brush_polyline(
+    painter,
+    transform,
+    points.len(),
+    |index| points[index],
+    BrushPaintStyle { color, width_px, hardness, opacity: 1.0 },
+  );
+}
+
+fn paint_brush_polyline(
+  painter: &Painter,
+  transform: &CanvasTransform,
+  point_count: usize,
+  point_at: impl Fn(usize) -> PointPx,
+  style: BrushPaintStyle,
+) {
+  if point_count == 0 {
     return;
   }
-  for points in points.windows(2) {
-    painter.line_segment(
-      [transform.document_to_egui(points[0]), transform.document_to_egui(points[1])],
-      stroke,
-    );
+
+  let width = style.width_px * transform.scale();
+  if style.hardness >= 1.0 {
+    let color = egui_color(style.color, style.opacity);
+    let stroke = Stroke::new(width, color);
+    if point_count == 1 {
+      painter.circle_filled(transform.document_to_egui(point_at(0)), stroke.width / 2.0, color);
+      return;
+    }
+    for index in 1..point_count {
+      painter.line_segment(
+        [
+          transform.document_to_egui(point_at(index - 1)),
+          transform.document_to_egui(point_at(index)),
+        ],
+        stroke,
+      );
+    }
+    return;
+  }
+
+  let points =
+    (0..point_count).map(|index| transform.document_to_egui(point_at(index))).collect::<Vec<_>>();
+  let minimum_core_width = width / SOFT_BRUSH_LAYER_COUNT as f32;
+  let core_width = (width * style.hardness).max(minimum_core_width);
+  for layer in 0..SOFT_BRUSH_LAYER_COUNT {
+    let outer_fraction = 1.0 - layer as f32 / (SOFT_BRUSH_LAYER_COUNT - 1) as f32;
+    let layer_width = core_width + (width - core_width) * outer_fraction;
+    let layer_opacity = style.opacity / (SOFT_BRUSH_LAYER_COUNT - layer) as f32;
+    let layer_color = egui_color(style.color, layer_opacity);
+    if let [point] = points.as_slice() {
+      painter.circle_filled(*point, layer_width / 2.0, layer_color);
+    } else {
+      painter.add(Shape::line(points.clone(), Stroke::new(layer_width, layer_color)));
+    }
   }
 }
 
@@ -317,21 +360,23 @@ pub(crate) fn layout_egui_text(
 fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx) {
   match &element.payload {
     ElementPayload::Stroke(payload) => match payload.points.as_slice() {
-      [point] => draw_thick_segment(
+      [point] => draw_brush_segment(
         image,
         point.point(),
         point.point(),
         payload.stroke_style.width_px,
         rgba(payload.stroke_style.color_rgba),
+        payload.hardness,
       ),
       points => {
         for points in points.windows(2) {
-          draw_thick_segment(
+          draw_brush_segment(
             image,
             points[0].point(),
             points[1].point(),
             payload.stroke_style.width_px,
             rgba(payload.stroke_style.color_rgba),
+            payload.hardness,
           );
         }
       }
@@ -529,6 +574,42 @@ fn draw_thick_segment(
       let point = PointPx::new(x as f32 + 0.5, y as f32 + 0.5);
       let distance = distance_to_segment(point, start, end);
       let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+      if coverage > 0.0 {
+        blend_pixel(image, x as u32, y as u32, color, coverage);
+      }
+    }
+  }
+}
+
+fn draw_brush_segment(
+  image: &mut RgbaImage,
+  start: PointPx,
+  end: PointPx,
+  width: f32,
+  color: Rgba<u8>,
+  hardness: f32,
+) {
+  if hardness >= 1.0 {
+    draw_thick_segment(image, start, end, width, color);
+    return;
+  }
+
+  let radius = width / 2.0;
+  let core_radius = (radius * hardness).max(radius / SOFT_BRUSH_LAYER_COUNT as f32);
+  let fade_width = radius - core_radius + 0.5;
+  let min_x = (start.x_px.min(end.x_px) - radius - 1.0).floor() as i32;
+  let max_x = (start.x_px.max(end.x_px) + radius + 1.0).ceil() as i32;
+  let min_y = (start.y_px.min(end.y_px) - radius - 1.0).floor() as i32;
+  let max_y = (start.y_px.max(end.y_px) + radius + 1.0).ceil() as i32;
+  for y in min_y.max(0)..=max_y.min(image.height() as i32 - 1) {
+    for x in min_x.max(0)..=max_x.min(image.width() as i32 - 1) {
+      let point = PointPx::new(x as f32 + 0.5, y as f32 + 0.5);
+      let distance = distance_to_segment(point, start, end);
+      let coverage = if distance <= core_radius {
+        1.0
+      } else {
+        ((radius + 0.5 - distance) / fade_width).clamp(0.0, 1.0)
+      };
       if coverage > 0.0 {
         blend_pixel(image, x as u32, y as u32, color, coverage);
       }
@@ -907,6 +988,72 @@ mod tests {
     let rendered = render_document_to_image(&document, &background);
     assert_eq!(rendered.get_pixel(50, 40), &Rgba([255, 59, 48, 255]));
     assert_eq!(rendered.get_pixel(56, 40), &Rgba([0, 0, 0, 255]));
+  }
+
+  #[test]
+  fn raster_renderer_fades_a_soft_brush_toward_its_edge() {
+    fn render(hardness: f32) -> RgbaImage {
+      let mut document = document();
+      let payload = StrokePayload::from_raw_points_with_hardness(
+        &[PointPx::new(20.5, 40.5), PointPx::new(80.5, 40.5)],
+        StrokeStyle::mvp(ColorRgba::RED, 12.0).unwrap(),
+        hardness,
+      )
+      .unwrap();
+      document.elements.push(
+        Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), document.canvas_size_px)
+          .unwrap(),
+      );
+      render_document_to_image(&document, &RgbaImage::from_pixel(100, 80, Rgba([0, 0, 0, 255])))
+    }
+
+    let soft = render(0.0);
+    let hard = render(1.0);
+    assert_eq!(soft.get_pixel(50, 40), hard.get_pixel(50, 40));
+    let soft_edge = soft.get_pixel(50, 46)[0];
+    let hard_edge = hard.get_pixel(50, 46)[0];
+    assert!(soft_edge > 0, "soft edge should remain visible");
+    assert!(soft_edge < hard_edge, "soft={soft_edge}, hard={hard_edge}");
+  }
+
+  #[test]
+  fn screen_renderer_builds_a_translucent_falloff_for_a_soft_brush() {
+    fn circle_alphas(hardness: f32) -> Vec<u8> {
+      let context = egui::Context::default();
+      let output = context.run_ui(
+        egui::RawInput {
+          screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 80.0))),
+          ..Default::default()
+        },
+        |ui| {
+          let transform = CanvasTransform::fit(SizePx::new(100, 80), ui.max_rect()).unwrap();
+          paint_raw_polyline(
+            ui.painter(),
+            &transform,
+            &[PointPx::new(50.0, 40.0)],
+            ColorRgba::RED,
+            12.0,
+            hardness,
+          );
+        },
+      );
+      let alphas = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+          Shape::Circle(circle) => Some(circle.fill.a()),
+          _ => None,
+        })
+        .collect();
+      output.drop_without_applying_deltas();
+      alphas
+    }
+
+    let soft = circle_alphas(0.0);
+    let hard = circle_alphas(1.0);
+    assert_eq!(soft.len(), SOFT_BRUSH_LAYER_COUNT);
+    assert!(soft.first().unwrap() < soft.last().unwrap(), "soft layers={soft:?}");
+    assert_eq!(hard, vec![u8::MAX]);
   }
 
   #[test]

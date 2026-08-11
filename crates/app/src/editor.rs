@@ -1,9 +1,9 @@
 use common::{
   ArrowEndpoint, ArrowHead, ArrowPayload, BoardDocument, ColorRgba, CommandBatch, CommandHistory,
   DocumentCommand, Element, ElementId, ElementPayload, LabelPlacementPreference,
-  PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx, RectangleLabel, RectanglePayload,
-  SequenceMarkerPayload, SizePx, StrokePayload, StrokeStyle, StyleChange, TextAlign, TextPayload,
-  TextStyle, minimum_geometry_extent, rectangle_label_layout,
+  PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx,
+  RectangleLabel, RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokeStyle,
+  StyleChange, TextAlign, TextPayload, TextStyle, minimum_geometry_extent, rectangle_label_layout,
 };
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FontId, Id, ImeEvent, Key, KeyboardShortcut, Modifiers,
@@ -90,11 +90,12 @@ pub struct ToolStyle {
   pub color_rgba: ColorRgba,
   pub width_px: f32,
   pub font_size_px: f32,
+  pub hardness: f32,
 }
 
 impl Default for ToolStyle {
   fn default() -> Self {
-    Self { color_rgba: ColorRgba::RED, width_px: 8.0, font_size_px: 24.0 }
+    Self { color_rgba: ColorRgba::RED, width_px: 8.0, font_size_px: 24.0, hardness: 1.0 }
   }
 }
 
@@ -873,7 +874,8 @@ impl EditorController {
   fn make_stroke(&self, document: &BoardDocument, points: &[PointPx]) -> Option<Element> {
     let style = self.tool_style(EditorTool::Stroke);
     let stroke_style = StrokeStyle::mvp(style.color_rgba, style.width_px).ok()?;
-    let payload = StrokePayload::from_raw_points(points, stroke_style).ok()?;
+    let payload =
+      StrokePayload::from_raw_points_with_hardness(points, stroke_style, style.hardness).ok()?;
     Element::new(
       ElementId::new(),
       document.elements.len() as i64,
@@ -1223,6 +1225,33 @@ impl EditorController {
       .response
       .on_hover_text("线宽");
 
+    if self.shows_brush_hardness(document) {
+      egui::ComboBox::from_id_salt("rs-board-hardness")
+        .selected_text(format!("硬度 {}%", hardness_percent(displayed.hardness)))
+        .width(82.0)
+        .height(FLOATING_MENU_MAX_HEIGHT_PT)
+        .show_ui(ui, |ui| {
+          set_floating_control_style(ui);
+          for hardness in PRESET_BRUSH_HARDNESSES {
+            if ui
+              .selectable_label(
+                displayed.hardness == hardness,
+                format!("{}%", hardness_percent(hardness)),
+              )
+              .clicked()
+            {
+              self.apply_style_change(
+                document,
+                StyleChange { hardness: Some(hardness), ..StyleChange::default() },
+                actions,
+              );
+            }
+          }
+        })
+        .response
+        .on_hover_text("画笔硬度");
+    }
+
     egui::ComboBox::from_id_salt("rs-board-font-size")
       .selected_text(format!("{} pt", displayed.font_size_px as i32))
       .width(62.0)
@@ -1312,6 +1341,14 @@ impl EditorController {
       .unwrap_or_else(|| self.tool_style(self.tool))
   }
 
+  fn shows_brush_hardness(&self, document: &BoardDocument) -> bool {
+    self
+      .selected_element_id
+      .and_then(|element_id| document.element(element_id))
+      .map(|element| matches!(element.payload, ElementPayload::Stroke(_)))
+      .unwrap_or(self.tool == EditorTool::Stroke)
+  }
+
   fn apply_style_change(
     &mut self,
     document: &BoardDocument,
@@ -1322,9 +1359,18 @@ impl EditorController {
       && let Some(element) = document.element(element_id)
     {
       match element.payload {
-        ElementPayload::Stroke(_) | ElementPayload::Arrow(_) => change.font_size_px = None,
-        ElementPayload::Text(_) => change.width_px = None,
-        ElementPayload::Rectangle(_) | ElementPayload::SequenceMarker(_) => {}
+        ElementPayload::Stroke(_) => change.font_size_px = None,
+        ElementPayload::Arrow(_) => {
+          change.font_size_px = None;
+          change.hardness = None;
+        }
+        ElementPayload::Text(_) => {
+          change.width_px = None;
+          change.hardness = None;
+        }
+        ElementPayload::Rectangle(_) | ElementPayload::SequenceMarker(_) => {
+          change.hardness = None;
+        }
       }
       if change != StyleChange::default() {
         actions.push(command_action(DocumentCommand::ChangeElementStyle { element_id, change }));
@@ -1341,6 +1387,9 @@ impl EditorController {
     }
     if let Some(font_size) = change.font_size_px {
       style.font_size_px = font_size;
+    }
+    if let Some(hardness) = change.hardness {
+      style.hardness = hardness;
     }
   }
 
@@ -1410,6 +1459,7 @@ impl EditorController {
           points,
           self.tool_style(EditorTool::Stroke).color_rgba,
           self.tool_style(EditorTool::Stroke).width_px,
+          self.tool_style(EditorTool::Stroke).hardness,
         ),
         EditorTool::Select | EditorTool::Text | EditorTool::Sequence => {}
       },
@@ -1997,28 +2047,37 @@ fn style_for_element(element: &Element) -> ToolStyle {
       color_rgba: payload.stroke_style.color_rgba,
       width_px: payload.stroke_style.width_px,
       font_size_px: 24.0,
+      hardness: payload.hardness,
     },
     ElementPayload::Arrow(payload) => ToolStyle {
       color_rgba: payload.stroke_style.color_rgba,
       width_px: payload.stroke_style.width_px,
       font_size_px: 24.0,
+      hardness: 1.0,
     },
     ElementPayload::Rectangle(payload) => ToolStyle {
       color_rgba: payload.stroke_style.color_rgba,
       width_px: payload.stroke_style.width_px,
       font_size_px: payload.label.text_style.font_size_px,
+      hardness: 1.0,
     },
     ElementPayload::Text(payload) => ToolStyle {
       color_rgba: payload.text_style.color_rgba,
       width_px: 8.0,
       font_size_px: payload.text_style.font_size_px,
+      hardness: 1.0,
     },
     ElementPayload::SequenceMarker(payload) => ToolStyle {
       color_rgba: payload.fill_rgba,
       width_px: payload.stroke_style.width_px,
       font_size_px: payload.text_style.font_size_px,
+      hardness: 1.0,
     },
   }
+}
+
+fn hardness_percent(hardness: f32) -> i32 {
+  (hardness * 100.0).round() as i32
 }
 
 fn command_action(command: DocumentCommand) -> EditorAction {
@@ -2152,6 +2211,64 @@ mod tests {
       Utc.with_ymd_and_hms(2026, 8, 6, 0, 0, 0).unwrap(),
     )
     .unwrap()
+  }
+
+  #[test]
+  fn brush_hardness_is_available_in_the_toolbar_and_option_panel() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let mut controller = EditorController::default();
+    assert!(!controller.shows_brush_hardness(&document));
+    controller.set_active_tool(EditorTool::Stroke);
+    assert!(controller.shows_brush_hardness(&document));
+    let anchor = Pos2::new(300.0, 160.0);
+    let input = raw_input(
+      vec![Event::ModifiersChanged(Modifiers::ALT), Event::PointerMoved(anchor)],
+      egui::vec2(1000.0, 500.0),
+    );
+
+    let output = context.run_ui(input, |ui| {
+      assert!(controller.show(ui, &document, &history, None).is_empty());
+    });
+    output.drop_without_applying_deltas();
+    assert_eq!(controller.option_panel_anchor, Some(anchor));
+  }
+
+  #[test]
+  fn brush_hardness_selection_is_used_for_new_strokes_and_selected_strokes() {
+    let mut document = document();
+    let mut controller = EditorController::default();
+    controller.set_active_tool(EditorTool::Stroke);
+    let mut actions = Vec::new();
+    controller.apply_style_change(
+      &document,
+      StyleChange { hardness: Some(0.5), ..StyleChange::default() },
+      &mut actions,
+    );
+    assert!(actions.is_empty());
+    let new_stroke = controller.make_stroke(&document, &[PointPx::new(80.0, 60.0)]).unwrap();
+    let ElementPayload::Stroke(payload) = &new_stroke.payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.hardness, 0.5);
+
+    let element_id = new_stroke.element_id;
+    document.elements.push(new_stroke);
+    controller.set_selected_element_id(Some(element_id));
+    controller.apply_style_change(
+      &document,
+      StyleChange { hardness: Some(0.0), ..StyleChange::default() },
+      &mut actions,
+    );
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected a style command, got {actions:?}");
+    };
+    batch.clone().apply(&mut document).unwrap();
+    let ElementPayload::Stroke(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.hardness, 0.0);
   }
 
   fn text_element(

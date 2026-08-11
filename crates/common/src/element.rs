@@ -9,6 +9,7 @@ use crate::geometry::{
 };
 
 pub const FONT_FAMILY: &str = "Noto Sans CJK SC Regular";
+pub const PRESET_BRUSH_HARDNESSES: [f32; 3] = [0.0, 0.5, 1.0];
 pub const PRESET_STROKE_WIDTHS_PX: [f32; 3] = [4.0, 8.0, 12.0];
 pub const PRESET_FONT_SIZES_PX: [f32; 6] = [12.0, 16.0, 24.0, 36.0, 48.0, 64.0];
 const BOUNDS_EPSILON_PX: f32 = 0.5;
@@ -219,6 +220,7 @@ impl StrokePoint {
 pub struct StrokePayload {
   pub points: Vec<StrokePoint>,
   pub stroke_style: StrokeStyle,
+  pub hardness: f32,
 }
 
 impl StrokePayload {
@@ -226,18 +228,29 @@ impl StrokePayload {
     points: &[PointPx],
     stroke_style: StrokeStyle,
   ) -> Result<Self, ElementError> {
+    Self::from_raw_points_with_hardness(points, stroke_style, default_brush_hardness())
+  }
+
+  pub fn from_raw_points_with_hardness(
+    points: &[PointPx],
+    stroke_style: StrokeStyle,
+    hardness: f32,
+  ) -> Result<Self, ElementError> {
     stroke_style.validate()?;
     let points = process_stroke_points(points, stroke_style.width_px)?
       .into_iter()
       .map(StrokePoint::new)
       .collect();
-    let payload = Self { points, stroke_style };
+    let payload = Self { points, stroke_style, hardness };
     payload.validate()?;
     Ok(payload)
   }
 
   fn validate(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
+    if !is_preset(self.hardness, &PRESET_BRUSH_HARDNESSES) {
+      return Err(ElementError::InvalidBrushHardness(self.hardness));
+    }
     if self.points.is_empty() {
       return Err(ElementError::Geometry(GeometryError::TooFewPoints));
     }
@@ -601,6 +614,9 @@ impl Element {
     match &mut staged.payload {
       ElementPayload::Stroke(payload) => {
         apply_stroke_change(&mut payload.stroke_style, change);
+        if let Some(hardness) = change.hardness {
+          payload.hardness = hardness;
+        }
       }
       ElementPayload::Arrow(payload) => {
         apply_stroke_change(&mut payload.stroke_style, change);
@@ -886,11 +902,16 @@ pub struct StyleChange {
   pub color_rgba: Option<ColorRgba>,
   pub width_px: Option<f32>,
   pub font_size_px: Option<f32>,
+  pub hardness: Option<f32>,
 }
 
 impl StyleChange {
   pub fn validate(&self) -> Result<(), ElementError> {
-    if self.color_rgba.is_none() && self.width_px.is_none() && self.font_size_px.is_none() {
+    if self.color_rgba.is_none()
+      && self.width_px.is_none()
+      && self.font_size_px.is_none()
+      && self.hardness.is_none()
+    {
       return Err(ElementError::EmptyStyleChange);
     }
     if let Some(color_rgba) = self.color_rgba {
@@ -906,8 +927,17 @@ impl StyleChange {
     {
       return Err(ElementError::InvalidFontSize(font_size_px));
     }
+    if let Some(hardness) = self.hardness
+      && !is_preset(hardness, &PRESET_BRUSH_HARDNESSES)
+    {
+      return Err(ElementError::InvalidBrushHardness(hardness));
+    }
     Ok(())
   }
+}
+
+const fn default_brush_hardness() -> f32 {
+  1.0
 }
 
 fn apply_stroke_change(style: &mut StrokeStyle, change: &StyleChange) {
@@ -1011,6 +1041,8 @@ pub enum ElementError {
   PressureMustBeOne,
   #[error("unsupported stroke width {0}")]
   InvalidStrokeWidth(f32),
+  #[error("unsupported brush hardness {0}")]
+  InvalidBrushHardness(f32),
   #[error("unsupported font size {0}")]
   InvalidFontSize(f32),
   #[error("font family must be the bundled Noto Sans CJK SC Regular")]
@@ -1042,6 +1074,31 @@ pub enum ElementError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn brush_hardness_accepts_presets_and_changes_transactionally() {
+    let canvas = SizePx::new(200, 120);
+    let point = PointPx::new(80.0, 60.0);
+    let payload =
+      StrokePayload::from_raw_points_with_hardness(&[point], StrokeStyle::default(), 0.0).unwrap();
+    let mut element =
+      Element::new(ElementId::new(), 0, ElementPayload::Stroke(payload), canvas).unwrap();
+
+    element
+      .set_style(&StyleChange { hardness: Some(0.5), ..StyleChange::default() }, canvas)
+      .unwrap();
+    let ElementPayload::Stroke(payload) = &element.payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.hardness, 0.5);
+
+    let before = element.clone();
+    assert_eq!(
+      element.set_style(&StyleChange { hardness: Some(0.25), ..StyleChange::default() }, canvas,),
+      Err(ElementError::InvalidBrushHardness(0.25))
+    );
+    assert_eq!(element, before);
+  }
 
   #[test]
   fn a_single_point_stroke_is_a_valid_dot() {
@@ -1286,7 +1343,7 @@ mod tests {
     .unwrap();
     let before = arrow.clone();
     let result = arrow.set_style(
-      &StyleChange { color_rgba: None, width_px: Some(12.0), font_size_px: None },
+      &StyleChange { color_rgba: None, width_px: Some(12.0), font_size_px: None, hardness: None },
       canvas,
     );
     assert_eq!(result, Err(ElementError::GeometryBelowMinimum));

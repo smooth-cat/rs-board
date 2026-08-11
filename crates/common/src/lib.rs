@@ -14,9 +14,10 @@ pub use document::{
 pub use element::{
   ArrowHead, ArrowPayload, ColorRgba, DerivedLabelPlacement, Element, ElementError, ElementId,
   ElementKind, ElementPayload, FONT_FAMILY, LabelPlacementPreference, LineCap, LineJoin,
-  PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, RectangleLabel, RectangleLabelLayout,
-  RectanglePayload, SequenceMarkerPayload, StrokePayload, StrokePoint, StrokeStyle, StyleChange,
-  TextAlign, TextLayout, TextPayload, TextStyle, layout_text, rectangle_label_layout,
+  PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, RectangleLabel,
+  RectangleLabelLayout, RectanglePayload, SequenceMarkerPayload, StrokePayload, StrokePoint,
+  StrokeStyle, StyleChange, TextAlign, TextLayout, TextPayload, TextStyle, layout_text,
+  rectangle_label_layout,
 };
 pub use format::{
   FormatError, ResourceNameError, decode_document, decode_snapshot, encode_document,

@@ -729,6 +729,7 @@ mod tests {
           color_rgba: Some(ColorRgba::BLUE),
           width_px: Some(12.0),
           font_size_px: None,
+          hardness: None,
         },
       },
     );

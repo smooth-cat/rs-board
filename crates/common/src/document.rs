@@ -11,7 +11,7 @@ use crate::{
   geometry::{GeometryError, SizePx},
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const MAX_ELEMENTS: usize = 10_000;
 pub const MAX_STROKE_POINTS: usize = 1_000_000;
 
@@ -536,7 +536,11 @@ mod tests {
     let stroke = Element::new(
       ElementId::from_uuid(Uuid::from_u128(1)),
       0,
-      ElementPayload::Stroke(StrokePayload { points, stroke_style: StrokeStyle::default() }),
+      ElementPayload::Stroke(StrokePayload {
+        points,
+        stroke_style: StrokeStyle::default(),
+        hardness: 1.0,
+      }),
       document.canvas_size_px,
     )
     .unwrap();
