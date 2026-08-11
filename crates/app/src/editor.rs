@@ -1430,13 +1430,6 @@ impl EditorController {
     else {
       return;
     };
-    let rect = transform.document_rect_to_egui(element.bounds_px).expand(3.0);
-    painter.rect_stroke(
-      rect,
-      egui::CornerRadius::ZERO,
-      Stroke::new(1.0, Color32::WHITE),
-      StrokeKind::Outside,
-    );
     match &element.payload {
       ElementPayload::Rectangle(payload) => {
         for (_, point) in rectangle_handles(RectPx::from_points(payload.start_px, payload.end_px)) {
@@ -1447,7 +1440,15 @@ impl EditorController {
         paint_handle(painter, transform.document_to_egui(payload.start_px));
         paint_handle(painter, transform.document_to_egui(payload.end_px));
       }
-      _ => {}
+      _ => {
+        let rect = transform.document_rect_to_egui(element.bounds_px).expand(3.0);
+        painter.rect_stroke(
+          rect,
+          egui::CornerRadius::ZERO,
+          Stroke::new(1.0, Color32::WHITE),
+          StrokeKind::Outside,
+        );
+      }
     }
   }
 }
@@ -2927,7 +2928,7 @@ mod tests {
   }
 
   #[test]
-  fn selection_outline_and_handles_follow_the_transform_preview() {
+  fn shape_selection_handles_follow_the_transform_preview_without_an_outline() {
     let mut rectangle_document = document();
     let rectangle =
       rectangle(&rectangle_document, 0, PointPx::new(80.0, 80.0), PointPx::new(200.0, 150.0));
@@ -2957,12 +2958,9 @@ mod tests {
       Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
     )
     .unwrap();
-    let expected_outline = transform.document_rect_to_egui(rectangle_preview.bounds_px).expand(3.0);
-    let actual_outline = rectangle_output.shapes.iter().find_map(|shape| match &shape.shape {
-      egui::Shape::Rect(rectangle) => Some(rectangle.rect),
-      _ => None,
-    });
-    assert_eq!(actual_outline, Some(expected_outline));
+    assert!(
+      rectangle_output.shapes.iter().all(|shape| !matches!(shape.shape, egui::Shape::Rect(_)))
+    );
     let circle_centers = rectangle_output
       .shapes
       .iter()
@@ -3004,6 +3002,7 @@ mod tests {
       ..Default::default()
     };
     let arrow_output = paint_selection_output(&arrow_controller, &arrow_document);
+    assert!(arrow_output.shapes.iter().all(|shape| !matches!(shape.shape, egui::Shape::Rect(_))));
     let arrow_centers = arrow_output
       .shapes
       .iter()
@@ -3022,6 +3021,27 @@ mod tests {
     let old_end = transform.document_to_egui(old_end);
     assert!(!arrow_centers.iter().any(|center| center.distance(old_end) < 0.001));
     arrow_output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn other_elements_keep_the_selection_outline() {
+    let mut document = document();
+    let elements = [
+      stroke(&document, 0),
+      text_element(&document, PointPx::new(80.0, 80.0), "Text", 120.0),
+      sequence_marker(&document, 2),
+    ];
+
+    for element in elements {
+      let element_id = element.element_id;
+      document.elements.push(element);
+      let controller =
+        EditorController { selected_element_id: Some(element_id), ..Default::default() };
+      let output = paint_selection_output(&controller, &document);
+
+      assert!(output.shapes.iter().any(|shape| matches!(shape.shape, egui::Shape::Rect(_))));
+      output.drop_without_applying_deltas();
+    }
   }
 
   #[test]
