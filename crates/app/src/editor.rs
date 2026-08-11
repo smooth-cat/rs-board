@@ -718,7 +718,10 @@ impl EditorController {
       match &mut self.interaction {
         Some(PointerInteraction::Draw { current, stroke_points, tool, .. }) => {
           *current = position;
-          if *tool == EditorTool::Stroke && stylus_frame.samples.is_empty() {
+          if *tool == EditorTool::Stroke
+            && stylus_frame.samples.is_empty()
+            && self.active_stylus_id.is_none()
+          {
             append_stroke_point(stroke_points, StrokePoint::new(position));
           }
         }
@@ -2974,6 +2977,78 @@ mod tests {
     let tail = &payload.points[payload.points.len() - 3..];
     assert!(tail.windows(2).all(|points| points[0].pressure >= points[1].pressure));
     assert!(tail[0].pressure > tail[1].pressure);
+  }
+
+  #[test]
+  fn stylus_drag_without_a_new_sample_preserves_the_last_pressure() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let mut controller = EditorController::default();
+    controller.set_active_tool(EditorTool::Stroke);
+    let start = Pos2::new(100.0, 100.0);
+    let middle = Pos2::new(150.0, 100.0);
+
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(start)],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![
+          touch_event(TouchPhase::Start, start, 0.4),
+          Event::PointerMoved(start),
+          Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+          },
+        ],
+      )
+      .is_empty()
+    );
+    assert!(
+      run_stylus_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![touch_event(TouchPhase::Move, middle, 0.4), Event::PointerMoved(middle)],
+      )
+      .is_empty()
+    );
+
+    let point_count = match &controller.interaction {
+      Some(PointerInteraction::Draw { tool: EditorTool::Stroke, stroke_points, .. }) => {
+        assert_eq!(stroke_points.last().unwrap().pressure, 0.4);
+        stroke_points.len()
+      }
+      interaction => panic!("expected an active pressure stroke, got {interaction:?}"),
+    };
+
+    assert!(
+      run_stylus_editor_frame(&context, &mut controller, &document, &history, Vec::new())
+        .is_empty()
+    );
+
+    let Some(PointerInteraction::Draw { tool: EditorTool::Stroke, stroke_points, .. }) =
+      &controller.interaction
+    else {
+      panic!("expected the pressure stroke to remain active");
+    };
+    assert_eq!(stroke_points.len(), point_count);
+    assert_eq!(stroke_points.last().unwrap().pressure, 0.4);
   }
 
   #[test]
