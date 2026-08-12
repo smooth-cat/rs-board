@@ -4,7 +4,7 @@ use common::{
   PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx, RectangleLabelAnchor,
   RectangleLabelEdge, RectangleLabelSide, RectanglePayload, SequenceMarkerPayload, SizePx,
   StrokePayload, StrokePoint, StrokeStyle, StyleChange, TextAlign, TextPayload, TextStyle,
-  arrow_label_layout, arrow_minimum_length_for_label, choose_rectangle_label_anchor,
+  arrow_label_layout, arrow_minimum_length_for_label, choose_rectangle_label_anchor, layout_text,
   minimum_geometry_extent, rectangle_label_layout, snap_rectangle_label_layout,
 };
 use eframe::egui::{
@@ -28,8 +28,11 @@ const FLOATING_PANEL_ORDER: egui::Order = egui::Order::Middle;
 const FLOATING_PANEL_MARGIN_PT: i8 = 4;
 const TOOLBAR_DRAG_HANDLE_WIDTH_PT: f32 = 18.0;
 const TOOLBAR_DRAG_HANDLE_DOT_RADIUS_PT: f32 = 1.5;
-const HANDLE_VISUAL_RADIUS_PT: f32 = 4.5;
+const HANDLE_VISUAL_RADIUS_PT: f32 = 3.0;
 const HANDLE_HIT_RADIUS_PT: f32 = 11.0;
+const TEXT_MOVE_HANDLE_VISUAL_RADIUS_PT: f32 = 3.0;
+const TEXT_MOVE_HANDLE_HIT_RADIUS_PT: f32 = 9.0;
+const TEXT_MOVE_HANDLE_OFFSET_PT: f32 = 4.0;
 const HIT_TOLERANCE_PT: f32 = 7.0;
 const MINIMUM_DISTANCE_ROUNDING_FACTOR: f32 = 4.0;
 const RELEASE_TAPER_WIDTH_FACTOR: f32 = 3.0;
@@ -292,10 +295,19 @@ enum ShortcutAction {
   Undo,
   Redo,
   Save,
+  Deselect,
   CloseOrCancel,
   Delete,
   Copy,
   Paste,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditorCompletion {
+  None,
+  FocusLost,
+  CanvasPress,
+  Enter,
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +321,9 @@ pub struct EditorController {
   last_pointer_document: Option<PointPx>,
   option_panel_anchor: Option<Pos2>,
   toolbar_screen_rect: Option<Rect>,
+  toolbar_panel_rect: Option<Rect>,
+  tool_button_rects: [Option<Rect>; 6],
+  active_tool_button_press_started: bool,
   toolbar_was_moved: bool,
   queued_stylus_events: Vec<StylusEvent>,
   active_stylus_id: Option<StylusId>,
@@ -333,6 +348,9 @@ impl EditorController {
       last_pointer_document: None,
       option_panel_anchor: None,
       toolbar_screen_rect: None,
+      toolbar_panel_rect: None,
+      tool_button_rects: [None; 6],
+      active_tool_button_press_started: false,
       toolbar_was_moved: false,
       queued_stylus_events: Vec::new(),
       active_stylus_id: None,
@@ -345,9 +363,14 @@ impl EditorController {
   }
 
   pub fn set_active_tool(&mut self, tool: EditorTool) {
+    if self.tool == tool {
+      return;
+    }
     self.tool = tool;
+    self.selected_element_id = None;
     self.interaction = None;
     self.released_preview_element = None;
+    self.active_tool_button_press_started = false;
     self.reset_stylus_input();
   }
 
@@ -404,6 +427,7 @@ impl EditorController {
     let mut actions = Vec::new();
 
     let mut transform = None;
+    let mut canvas_response = None;
     let mut canvas_painter = None;
     let background_fill = if background.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
@@ -427,9 +451,7 @@ impl EditorController {
         {
           self.last_pointer_document = Some(document_position);
         }
-        if self.text_editing.is_none() {
-          self.handle_pointer(&response, canvas_transform, document, &mut actions);
-        }
+        canvas_response = Some(response);
 
         let painter = ui.painter().with_clip_rect(canvas_transform.canvas_rect());
         if let Some(background) = background {
@@ -445,18 +467,43 @@ impl EditorController {
     );
 
     if let Some(transform) = transform {
-      let submit_text = self.show_text_editor(&ctx, transform, document);
+      let editing_transform_pointer = canvas_response.as_ref().is_some_and(|response| {
+        self.text_editing_transform_pointer_active(response, transform, document)
+      });
+      let preserve_text_focus = self.active_tool_button_clicked(&ctx) || editing_transform_pointer;
+      let mut text_completion =
+        self.show_text_editor(&ctx, transform, document, preserve_text_focus);
+      if text_completion == TextEditorCompletion::None
+        && self.text_editing.is_some()
+        && !editing_transform_pointer
+        && canvas_response.as_ref().is_some_and(|response| self.canvas_primary_pressed(response))
+      {
+        ctx.memory_mut(|memory| memory.surrender_focus(inline_text_editor_id()));
+        text_completion = TextEditorCompletion::CanvasPress;
+      }
+      if text_completion != TextEditorCompletion::None {
+        self.commit_text(document, &mut actions);
+        if text_completion == TextEditorCompletion::Enter {
+          self.selected_element_id = None;
+        }
+      }
+      let handle_editing_transform = self.text_editing.is_some()
+        && (editing_transform_pointer || self.text_editing_transform_interaction_active());
+      if let Some(response) = canvas_response.as_ref()
+        && (self.text_editing.is_none() || handle_editing_transform)
+      {
+        self.handle_pointer(response, transform, document, &mut actions, handle_editing_transform);
+      }
       if let Some(painter) = canvas_painter {
         self.paint_document_for_editing(&painter, transform, document);
         self.paint_interaction(&painter, transform, document);
-        if self.text_editing.is_none() {
+        if self.text_editing.is_some() {
+          self.paint_text_editing_controls(&painter, transform, document);
+        } else {
           self.paint_selection(&painter, transform, document);
         }
       }
       self.released_preview_element = None;
-      if submit_text {
-        self.commit_text(document, &mut actions);
-      }
       self.handle_keyboard(&ctx, document, &mut actions);
       self.show_option_panel(&ctx, transform, document, &mut actions);
     } else {
@@ -537,10 +584,7 @@ impl EditorController {
     };
     match shortcut {
       ShortcutAction::Tool(tool) => {
-        if text_editing {
-          self.commit_text(document, actions);
-        }
-        self.set_active_tool(tool);
+        self.switch_tool(tool, document, actions);
       }
       ShortcutAction::Undo => {
         self.interaction = None;
@@ -559,6 +603,9 @@ impl EditorController {
           self.commit_text(document, actions);
         }
         actions.push(EditorAction::Save);
+      }
+      ShortcutAction::Deselect => {
+        self.selected_element_id = None;
       }
       ShortcutAction::CloseOrCancel => {
         let cancelled_text = self.text_editing.take().is_some();
@@ -587,12 +634,26 @@ impl EditorController {
     }
   }
 
+  fn switch_tool(
+    &mut self,
+    tool: EditorTool,
+    document: &BoardDocument,
+    actions: &mut Vec<EditorAction>,
+  ) {
+    if self.tool == tool {
+      return;
+    }
+    self.commit_text(document, actions);
+    self.set_active_tool(tool);
+  }
+
   fn handle_pointer(
     &mut self,
     response: &Response,
     transform: CanvasTransform,
     document: &BoardDocument,
     actions: &mut Vec<EditorAction>,
+    editing_transform_only: bool,
   ) {
     let pointer_position =
       response.interact_pointer_pos().and_then(|p| transform.egui_to_document(p));
@@ -635,11 +696,16 @@ impl EditorController {
       return;
     }
 
-    if response.double_clicked()
-      && self.tool == EditorTool::Select
+    if !editing_transform_only
+      && response.double_clicked()
+      && self.tool != EditorTool::Stroke
       && let Some(position) = pointer_position
-      && let Some(element_id) =
-        hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale())
+      && let Some(element_id) = hit_test_document_for_tool(
+        document,
+        position,
+        HIT_TOLERANCE_PT / transform.scale(),
+        self.tool,
+      )
     {
       self.selected_element_id = Some(element_id);
       if double_click_starts_editing(document, element_id, position) {
@@ -648,54 +714,61 @@ impl EditorController {
       return;
     }
 
-    if response.clicked()
+    if !editing_transform_only
+      && response.clicked()
       && let Some(position) = pointer_position
     {
-      match self.tool {
-        EditorTool::Select => {
-          if let Some(element_id) = hit_test_visible_element_label(document, position) {
-            self.selected_element_id = Some(element_id);
-            self.start_editing_existing(document, element_id, false, actions);
-          } else {
-            self.selected_element_id =
-              hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale());
+      let matching_element = hit_test_document_for_tool(
+        document,
+        position,
+        HIT_TOLERANCE_PT / transform.scale(),
+        self.tool,
+      );
+      if let Some(element_id) = matching_element {
+        self.selected_element_id = Some(element_id);
+        if single_click_starts_editing(document, element_id, position) {
+          self.start_editing_existing(document, element_id, false, actions);
+        }
+      } else {
+        self.selected_element_id = None;
+        match self.tool {
+          EditorTool::Select => {}
+          EditorTool::Text => {
+            let style = self.tool_style(EditorTool::Text);
+            self.text_editing = Some(TextEditing {
+              target: TextTarget::NewText { anchor_px: position },
+              buffer: String::new(),
+              text_style: TextStyle::mvp(style.color_rgba, style.font_size_px)
+                .expect("text tool style is valid"),
+              ime: InlineImeState::default(),
+              request_focus: true,
+              select_all: false,
+              auto_place_rectangle: false,
+            });
           }
-        }
-        EditorTool::Text => {
-          let style = self.tool_style(EditorTool::Text);
-          self.text_editing = Some(TextEditing {
-            target: TextTarget::NewText { anchor_px: position },
-            buffer: String::new(),
-            text_style: TextStyle::mvp(style.color_rgba, style.font_size_px)
-              .expect("text tool style is valid"),
-            ime: InlineImeState::default(),
-            request_focus: true,
-            select_all: false,
-            auto_place_rectangle: false,
-          });
-        }
-        EditorTool::Sequence => self.insert_sequence(document, position, actions),
-        EditorTool::Stroke => {
-          let pressure = self
-            .pending_stroke_points
-            .iter()
-            .map(|point| point.pressure)
-            .reduce(f32::max)
-            .unwrap_or(1.0);
-          let point = StrokePoint::with_pressure(position, pressure)
-            .expect("captured stroke pressure is normalized");
-          if let Some(element) = self.make_stroke_points(document, &[point]) {
-            let element_id = element.element_id;
-            self.push_pointer_command(
-              document,
-              actions,
-              DocumentCommand::AddElement { element },
-              element_id,
-            );
+          EditorTool::Sequence => self.insert_sequence(document, position, actions),
+          EditorTool::Stroke => {
+            let pressure = self
+              .pending_stroke_points
+              .iter()
+              .map(|point| point.pressure)
+              .reduce(f32::max)
+              .unwrap_or(1.0);
+            let point = StrokePoint::with_pressure(position, pressure)
+              .expect("captured stroke pressure is normalized");
+            if let Some(element) = self.make_stroke_points(document, &[point]) {
+              let element_id = element.element_id;
+              self.push_pointer_command(
+                document,
+                actions,
+                DocumentCommand::AddElement { element },
+                element_id,
+              );
+            }
+            self.pending_stroke_points.clear();
           }
-          self.pending_stroke_points.clear();
+          EditorTool::Rectangle | EditorTool::Arrow => {}
         }
-        EditorTool::Rectangle | EditorTool::Arrow => {}
       }
     }
 
@@ -706,12 +779,16 @@ impl EditorController {
         .and_then(|position| transform.egui_to_document(position))
         .or(pointer_position);
       if let Some(start) = start {
-        if self.tool == EditorTool::Select {
-          self.begin_selection_drag(start, transform, document);
-        } else if matches!(
-          self.tool,
-          EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Stroke
-        ) {
+        let selected_existing = if editing_transform_only {
+          self.begin_text_editing_transform_drag(start, transform, document)
+        } else {
+          self.tool != EditorTool::Stroke && self.begin_selection_drag(start, transform, document)
+        };
+        if !selected_existing
+          && !editing_transform_only
+          && matches!(self.tool, EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Stroke)
+        {
+          self.selected_element_id = None;
           let stroke_points = if self.tool == EditorTool::Stroke {
             let mut points = std::mem::take(&mut self.pending_stroke_points);
             if points.first().is_none_or(|point| point.point() != start) {
@@ -741,6 +818,12 @@ impl EditorController {
     {
       match &mut self.interaction {
         Some(PointerInteraction::Draw { current, stroke_points, tool, .. }) => {
+          if *tool == EditorTool::Text
+            && let Some(TextEditing { target: TextTarget::NewText { anchor_px }, .. }) =
+              self.text_editing.as_mut()
+          {
+            *anchor_px = *anchor_px + (position - *current);
+          }
           *current = position;
           if *tool == EditorTool::Stroke
             && stylus_frame.samples.is_empty()
@@ -823,14 +906,238 @@ impl EditorController {
     self.pending_stroke_points.clear();
   }
 
+  fn text_editing_transform_pointer_active(
+    &self,
+    response: &Response,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+  ) -> bool {
+    if self.text_editing_transform_interaction_active() {
+      return true;
+    }
+    let Some(press_origin) = response
+      .ctx
+      .input(|input| input.pointer.primary_down().then(|| input.pointer.press_origin()).flatten())
+    else {
+      return false;
+    };
+    if self.toolbar_panel_rect.is_some_and(|rect| rect.contains(press_origin))
+      || !response.rect.contains(press_origin)
+    {
+      return false;
+    }
+    let Some(position) = transform.egui_to_document(press_origin) else {
+      return false;
+    };
+    let inside_editor = response
+      .ctx
+      .read_response(inline_text_editor_id())
+      .is_some_and(|editor| editor.rect.contains(press_origin));
+    self.text_editing_transform_hit(position, transform, document, inside_editor)
+  }
+
+  fn text_editing_transform_interaction_active(&self) -> bool {
+    let Some(editing) = &self.text_editing else {
+      return false;
+    };
+    match (&editing.target, &self.interaction) {
+      (
+        TextTarget::NewText { .. },
+        Some(PointerInteraction::Draw { tool: EditorTool::Text, .. }),
+      ) => true,
+      (target, Some(interaction)) => {
+        text_target_element_id(target).is_some_and(|target_id| match interaction {
+          PointerInteraction::Move { element_id, .. }
+          | PointerInteraction::ResizeRectangle { element_id, .. }
+          | PointerInteraction::UpdateArrowEndpoint { element_id, .. }
+          | PointerInteraction::DragRectangleLabel { element_id, .. } => *element_id == target_id,
+          PointerInteraction::Draw { .. } => false,
+        })
+      }
+      _ => false,
+    }
+  }
+
+  fn text_editing_transform_hit(
+    &self,
+    position: PointPx,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+    inside_editor: bool,
+  ) -> bool {
+    let Some(editing) = &self.text_editing else {
+      return false;
+    };
+    let tolerance = HIT_TOLERANCE_PT / transform.scale();
+    match editing.target {
+      TextTarget::RectangleLabel { element_id } => {
+        let Some(element) = document.element(element_id) else {
+          return false;
+        };
+        let ElementPayload::Rectangle(payload) = &element.payload else {
+          return false;
+        };
+        hit_rectangle_handle(element, position, transform).is_some()
+          || (!inside_editor
+            && contains(
+              RectPx::from_points(payload.start_px, payload.end_px).expanded(tolerance),
+              position,
+            ))
+      }
+      TextTarget::ArrowLabel { element_id } => {
+        let Some(element) = document.element(element_id) else {
+          return false;
+        };
+        let ElementPayload::Arrow(payload) = &element.payload else {
+          return false;
+        };
+        hit_arrow_handle(element, position, transform).is_some()
+          || (!inside_editor && hit_arrow_body(payload, position, tolerance))
+      }
+      TextTarget::ExistingText { .. } | TextTarget::NewText { .. } => self
+        .text_editing_bounds_px(document)
+        .is_some_and(|bounds| hit_text_editing_frame(bounds, position, transform)),
+    }
+  }
+
+  fn begin_text_editing_transform_drag(
+    &mut self,
+    position: PointPx,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+  ) -> bool {
+    let Some(target) = self.text_editing.as_ref().map(|editing| editing.target.clone()) else {
+      return false;
+    };
+    match target {
+      TextTarget::RectangleLabel { element_id } => {
+        let Some(element) = document.element(element_id) else {
+          return false;
+        };
+        let ElementPayload::Rectangle(payload) = &element.payload else {
+          return false;
+        };
+        self.selected_element_id = Some(element_id);
+        if let Some(handle) = hit_rectangle_handle(element, position, transform) {
+          self.interaction = Some(PointerInteraction::ResizeRectangle {
+            element_id,
+            handle,
+            original: RectPx::from_points(payload.start_px, payload.end_px),
+            current: position,
+          });
+        } else {
+          self.interaction =
+            Some(PointerInteraction::Move { element_id, start: position, current: position });
+        }
+        true
+      }
+      TextTarget::ArrowLabel { element_id } => {
+        let Some(element) = document.element(element_id) else {
+          return false;
+        };
+        self.selected_element_id = Some(element_id);
+        if let Some(endpoint) = hit_arrow_handle(element, position, transform) {
+          self.interaction = Some(PointerInteraction::UpdateArrowEndpoint {
+            element_id,
+            endpoint,
+            current: position,
+          });
+        } else {
+          self.interaction =
+            Some(PointerInteraction::Move { element_id, start: position, current: position });
+        }
+        true
+      }
+      TextTarget::ExistingText { element_id } => {
+        self.selected_element_id = Some(element_id);
+        self.interaction =
+          Some(PointerInteraction::Move { element_id, start: position, current: position });
+        true
+      }
+      TextTarget::NewText { .. } => {
+        self.interaction = Some(PointerInteraction::Draw {
+          tool: EditorTool::Text,
+          start: position,
+          current: position,
+          stroke_points: Vec::new(),
+        });
+        true
+      }
+    }
+  }
+
+  fn text_editing_preview_element(&self, document: &BoardDocument) -> Option<Element> {
+    let target_id =
+      self.text_editing.as_ref().and_then(|editing| text_target_element_id(&editing.target))?;
+    self
+      .interaction
+      .as_ref()
+      .and_then(|interaction| interaction_preview_element(interaction, document))
+      .filter(|element| element.element_id == target_id)
+      .or_else(|| {
+        self
+          .released_preview_element
+          .as_ref()
+          .filter(|element| element.element_id == target_id)
+          .cloned()
+      })
+  }
+
+  fn text_editing_bounds_px(&self, document: &BoardDocument) -> Option<RectPx> {
+    let editing = self.text_editing.as_ref()?;
+    let preview = self.text_editing_preview_element(document);
+    text_editing_bounds_px_with_preview(editing, document, preview.as_ref())
+  }
+
   fn begin_selection_drag(
     &mut self,
     position: PointPx,
     transform: CanvasTransform,
     document: &BoardDocument,
-  ) {
-    if let Some(element_id) = hit_test_visible_rectangle_label(document, position) {
-      self.selected_element_id = Some(element_id);
+  ) -> bool {
+    if let Some(element_id) = self.selected_element_id
+      && let Some(element) = document.element(element_id)
+      && tool_selects_element(self.tool, element)
+    {
+      if let Some(handle) = hit_rectangle_handle(element, position, transform) {
+        let ElementPayload::Rectangle(payload) = &element.payload else {
+          unreachable!();
+        };
+        self.interaction = Some(PointerInteraction::ResizeRectangle {
+          element_id,
+          handle,
+          original: RectPx::from_points(payload.start_px, payload.end_px),
+          current: position,
+        });
+        return true;
+      }
+      if let Some(endpoint) = hit_arrow_handle(element, position, transform) {
+        self.interaction =
+          Some(PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current: position });
+        return true;
+      }
+    }
+
+    let Some(element_id) = hit_test_document_for_tool(
+      document,
+      position,
+      HIT_TOLERANCE_PT / transform.scale(),
+      self.tool,
+    ) else {
+      self.selected_element_id = None;
+      return false;
+    };
+    self.selected_element_id = Some(element_id);
+    if document
+      .element(element_id)
+      .and_then(|element| match &element.payload {
+        ElementPayload::Rectangle(payload) => {
+          rectangle_label_layout(payload, document.canvas_size_px).ok().flatten()
+        }
+        _ => None,
+      })
+      .is_some_and(|layout| contains(layout.bounds_px, position))
+    {
       let grab_offset_px = document
         .element(element_id)
         .and_then(|element| match &element.payload {
@@ -845,37 +1152,11 @@ impl EditorController {
         current: position,
         grab_offset_px,
       });
-      return;
-    }
-
-    if let Some(element_id) = self.selected_element_id
-      && let Some(element) = document.element(element_id)
-    {
-      if let Some(handle) = hit_rectangle_handle(element, position, transform) {
-        let ElementPayload::Rectangle(payload) = &element.payload else {
-          unreachable!();
-        };
-        self.interaction = Some(PointerInteraction::ResizeRectangle {
-          element_id,
-          handle,
-          original: RectPx::from_points(payload.start_px, payload.end_px),
-          current: position,
-        });
-        return;
-      }
-      if let Some(endpoint) = hit_arrow_handle(element, position, transform) {
-        self.interaction =
-          Some(PointerInteraction::UpdateArrowEndpoint { element_id, endpoint, current: position });
-        return;
-      }
-    }
-
-    self.selected_element_id =
-      hit_test_document(document, position, HIT_TOLERANCE_PT / transform.scale());
-    if let Some(element_id) = self.selected_element_id {
+    } else {
       self.interaction =
         Some(PointerInteraction::Move { element_id, start: position, current: position });
     }
+    true
   }
 
   fn finish_pointer_interaction(
@@ -1384,9 +1665,10 @@ impl EditorController {
     ctx: &egui::Context,
     transform: CanvasTransform,
     document: &BoardDocument,
-  ) -> bool {
+    preserve_focus: bool,
+  ) -> TextEditorCompletion {
     if self.text_editing.is_none() {
-      return false;
+      return TextEditorCompletion::None;
     }
     let cancel = ctx.input_mut(|input| {
       input
@@ -1400,14 +1682,16 @@ impl EditorController {
     });
     if cancel {
       self.text_editing = None;
-      return false;
+      return TextEditorCompletion::None;
     }
     let editing = self.text_editing.as_ref().expect("text editing checked above");
-    let Some(geometry) = inline_text_geometry(editing, document) else {
-      return false;
+    let preview = self.text_editing_preview_element(document);
+    let Some(geometry) = inline_text_geometry_with_preview(editing, document, preview.as_ref())
+    else {
+      return TextEditorCompletion::None;
     };
     let screen_position = transform.document_to_egui(geometry.origin_px);
-    let editor_id = Id::new("rs-board-inline-text-editor");
+    let editor_id = inline_text_editor_id();
     let mut lost_focus = false;
     let editing = self.text_editing.as_mut().expect("text editor checked above");
     let submit_after_widget =
@@ -1475,10 +1759,16 @@ impl EditorController {
     } else {
       lost_focus = output.response.lost_focus();
     }
+    if preserve_focus {
+      output.response.request_focus();
+      lost_focus = false;
+    }
     if submit_after_widget {
       output.response.surrender_focus();
     }
-    if let Some(updated_geometry) = inline_text_geometry(editing, document) {
+    if let Some(updated_geometry) =
+      inline_text_geometry_with_preview(editing, document, preview.as_ref())
+    {
       let updated_position = transform.document_to_egui(updated_geometry.origin_px);
       translate_inline_text_layer(
         ctx,
@@ -1488,7 +1778,13 @@ impl EditorController {
         transform.canvas_rect(),
       );
     }
-    lost_focus || submit_after_widget
+    if submit_after_widget {
+      TextEditorCompletion::Enter
+    } else if lost_focus {
+      TextEditorCompletion::FocusLost
+    } else {
+      TextEditorCompletion::None
+    }
   }
 
   fn show_toolbar(
@@ -1506,15 +1802,11 @@ impl EditorController {
         ui.horizontal(|ui| {
           toolbar_drag_handle(ui);
           for tool in EditorTool::ALL {
-            if ui
-              .selectable_label(self.tool == tool, tool.label())
-              .on_hover_text(tool.tooltip())
-              .clicked()
-            {
-              if self.text_editing.is_some() {
-                self.commit_text(document, actions);
-              }
-              self.set_active_tool(tool);
+            let response =
+              ui.selectable_label(self.tool == tool, tool.label()).on_hover_text(tool.tooltip());
+            self.tool_button_rects[tool.index()] = Some(response.rect);
+            if response.clicked() {
+              self.switch_tool(tool, document, actions);
             }
           }
           ui.separator();
@@ -1544,7 +1836,49 @@ impl EditorController {
         });
       });
     });
+    self.toolbar_panel_rect = Some(area.response.rect);
+    let toolbar_origin = area.response.rect.min.to_vec2();
+    for rect in self.tool_button_rects.iter_mut().flatten() {
+      *rect = rect.translate(toolbar_origin);
+    }
     self.toolbar_was_moved |= area.response.dragged();
+  }
+
+  fn active_tool_button_clicked(&mut self, ctx: &egui::Context) -> bool {
+    let Some(rect) = self.tool_button_rects[self.tool.index()] else {
+      return false;
+    };
+    let clicked = ctx.input(|input| {
+      if input.pointer.primary_pressed()
+        && input.pointer.press_origin().is_some_and(|position| rect.contains(position))
+      {
+        self.active_tool_button_press_started = true;
+      }
+      self.active_tool_button_press_started && input.pointer.primary_released()
+    });
+    if ctx.input(|input| input.pointer.primary_released()) {
+      self.active_tool_button_press_started = false;
+    }
+    clicked
+  }
+
+  fn canvas_primary_pressed(&self, response: &Response) -> bool {
+    let Some(press_origin) = response.ctx.input(|input| {
+      input.pointer.primary_pressed().then(|| input.pointer.press_origin()).flatten()
+    }) else {
+      return false;
+    };
+    if self.toolbar_panel_rect.is_some_and(|rect| rect.contains(press_origin)) {
+      return false;
+    }
+    if response
+      .ctx
+      .read_response(inline_text_editor_id())
+      .is_some_and(|editor| editor.rect.contains(press_origin))
+    {
+      return false;
+    }
+    response.rect.contains(press_origin)
   }
 
   fn should_recenter_toolbar(&mut self, screen: Rect) -> bool {
@@ -1802,16 +2136,13 @@ impl EditorController {
       .and_then(|interaction| interaction_preview_element(interaction, document));
     let preview_element = interaction_preview.as_ref().or(self.released_preview_element.as_ref());
     for element in &document.elements {
-      if let Some(preview) = preview_element
-        && preview.element_id == element.element_id
-      {
-        paint_element(&painter, &transform, preview, 1.0);
-        continue;
-      }
+      let display_element = preview_element
+        .filter(|preview| preview.element_id == element.element_id)
+        .unwrap_or(element);
       match self.text_editing.as_ref().map(|editing| &editing.target) {
         Some(TextTarget::ExistingText { element_id }) if *element_id == element.element_id => {}
         Some(TextTarget::ArrowLabel { element_id }) if *element_id == element.element_id => {
-          let ElementPayload::Arrow(payload) = &element.payload else {
+          let ElementPayload::Arrow(payload) = &display_element.payload else {
             continue;
           };
           let editing = self.text_editing.as_ref().expect("text editing target checked above");
@@ -1819,20 +2150,39 @@ impl EditorController {
           paint_arrow_without_label_text(&painter, &transform, &draft, 1.0);
         }
         Some(TextTarget::RectangleLabel { element_id }) if *element_id == element.element_id => {
-          let ElementPayload::Rectangle(payload) = &element.payload else {
+          let ElementPayload::Rectangle(payload) = &display_element.payload else {
             continue;
           };
           let editing = self.text_editing.as_ref().expect("text editing target checked above");
           let draft = rectangle_label_draft(payload, editing, document, *element_id);
           paint_rectangle_without_label_text(&painter, &transform, &draft, 1.0);
         }
-        _ => paint_element(&painter, &transform, element, 1.0),
+        _ => paint_element(&painter, &transform, display_element, 1.0),
       }
     }
     if let Some(preview) = preview_element
       && document.element(preview.element_id).is_none()
     {
       paint_element(&painter, &transform, preview, 1.0);
+    }
+  }
+
+  fn paint_text_editing_controls(
+    &self,
+    painter: &egui::Painter,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+  ) {
+    match self.text_editing.as_ref().map(|editing| &editing.target) {
+      Some(TextTarget::ExistingText { .. }) | Some(TextTarget::NewText { .. }) => {
+        if let Some(bounds) = self.text_editing_bounds_px(document) {
+          paint_text_editing_frame(painter, transform, bounds);
+        }
+      }
+      Some(TextTarget::ArrowLabel { .. }) | Some(TextTarget::RectangleLabel { .. }) => {
+        self.paint_selection(painter, transform, document);
+      }
+      None => {}
     }
   }
 
@@ -1922,36 +2272,66 @@ pub fn hit_test_document(
   position_px: PointPx,
   tolerance_px: f32,
 ) -> Option<ElementId> {
+  hit_test_document_where(document, position_px, tolerance_px, |_| true)
+}
+
+fn hit_test_document_for_tool(
+  document: &BoardDocument,
+  position_px: PointPx,
+  tolerance_px: f32,
+  tool: EditorTool,
+) -> Option<ElementId> {
+  hit_test_document_where(document, position_px, tolerance_px, |element| {
+    tool_selects_element(tool, element)
+  })
+}
+
+fn hit_test_document_where(
+  document: &BoardDocument,
+  position_px: PointPx,
+  tolerance_px: f32,
+  predicate: impl Fn(&Element) -> bool,
+) -> Option<ElementId> {
   document
     .elements
     .iter()
+    .filter(|element| predicate(element))
     .filter(|element| hit_test_element(element, position_px, tolerance_px, document.canvas_size_px))
     .max_by_key(|element| element.z_index)
     .map(|element| element.element_id)
 }
 
-fn hit_test_visible_element_label(
+fn tool_selects_element(tool: EditorTool, element: &Element) -> bool {
+  match tool {
+    EditorTool::Select => true,
+    EditorTool::Rectangle => matches!(element.payload, ElementPayload::Rectangle(_)),
+    EditorTool::Arrow => matches!(element.payload, ElementPayload::Arrow(_)),
+    EditorTool::Text => matches!(element.payload, ElementPayload::Text(_)),
+    EditorTool::Sequence => matches!(element.payload, ElementPayload::SequenceMarker(_)),
+    EditorTool::Stroke => false,
+  }
+}
+
+fn single_click_starts_editing(
   document: &BoardDocument,
+  element_id: ElementId,
   position_px: PointPx,
-) -> Option<ElementId> {
-  document
-    .elements
-    .iter()
-    .filter(|element| match &element.payload {
-      ElementPayload::Arrow(payload) => arrow_label_layout(payload, document.canvas_size_px)
-        .ok()
-        .flatten()
-        .is_some_and(|layout| contains(layout.bounds_px, position_px)),
-      ElementPayload::Rectangle(payload) => {
-        rectangle_label_layout(payload, document.canvas_size_px)
-          .ok()
-          .flatten()
-          .is_some_and(|layout| contains(layout.bounds_px, position_px))
-      }
-      _ => false,
-    })
-    .max_by_key(|element| element.z_index)
-    .map(|element| element.element_id)
+) -> bool {
+  let Some(element) = document.element(element_id) else {
+    return false;
+  };
+  match &element.payload {
+    ElementPayload::Text(_) => true,
+    ElementPayload::Arrow(payload) => arrow_label_layout(payload, document.canvas_size_px)
+      .ok()
+      .flatten()
+      .is_some_and(|layout| contains(layout.bounds_px, position_px)),
+    ElementPayload::Rectangle(payload) => rectangle_label_layout(payload, document.canvas_size_px)
+      .ok()
+      .flatten()
+      .is_some_and(|layout| contains(layout.bounds_px, position_px)),
+    ElementPayload::Stroke(_) | ElementPayload::SequenceMarker(_) => false,
+  }
 }
 
 fn double_click_starts_editing(
@@ -1980,26 +2360,6 @@ fn double_click_starts_editing(
     }
     _ => false,
   }
-}
-
-fn hit_test_visible_rectangle_label(
-  document: &BoardDocument,
-  position_px: PointPx,
-) -> Option<ElementId> {
-  document
-    .elements
-    .iter()
-    .filter(|element| {
-      let ElementPayload::Rectangle(payload) = &element.payload else {
-        return false;
-      };
-      rectangle_label_layout(payload, document.canvas_size_px)
-        .ok()
-        .flatten()
-        .is_some_and(|layout| contains(layout.bounds_px, position_px))
-    })
-    .max_by_key(|element| element.z_index)
-    .map(|element| element.element_id)
 }
 
 fn rectangle_label_obstacles(
@@ -2464,6 +2824,9 @@ fn map_shortcut(key: Key, modifiers: Modifiers, text_editing: bool) -> Option<Sh
   if command && key == Key::V {
     return Some(ShortcutAction::Paste);
   }
+  if key == Key::Enter && modifiers.is_none() {
+    return Some(ShortcutAction::Deselect);
+  }
   if key == Key::Escape {
     return Some(ShortcutAction::CloseOrCancel);
   }
@@ -2482,13 +2845,22 @@ fn inline_text_geometry(
   editing: &TextEditing,
   document: &BoardDocument,
 ) -> Option<InlineTextGeometry> {
+  inline_text_geometry_with_preview(editing, document, None)
+}
+
+fn inline_text_geometry_with_preview(
+  editing: &TextEditing,
+  document: &BoardDocument,
+  preview: Option<&Element>,
+) -> Option<InlineTextGeometry> {
   match editing.target {
     TextTarget::NewText { anchor_px } => Some(InlineTextGeometry {
       origin_px: anchor_px,
       wrap_width_px: text_width_to_canvas_edge(anchor_px, document.canvas_size_px),
     }),
     TextTarget::ExistingText { element_id } => {
-      let ElementPayload::Text(payload) = &document.element(element_id)?.payload else {
+      let ElementPayload::Text(payload) = &target_element(document, preview, element_id)?.payload
+      else {
         return None;
       };
       Some(InlineTextGeometry {
@@ -2497,7 +2869,8 @@ fn inline_text_geometry(
       })
     }
     TextTarget::ArrowLabel { element_id } => {
-      let ElementPayload::Arrow(payload) = &document.element(element_id)?.payload else {
+      let ElementPayload::Arrow(payload) = &target_element(document, preview, element_id)?.payload
+      else {
         return None;
       };
       let draft = arrow_label_draft(payload, editing);
@@ -2512,7 +2885,9 @@ fn inline_text_geometry(
     TextTarget::RectangleLabel { element_id } => {
       // A newly-created rectangle is added after this frame. Waiting for it to
       // enter the document avoids briefly placing its editor at the origin.
-      let ElementPayload::Rectangle(payload) = &document.element(element_id)?.payload else {
+      let ElementPayload::Rectangle(payload) =
+        &target_element(document, preview, element_id)?.payload
+      else {
         return None;
       };
       let draft = rectangle_label_draft(payload, editing, document, element_id);
@@ -2525,6 +2900,65 @@ fn inline_text_geometry(
       ))
     }
   }
+}
+
+fn target_element<'a>(
+  document: &'a BoardDocument,
+  preview: Option<&'a Element>,
+  element_id: ElementId,
+) -> Option<&'a Element> {
+  preview
+    .filter(|element| element.element_id == element_id)
+    .or_else(|| document.element(element_id))
+}
+
+fn text_target_element_id(target: &TextTarget) -> Option<ElementId> {
+  match target {
+    TextTarget::NewText { .. } => None,
+    TextTarget::ExistingText { element_id }
+    | TextTarget::ArrowLabel { element_id }
+    | TextTarget::RectangleLabel { element_id } => Some(*element_id),
+  }
+}
+
+fn text_editing_bounds_px_with_preview(
+  editing: &TextEditing,
+  document: &BoardDocument,
+  preview: Option<&Element>,
+) -> Option<RectPx> {
+  match editing.target {
+    TextTarget::NewText { anchor_px } => {
+      text_draft_bounds_px(anchor_px, &editing.buffer, &editing.text_style, document.canvas_size_px)
+    }
+    TextTarget::ExistingText { element_id } => {
+      let ElementPayload::Text(payload) = &target_element(document, preview, element_id)?.payload
+      else {
+        return None;
+      };
+      Some(payload_text_bounds_px(payload, document.canvas_size_px))
+    }
+    TextTarget::ArrowLabel { .. } | TextTarget::RectangleLabel { .. } => None,
+  }
+}
+
+fn text_draft_bounds_px(
+  anchor_px: PointPx,
+  text: &str,
+  text_style: &TextStyle,
+  canvas_size_px: SizePx,
+) -> Option<RectPx> {
+  let box_width_px = text_width_to_canvas_edge(anchor_px, canvas_size_px);
+  let text = if text.trim().is_empty() { EMPTY_LABEL_DRAFT } else { text };
+  let layout = layout_text(text, text_style, box_width_px).ok()?;
+  Some(RectPx::from_min_max(
+    anchor_px,
+    PointPx::new(anchor_px.x_px + layout.width_px, anchor_px.y_px + layout.height_px),
+  ))
+}
+
+fn payload_text_bounds_px(payload: &TextPayload, canvas_size_px: SizePx) -> RectPx {
+  text_draft_bounds_px(payload.anchor_px, &payload.text, &payload.text_style, canvas_size_px)
+    .unwrap_or(RectPx::from_min_max(payload.anchor_px, payload.anchor_px))
 }
 
 fn inline_label_geometry(
@@ -2580,6 +3014,10 @@ fn rectangle_label_draft(
 
 fn normalized_label_text(text: String) -> Option<String> {
   (!text.trim().is_empty()).then_some(text)
+}
+
+fn inline_text_editor_id() -> Id {
+  Id::new("rs-board-inline-text-editor")
 }
 
 fn translate_inline_text_layer(
@@ -2827,12 +3265,49 @@ fn distance_to_segment(point: PointPx, start: PointPx, end: PointPx) -> f32 {
 }
 
 fn paint_handle(painter: &egui::Painter, position: Pos2) {
-  painter.circle_filled(position, HANDLE_VISUAL_RADIUS_PT + 1.5, Color32::BLACK);
-  painter.circle(
+  painter.circle_stroke(position, HANDLE_VISUAL_RADIUS_PT + 1.0, Stroke::new(1.5, Color32::BLACK));
+  painter.circle_stroke(position, HANDLE_VISUAL_RADIUS_PT, Stroke::new(1.5, Color32::WHITE));
+}
+
+fn paint_text_editing_frame(
+  painter: &egui::Painter,
+  transform: CanvasTransform,
+  bounds_px: RectPx,
+) {
+  let rect = transform.document_rect_to_egui(bounds_px).expand(3.0);
+  painter.rect_stroke(
+    rect,
+    egui::CornerRadius::ZERO,
+    Stroke::new(1.0, Color32::WHITE),
+    StrokeKind::Outside,
+  );
+  paint_text_move_handle(painter, text_move_handle_position(rect));
+}
+
+fn hit_text_editing_frame(bounds_px: RectPx, point: PointPx, transform: CanvasTransform) -> bool {
+  let screen_point = transform.document_to_egui(point);
+  let rect = transform.document_rect_to_egui(bounds_px).expand(3.0);
+  if text_move_handle_position(rect).distance(screen_point) <= TEXT_MOVE_HANDLE_HIT_RADIUS_PT {
+    return true;
+  }
+  rect.expand(HANDLE_HIT_RADIUS_PT * 0.5).contains(screen_point)
+    && !rect.shrink(HANDLE_HIT_RADIUS_PT * 0.5).contains(screen_point)
+}
+
+fn text_move_handle_position(rect: Rect) -> Pos2 {
+  rect.min - egui::vec2(TEXT_MOVE_HANDLE_OFFSET_PT, TEXT_MOVE_HANDLE_OFFSET_PT)
+}
+
+fn paint_text_move_handle(painter: &egui::Painter, position: Pos2) {
+  painter.circle_stroke(
     position,
-    HANDLE_VISUAL_RADIUS_PT,
-    Color32::WHITE,
-    Stroke::new(1.0, Color32::BLACK),
+    TEXT_MOVE_HANDLE_VISUAL_RADIUS_PT + 1.0,
+    Stroke::new(1.5, Color32::BLACK),
+  );
+  painter.circle_stroke(
+    position,
+    TEXT_MOVE_HANDLE_VISUAL_RADIUS_PT,
+    Stroke::new(1.5, Color32::WHITE),
   );
 }
 
@@ -3053,6 +3528,15 @@ mod tests {
       phase,
       pos: position,
       force: Some(pressure),
+    }
+  }
+
+  fn primary_button(position: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+      pos: position,
+      button: egui::PointerButton::Primary,
+      pressed,
+      modifiers: Modifiers::NONE,
     }
   }
 
@@ -5147,7 +5631,10 @@ mod tests {
     .unwrap();
     let context = egui::Context::default();
     let output = context.run_ui(raw_input(Vec::new(), egui::vec2(1000.0, 200.0)), |ui| {
-      assert!(!controller.show_text_editor(&context, transform, &document));
+      assert_eq!(
+        controller.show_text_editor(&context, transform, &document, false),
+        TextEditorCompletion::None
+      );
       controller.paint_document_for_editing(ui.painter(), transform, &document);
     });
     let text_shape_count =
@@ -5259,7 +5746,10 @@ mod tests {
       events: Vec<Event>,
     ) -> egui::FullOutput {
       context.run_ui(raw_input(events, egui::vec2(400.0, 200.0)), |ui| {
-        assert!(!controller.show_text_editor(context, transform, document));
+        assert_eq!(
+          controller.show_text_editor(context, transform, document, false),
+          TextEditorCompletion::None
+        );
         controller.paint_document_for_editing(ui.painter(), transform, document);
       })
     }
@@ -5440,7 +5930,7 @@ mod tests {
     .unwrap()
     .bounds_px
     .center();
-    assert_eq!(hit_test_visible_element_label(&document, label_center), Some(element_id));
+    assert!(single_click_starts_editing(&document, element_id, label_center));
 
     let mut controller = EditorController::new(EditorTool::Select);
     let context = egui::Context::default();
@@ -5821,5 +6311,484 @@ mod tests {
     assert_eq!(text_width_to_canvas_edge(PointPx::new(120.0, 20.0), canvas), 280.0);
     assert_eq!(text_width_to_canvas_edge(PointPx::new(-30.0, 20.0), canvas), 400.0);
     assert_eq!(text_width_to_canvas_edge(PointPx::new(399.5, 20.0), canvas), 1.0);
+  }
+
+  #[test]
+  fn tool_filtered_hit_testing_penetrates_other_types_and_keeps_matching_z_order() {
+    let mut document = document();
+    let position = PointPx::new(150.0, 100.0);
+    let lower_rectangle =
+      rectangle(&document, 0, PointPx::new(20.0, 30.0), PointPx::new(220.0, 180.0));
+    let upper_rectangle =
+      rectangle(&document, 1, PointPx::new(40.0, 40.0), PointPx::new(240.0, 160.0));
+    let upper_rectangle_id = upper_rectangle.element_id;
+    let arrow =
+      arrow(&document, 2, PointPx::new(80.0, position.y_px), PointPx::new(220.0, position.y_px));
+    let arrow_id = arrow.element_id;
+    let text = Element::new(
+      ElementId::new(),
+      3,
+      ElementPayload::Text(TextPayload {
+        anchor_px: PointPx::new(140.0, 84.0),
+        text: "X".to_owned(),
+        box_width_px: 80.0,
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+      }),
+      document.canvas_size_px,
+    )
+    .unwrap();
+    let text_id = text.element_id;
+    let marker = sequence_marker(&document, 4);
+    let marker_id = marker.element_id;
+    let stroke_payload = StrokePayload::from_raw_points(
+      &[PointPx::new(100.0, position.y_px), PointPx::new(200.0, position.y_px)],
+      StrokeStyle::default(),
+    )
+    .unwrap();
+    let stroke = Element::new(
+      ElementId::new(),
+      5,
+      ElementPayload::Stroke(stroke_payload),
+      document.canvas_size_px,
+    )
+    .unwrap();
+    let stroke_id = stroke.element_id;
+    document.elements = vec![lower_rectangle, upper_rectangle, arrow, text, marker, stroke];
+    document.validate().unwrap();
+
+    assert_eq!(
+      hit_test_document_for_tool(&document, position, 2.0, EditorTool::Rectangle),
+      Some(upper_rectangle_id)
+    );
+    assert_eq!(
+      hit_test_document_for_tool(&document, position, 2.0, EditorTool::Arrow),
+      Some(arrow_id)
+    );
+    assert_eq!(
+      hit_test_document_for_tool(&document, position, 2.0, EditorTool::Text),
+      Some(text_id)
+    );
+    assert_eq!(
+      hit_test_document_for_tool(&document, position, 2.0, EditorTool::Sequence),
+      Some(marker_id)
+    );
+    assert_eq!(
+      hit_test_document_for_tool(&document, position, 2.0, EditorTool::Select),
+      Some(stroke_id)
+    );
+    assert_eq!(hit_test_document_for_tool(&document, position, 2.0, EditorTool::Stroke), None);
+  }
+
+  #[test]
+  fn matching_tools_reuse_move_label_and_shape_handle_interactions() {
+    let mut document = document();
+    let rectangle = rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(180.0, 155.0));
+    let rectangle_id = rectangle.element_id;
+    document.elements.push(rectangle);
+    let arrow = arrow(&document, 1, PointPx::new(220.0, 80.0), PointPx::new(360.0, 80.0));
+    let arrow_id = arrow.element_id;
+    document.elements.push(arrow);
+    let text = text_element(&document, PointPx::new(220.0, 120.0), "move", 120.0);
+    let text_id = text.element_id;
+    let text_center = text.bounds_px.center();
+    document.elements.push(text);
+    let mut marker = sequence_marker(&document, 3);
+    let marker_id = marker.element_id;
+    let ElementPayload::SequenceMarker(payload) = &mut marker.payload else {
+      unreachable!();
+    };
+    payload.center_px = PointPx::new(330.0, 150.0);
+    let marker_center = payload.center_px;
+    marker.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(marker);
+    document.validate().unwrap();
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+
+    let mut rectangle_controller = EditorController::new(EditorTool::Rectangle);
+    rectangle_controller.selected_element_id = Some(rectangle_id);
+    assert!(rectangle_controller.begin_selection_drag(
+      PointPx::new(180.0, 155.0),
+      transform,
+      &document
+    ));
+    assert!(matches!(
+      rectangle_controller.interaction,
+      Some(PointerInteraction::ResizeRectangle {
+        element_id,
+        handle: RectangleHandle::BottomRight,
+        ..
+      }) if element_id == rectangle_id
+    ));
+    rectangle_controller.interaction = None;
+    assert!(rectangle_controller.begin_selection_drag(
+      PointPx::new(130.0, 125.0),
+      transform,
+      &document
+    ));
+    assert!(matches!(
+      rectangle_controller.interaction,
+      Some(PointerInteraction::Move { element_id, .. }) if element_id == rectangle_id
+    ));
+    rectangle_controller.interaction = None;
+    let rectangle_label_center = rectangle_label_layout(
+      match &document.element(rectangle_id).unwrap().payload {
+        ElementPayload::Rectangle(payload) => payload,
+        _ => unreachable!(),
+      },
+      document.canvas_size_px,
+    )
+    .unwrap()
+    .unwrap()
+    .bounds_px
+    .center();
+    assert!(rectangle_controller.begin_selection_drag(
+      rectangle_label_center,
+      transform,
+      &document
+    ));
+    assert!(matches!(
+      rectangle_controller.interaction,
+      Some(PointerInteraction::DragRectangleLabel { element_id, .. })
+        if element_id == rectangle_id
+    ));
+
+    let mut arrow_controller = EditorController::new(EditorTool::Arrow);
+    arrow_controller.selected_element_id = Some(arrow_id);
+    assert!(arrow_controller.begin_selection_drag(PointPx::new(360.0, 80.0), transform, &document));
+    assert!(matches!(
+      arrow_controller.interaction,
+      Some(PointerInteraction::UpdateArrowEndpoint {
+        element_id,
+        endpoint: ArrowEndpoint::End,
+        ..
+      }) if element_id == arrow_id
+    ));
+    arrow_controller.interaction = None;
+    assert!(arrow_controller.begin_selection_drag(PointPx::new(285.0, 80.0), transform, &document));
+    assert!(matches!(
+      arrow_controller.interaction,
+      Some(PointerInteraction::Move { element_id, .. }) if element_id == arrow_id
+    ));
+
+    for (tool, element_id, position) in
+      [(EditorTool::Text, text_id, text_center), (EditorTool::Sequence, marker_id, marker_center)]
+    {
+      let mut controller = EditorController::new(tool);
+      assert!(controller.begin_selection_drag(position, transform, &document));
+      assert!(matches!(
+        controller.interaction,
+        Some(PointerInteraction::Move { element_id: moved_id, .. }) if moved_id == element_id
+      ));
+      assert_eq!(controller.selected_element_id, Some(element_id));
+    }
+  }
+
+  #[test]
+  fn switch_tool_is_idempotent_and_real_switch_commits_then_clears_state() {
+    let mut document = document();
+    let element = text_element(&document, PointPx::new(80.0, 60.0), "before", 120.0);
+    let element_id = element.element_id;
+    let ElementPayload::Text(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.text_style.clone();
+    document.elements.push(element.clone());
+    document.validate().unwrap();
+    let stylus_id = StylusId { device_id: TouchDeviceId(7), touch_id: TouchId(11) };
+    let mut controller = EditorController {
+      tool: EditorTool::Text,
+      selected_element_id: Some(element_id),
+      interaction: Some(PointerInteraction::Move {
+        element_id,
+        start: PointPx::new(90.0, 70.0),
+        current: PointPx::new(100.0, 80.0),
+      }),
+      released_preview_element: Some(element),
+      text_editing: Some(TextEditing {
+        target: TextTarget::ExistingText { element_id },
+        buffer: "after".to_owned(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: false,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      queued_stylus_events: vec![StylusEvent {
+        id: stylus_id,
+        phase: TouchPhase::Start,
+        position: Pos2::new(100.0, 100.0),
+        pressure: 0.5,
+      }],
+      active_stylus_id: Some(stylus_id),
+      pending_stroke_points: vec![StrokePoint::new(PointPx::new(50.0, 50.0))],
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+
+    controller.switch_tool(EditorTool::Text, &document, &mut actions);
+
+    assert!(actions.is_empty());
+    assert_eq!(controller.selected_element_id, Some(element_id));
+    assert!(controller.interaction.is_some());
+    assert!(controller.released_preview_element.is_some());
+    assert_eq!(
+      controller.text_editing.as_ref().map(|editing| editing.buffer.as_str()),
+      Some("after")
+    );
+    assert_eq!(controller.active_stylus_id, Some(stylus_id));
+    assert_eq!(controller.queued_stylus_events.len(), 1);
+    assert_eq!(controller.pending_stroke_points.len(), 1);
+
+    controller.switch_tool(EditorTool::Arrow, &document, &mut actions);
+
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected the text commit before switching, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::UpdateElement {
+        element_id: updated_id,
+        payload: ElementPayload::Text(TextPayload { text, .. }),
+      }] if *updated_id == element_id && text == "after"
+    ));
+    assert_eq!(controller.tool, EditorTool::Arrow);
+    assert!(controller.selected_element_id.is_none());
+    assert!(controller.interaction.is_none());
+    assert!(controller.released_preview_element.is_none());
+    assert!(controller.text_editing.is_none());
+    assert!(controller.active_stylus_id.is_none());
+    assert!(controller.queued_stylus_events.is_empty());
+    assert!(controller.pending_stroke_points.is_empty());
+  }
+
+  #[test]
+  fn plain_enter_maps_to_deselect_and_clears_selection_without_a_command() {
+    assert_eq!(map_shortcut(Key::Enter, Modifiers::NONE, false), Some(ShortcutAction::Deselect));
+    assert_eq!(map_shortcut(Key::Enter, Modifiers::NONE, true), None);
+    assert_eq!(map_shortcut(Key::Enter, Modifiers::SHIFT, false), None);
+
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(80.0, 70.0), PointPx::new(180.0, 150.0));
+    let element_id = element.element_id;
+    document.elements.push(element);
+    let revision = document.revision;
+    let history = CommandHistory::new();
+    let mut controller =
+      EditorController { selected_element_id: Some(element_id), ..Default::default() };
+
+    let actions = run_editor_frame(
+      &egui::Context::default(),
+      &mut controller,
+      &document,
+      &history,
+      vec![enter_event(Modifiers::NONE)],
+    );
+
+    assert!(actions.is_empty());
+    assert!(controller.selected_element_id.is_none());
+    assert_eq!(document.revision, revision);
+  }
+
+  #[test]
+  fn canvas_press_while_editing_commits_before_drag_creation_and_keeps_press_origin() {
+    let mut document = document();
+    let element = rectangle(&document, 0, PointPx::new(240.0, 80.0), PointPx::new(360.0, 160.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let text_style = payload.label.text_style.clone();
+    document.elements.push(element);
+    document.validate().unwrap();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController {
+      tool: EditorTool::Rectangle,
+      selected_element_id: Some(element_id),
+      text_editing: Some(TextEditing {
+        target: TextTarget::RectangleLabel { element_id },
+        buffer: "updated".to_owned(),
+        text_style,
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+
+    let start = PointPx::new(30.0, 30.0);
+    let middle = PointPx::new(70.0, 55.0);
+    let end = PointPx::new(120.0, 95.0);
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+
+    let press_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![
+        Event::PointerMoved(transform.document_to_egui(start)),
+        primary_button(transform.document_to_egui(start), true),
+      ],
+    );
+    let [EditorAction::Command(commit_batch)] = press_actions.as_slice() else {
+      panic!("expected the label commit on pointer press, got {press_actions:?}");
+    };
+    assert!(matches!(
+      commit_batch.commands(),
+      [DocumentCommand::UpdateElementLabel { element_id: updated_id, text: Some(text) }]
+        if *updated_id == element_id && text == "updated"
+    ));
+    commit_batch.clone().apply(&mut document).unwrap();
+
+    let drag_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerMoved(transform.document_to_egui(middle))],
+    );
+    assert!(drag_actions.is_empty());
+    assert!(matches!(
+      controller.interaction,
+      Some(PointerInteraction::Draw {
+        tool: EditorTool::Rectangle,
+        start: interaction_start,
+        current,
+        ..
+      }) if interaction_start == start && current == middle
+    ));
+
+    let end_drag_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerMoved(transform.document_to_egui(end))],
+    );
+    assert!(end_drag_actions.is_empty(), "unexpected drag actions: {end_drag_actions:?}");
+
+    let release_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![primary_button(transform.document_to_egui(end), false)],
+    );
+    let [EditorAction::Command(add_batch)] = release_actions.as_slice() else {
+      panic!("expected the rectangle add on release, got {release_actions:?}");
+    };
+    assert!(matches!(
+      add_batch.commands(),
+      [DocumentCommand::AddElement {
+        element: Element {
+          payload: ElementPayload::Rectangle(RectanglePayload { start_px, end_px, .. }),
+          ..
+        },
+      }] if *start_px == start && *end_px == end
+    ));
+  }
+
+  #[test]
+  fn clicking_the_active_toolbar_tool_preserves_text_editing() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController {
+      tool: EditorTool::Text,
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(380.0, 20.0) },
+        buffer: "draft".to_owned(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    let button_center = controller.tool_button_rects[EditorTool::Text.index()].unwrap().center();
+
+    let press_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerMoved(button_center), primary_button(button_center, true)],
+    );
+    assert!(press_actions.is_empty());
+    let release_actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![primary_button(button_center, false)],
+    );
+    assert!(release_actions.is_empty());
+
+    assert_eq!(controller.tool, EditorTool::Text);
+    assert!(matches!(
+      controller.text_editing.as_ref(),
+      Some(TextEditing { target: TextTarget::NewText { .. }, buffer, .. }) if buffer == "draft"
+    ));
+  }
+
+  #[test]
+  fn inline_editor_internal_press_does_not_commit_or_start_canvas_operation() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController {
+      tool: EditorTool::Rectangle,
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(20.0, 20.0) },
+        buffer: "draft".to_owned(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    let transform = CanvasTransform::fit(
+      document.canvas_size_px,
+      Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 400.0)),
+    )
+    .unwrap();
+    let press = transform.document_to_egui(PointPx::new(30.0, 30.0));
+
+    let actions = run_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::PointerMoved(press), primary_button(press, true)],
+    );
+
+    assert!(actions.is_empty());
+    assert!(controller.interaction.is_none());
+    assert!(matches!(
+      controller.text_editing.as_ref(),
+      Some(TextEditing { target: TextTarget::NewText { .. }, buffer, .. }) if buffer == "draft"
+    ));
   }
 }
