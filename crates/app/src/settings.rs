@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use common::ColorRgba;
 
+use crate::editor::EditorTool;
+
 const SETTINGS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +25,8 @@ pub struct Settings {
   #[serde(default = "default_global_color")]
   pub global_color: ColorRgba,
   pub tool_styles: ToolDefaultStyles,
+  #[serde(default = "default_tab_order")]
+  pub tab_order: Vec<EditorTool>,
 }
 
 impl Default for Settings {
@@ -35,12 +39,17 @@ impl Default for Settings {
       copy_image_after_save: true,
       global_color: default_global_color(),
       tool_styles: ToolDefaultStyles::default(),
+      tab_order: default_tab_order(),
     }
   }
 }
 
 fn default_global_color() -> ColorRgba {
   ColorRgba::RED
+}
+
+fn default_tab_order() -> Vec<EditorTool> {
+  vec![EditorTool::Rectangle, EditorTool::Arrow]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -203,6 +212,7 @@ mod tests {
       settings.tool_styles.sequence,
       ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
     );
+    assert_eq!(settings.tab_order, vec![EditorTool::Rectangle, EditorTool::Arrow]);
   }
 
   #[test]
@@ -224,6 +234,36 @@ mod tests {
   #[test]
   fn missing_settings_use_defaults() {
     assert_eq!(Settings::load_or_default(&temp_path()).unwrap(), Settings::default());
+  }
+
+  #[test]
+  fn tab_order_round_trips_and_legacy_files_fill_the_default_order() {
+    let path = temp_path();
+    let settings = Settings {
+      tab_order: vec![EditorTool::Text, EditorTool::Arrow, EditorTool::Select],
+      ..Settings::default()
+    };
+    settings.save(&path).unwrap();
+    let loaded = Settings::load_or_default(&path).unwrap();
+    assert_eq!(loaded.tab_order, settings.tab_order);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+
+    let legacy_path = temp_path();
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    fs::write(
+      &legacy_path,
+      br#"{
+  "version": 1,
+  "global_hotkey": "F2",
+  "include_cursor": true,
+  "launch_at_login": false,
+  "copy_image_after_save": false
+}"#,
+    )
+    .unwrap();
+    let loaded = Settings::load_or_default(&legacy_path).unwrap();
+    assert_eq!(loaded.tab_order, vec![EditorTool::Rectangle, EditorTool::Arrow]);
+    fs::remove_dir_all(legacy_path.parent().unwrap()).unwrap();
   }
 
   #[test]

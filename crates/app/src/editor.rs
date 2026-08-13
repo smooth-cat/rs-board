@@ -8,10 +8,11 @@ use common::{
   minimum_geometry_extent, rectangle_label_layout, snap_rectangle_label_layout,
 };
 use eframe::egui::{
-  self, Align2, Color32, CursorIcon, Event, FontId, Id, ImeEvent, Key, KeyboardShortcut, Modifiers,
-  Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle, TouchDeviceId, TouchId,
-  TouchPhase,
+  self, Align2, Color32, CursorIcon, Event, FocusDirection, FontId, Id, ImeEvent, Key,
+  KeyboardShortcut, Modifiers, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
+  TouchDeviceId, TouchId, TouchPhase,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::renderer::{
   layout_egui_text, paint_arrow_without_label_text, paint_document, paint_element,
@@ -37,7 +38,8 @@ const HIT_TOLERANCE_PT: f32 = 7.0;
 const MINIMUM_DISTANCE_ROUNDING_FACTOR: f32 = 4.0;
 const RELEASE_TAPER_WIDTH_FACTOR: f32 = 3.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EditorTool {
   Select,
   Rectangle,
@@ -51,7 +53,7 @@ impl EditorTool {
   pub const ALL: [Self; 6] =
     [Self::Select, Self::Rectangle, Self::Arrow, Self::Text, Self::Stroke, Self::Sequence];
 
-  fn label(self) -> &'static str {
+  pub fn label(self) -> &'static str {
     match self {
       Self::Select => "选择",
       Self::Rectangle => "方框",
@@ -321,6 +323,12 @@ enum ShortcutAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSwitchDirection {
+  Next,
+  Previous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextEditorCompletion {
   None,
   FocusLost,
@@ -347,6 +355,8 @@ pub struct EditorController {
   queued_stylus_events: Vec<StylusEvent>,
   active_stylus_id: Option<StylusId>,
   pending_stroke_points: Vec<StrokePoint>,
+  queued_tool_switch: Option<ToolSwitchDirection>,
+  tab_order: Vec<EditorTool>,
 }
 
 impl Default for EditorController {
@@ -383,11 +393,17 @@ impl EditorController {
       queued_stylus_events: Vec::new(),
       active_stylus_id: None,
       pending_stroke_points: Vec::new(),
+      queued_tool_switch: None,
+      tab_order: vec![EditorTool::Rectangle, EditorTool::Arrow],
     }
   }
 
   pub fn active_tool(&self) -> EditorTool {
     self.tool
+  }
+
+  pub fn set_tab_order(&mut self, tab_order: Vec<EditorTool>) {
+    self.tab_order = tab_order;
   }
 
   pub fn set_active_tool(&mut self, tool: EditorTool) {
@@ -409,6 +425,38 @@ impl EditorController {
   pub(crate) fn capture_stylus_input_state(&mut self, input: &mut egui::InputState) {
     self.capture_stylus_events(&mut input.events);
     input.raw.events.retain(|event| !is_stylus_event(event));
+  }
+
+  pub(crate) fn capture_tab_switch_input_state(&mut self, ctx: &egui::Context) {
+    let direction = ctx.input_mut(|input| {
+      let mut direction = None;
+      input.events.retain(|event| {
+        let Event::Key { key: Key::Tab, pressed: true, modifiers, .. } = event else {
+          return true;
+        };
+        let switch_direction = if modifiers.is_none() {
+          Some(ToolSwitchDirection::Next)
+        } else if modifiers.shift_only() {
+          Some(ToolSwitchDirection::Previous)
+        } else {
+          return true;
+        };
+        direction = switch_direction;
+        false
+      });
+      input.raw.events.retain(|event| {
+        !matches!(
+          event,
+          Event::Key { key: Key::Tab, pressed: true, modifiers, .. }
+            if modifiers.is_none() || modifiers.shift_only()
+        )
+      });
+      direction
+    });
+    if let Some(direction) = direction {
+      self.queued_tool_switch = Some(direction);
+      ctx.memory_mut(|memory| memory.move_focus(FocusDirection::None));
+    }
   }
 
   fn capture_stylus_events(&mut self, events: &mut Vec<Event>) {
@@ -596,6 +644,15 @@ impl EditorController {
     document: &BoardDocument,
     actions: &mut Vec<EditorAction>,
   ) {
+    if let Some(direction) = self.queued_tool_switch.take() {
+      let tool = match direction {
+        ToolSwitchDirection::Next => self.tab_order_next(),
+        ToolSwitchDirection::Previous => self.tab_order_previous(),
+      };
+      if let Some(tool) = tool {
+        self.switch_tool(tool, document, actions);
+      }
+    }
     let text_editing = self.text_editing.is_some();
     let shortcut = ctx.input_mut(|input| {
       let position = input.events.iter().position(|event| {
@@ -663,6 +720,22 @@ impl EditorController {
           self.last_pointer_document.unwrap_or_else(|| document.canvas_size_px.bounds().center());
         actions.push(EditorAction::Paste { position });
       }
+    }
+  }
+
+  fn tab_order_next(&self) -> Option<EditorTool> {
+    match self.tab_order.iter().position(|tool| *tool == self.tool) {
+      Some(index) => Some(self.tab_order[(index + 1) % self.tab_order.len()]),
+      None => self.tab_order.first().copied(),
+    }
+  }
+
+  fn tab_order_previous(&self) -> Option<EditorTool> {
+    match self.tab_order.iter().position(|tool| *tool == self.tool) {
+      Some(index) => {
+        Some(self.tab_order[(index + self.tab_order.len() - 1) % self.tab_order.len()])
+      }
+      None => self.tab_order.last().copied(),
     }
   }
 
@@ -3851,6 +3924,33 @@ mod tests {
     actions.expect("editor frame ran")
   }
 
+  fn tab_event(modifiers: Modifiers) -> Event {
+    Event::Key {
+      key: Key::Tab,
+      physical_key: Some(Key::Tab),
+      pressed: true,
+      repeat: false,
+      modifiers,
+    }
+  }
+
+  fn run_tab_editor_frame(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    events: Vec<Event>,
+  ) -> Vec<EditorAction> {
+    let mut actions = None;
+    context
+      .run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
+        controller.capture_tab_switch_input_state(ui.ctx());
+        actions = Some(controller.show(ui, document, history, None));
+      })
+      .drop_without_applying_deltas();
+    actions.expect("editor frame ran")
+  }
+
   fn touch_event(phase: TouchPhase, position: Pos2, pressure: f32) -> Event {
     Event::Touch {
       device_id: TouchDeviceId(7),
@@ -6894,6 +6994,185 @@ mod tests {
     assert!(controller.active_stylus_id.is_none());
     assert!(controller.queued_stylus_events.is_empty());
     assert!(controller.pending_stroke_points.is_empty());
+  }
+
+  #[test]
+  fn tab_and_shift_tab_cycle_through_all_tools() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+
+    let mut controller = EditorController::new(EditorTool::Select);
+    controller.set_tab_order(EditorTool::ALL.to_vec());
+    for expected in [EditorTool::Rectangle, EditorTool::Arrow, EditorTool::Text, EditorTool::Stroke]
+    {
+      run_tab_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![tab_event(Modifiers::NONE)],
+      );
+      assert_eq!(controller.active_tool(), expected);
+    }
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Sequence);
+
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Select);
+
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::SHIFT)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Sequence);
+
+    for expected in [EditorTool::Stroke, EditorTool::Text, EditorTool::Arrow, EditorTool::Rectangle]
+    {
+      run_tab_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![tab_event(Modifiers::SHIFT)],
+      );
+      assert_eq!(controller.active_tool(), expected);
+    }
+  }
+
+  #[test]
+  fn tab_capture_ignores_modifier_combinations_and_key_releases() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController::new(EditorTool::Select);
+    let events = vec![
+      tab_event(Modifiers::COMMAND),
+      tab_event(Modifiers::CTRL),
+      Event::Key {
+        key: Key::Tab,
+        physical_key: Some(Key::Tab),
+        pressed: false,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+      },
+    ];
+    run_tab_editor_frame(&context, &mut controller, &document, &history, events);
+    assert_eq!(controller.active_tool(), EditorTool::Select);
+    assert_eq!(controller.queued_tool_switch, None);
+  }
+
+  #[test]
+  fn tab_switching_does_not_move_keyboard_focus() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController::new(EditorTool::Select);
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Rectangle);
+    assert!(context.memory(|memory| memory.focused()).is_none());
+  }
+
+  #[test]
+  fn tab_cycles_follow_the_configured_tab_order() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController::new(EditorTool::Select);
+    controller.set_tab_order(vec![EditorTool::Text, EditorTool::Sequence, EditorTool::Arrow]);
+
+    for expected in [EditorTool::Text, EditorTool::Sequence, EditorTool::Arrow, EditorTool::Text] {
+      run_tab_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![tab_event(Modifiers::NONE)],
+      );
+      assert_eq!(controller.active_tool(), expected);
+    }
+    for expected in [EditorTool::Arrow, EditorTool::Sequence, EditorTool::Text] {
+      run_tab_editor_frame(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![tab_event(Modifiers::SHIFT)],
+      );
+      assert_eq!(controller.active_tool(), expected);
+    }
+  }
+
+  #[test]
+  fn tab_does_nothing_with_an_empty_tab_order() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController::new(EditorTool::Stroke);
+    controller.set_tab_order(Vec::new());
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Stroke);
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::SHIFT)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Stroke);
+  }
+
+  #[test]
+  fn tab_jumps_to_the_edge_when_the_current_tool_is_missing_from_the_order() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController::new(EditorTool::Stroke);
+    controller.set_tab_order(vec![EditorTool::Text, EditorTool::Rectangle]);
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Text);
+    controller.set_active_tool(EditorTool::Stroke);
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::SHIFT)],
+    );
+    assert_eq!(controller.active_tool(), EditorTool::Rectangle);
   }
 
   #[test]

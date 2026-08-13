@@ -1153,11 +1153,15 @@ impl RsBoardApp {
       prepared_background: background.prepared,
       native_background: background.native,
       background_texture: texture,
-      editor: EditorController::with_styles(
-        self.last_tool,
-        editor_styles_from_settings(&self.settings),
-        self.settings.global_color,
-      ),
+      editor: {
+        let mut editor = EditorController::with_styles(
+          self.last_tool,
+          editor_styles_from_settings(&self.settings),
+          self.settings.global_color,
+        );
+        editor.set_tab_order(self.settings.tab_order.clone());
+        editor
+      },
     })
   }
 
@@ -2281,6 +2285,7 @@ impl RsBoardApp {
     let actions = if let Some(session) = self.session.as_mut() {
       if self.phase == Phase::Editing {
         root_ui.input_mut(|input| session.editor.capture_stylus_input_state(input));
+        session.editor.capture_tab_switch_input_state(root_ui.ctx());
       }
       let mut actions = Vec::new();
       let background_fill =
@@ -2849,6 +2854,33 @@ impl RsBoardApp {
             &mut self.settings_draft.tool_styles,
           );
           ui.separator();
+          ui.label("Tab 切换工具顺序");
+          let mut remove_index = None;
+          for index in 0..self.settings_draft.tab_order.len() {
+            let tool = self.settings_draft.tab_order[index];
+            ui.horizontal(|ui| {
+              ui.label(format!("{}. {}", index + 1, tool.label()));
+              if ui.small_button("✕").on_hover_text("从列表移除").clicked() {
+                remove_index = Some(index);
+              }
+            });
+          }
+          if let Some(index) = remove_index {
+            self.settings_draft.tab_order.remove(index);
+          }
+          ui.horizontal_wrapped(|ui| {
+            for tool in EditorTool::ALL {
+              let already_added = self.settings_draft.tab_order.contains(&tool);
+              if ui
+                .add_enabled(!already_added, egui::Button::new(tool.label()))
+                .on_hover_text("加入 Tab 切换列表")
+                .clicked()
+              {
+                self.settings_draft.tab_order.push(tool);
+              }
+            }
+          });
+          ui.separator();
           if ui
             .add_enabled(
               self.phase == Phase::Idle,
@@ -3065,6 +3097,9 @@ impl RsBoardApp {
     self.settings = next.clone();
     self.settings_draft = next;
     self.show_settings = false;
+    if let Some(session) = self.session.as_mut() {
+      session.editor.set_tab_order(self.settings.tab_order.clone());
+    }
     self.set_toast("设置已保存");
   }
 
