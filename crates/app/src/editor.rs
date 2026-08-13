@@ -2891,7 +2891,7 @@ fn text_width_to_canvas_edge(anchor_px: PointPx, canvas_size_px: SizePx) -> f32 
   let canvas_width_px = canvas_size_px.width_px as f32;
   (canvas_width_px - anchor_px.x_px).clamp(1.0, canvas_width_px)
 }
-
+#[allow(dead_code)]
 fn inline_text_geometry(
   editing: &TextEditing,
   document: &BoardDocument,

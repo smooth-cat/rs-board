@@ -1,0 +1,1896 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src 'unsafe-inline' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>方框标签碰撞逻辑</title>
+<style>:root{color-scheme:light dark;background:light-dark(rgb(255 255 255), rgb(24 24 24))}html,body{margin:0}body{box-sizing:border-box;padding:1rem;background:inherit}iframe{display:block;width:100%;height:calc(100vh - 2rem);margin:0 auto;border:0}</style>
+</head>
+<body>
+<iframe sandbox="allow-scripts" referrerpolicy="no-referrer" title="方框标签碰撞逻辑" srcdoc="&lt;!doctype html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+&lt;meta charset=&quot;utf-8&quot;&gt;
+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+&lt;meta name=&quot;referrer&quot; content=&quot;no-referrer&quot;&gt;
+&lt;meta http-equiv=&quot;Content-Security-Policy&quot; content=&quot;default-src &#x27;none&#x27;; script-src &#x27;unsafe-inline&#x27; &#x27;unsafe-eval&#x27; &#x27;wasm-unsafe-eval&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; style-src &#x27;unsafe-inline&#x27; blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; img-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; font-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; media-src blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://esm.sh https://fonts.bunny.net https://fonts.googleapis.com https://fonts.gstatic.com https://unpkg.com; worker-src blob:; connect-src blob: data:; frame-src &#x27;none&#x27;; object-src &#x27;none&#x27;; base-uri &#x27;none&#x27;; form-action &#x27;none&#x27;&quot;&gt;
+&lt;title&gt;方框标签碰撞逻辑&lt;/title&gt;
+&lt;style&gt;:root {
+  color-scheme: light dark;
+  background-color: var(
+    --background,
+    var(--color-background-primary, light-dark(rgb(255 255 255), rgb(24 24 24)))
+  ) !important;
+
+  /* Agent-facing contract; keep in sync with SKILL.md. */
+  --background: var(
+    --color-background-primary,
+    light-dark(rgb(255 255 255), rgb(24 24 24))
+  );
+  --foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --card: color-mix(in oklab, var(--foreground) 5%, var(--background));
+  --card-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --popover: var(
+    --color-background-secondary,
+    light-dark(rgb(255 255 255), rgb(45 45 45))
+  );
+  --popover-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --primary: var(
+    --color-text-info,
+    light-dark(rgb(51 156 255), rgb(131 195 255))
+  );
+  --primary-foreground: var(
+    --color-text-inverse,
+    light-dark(rgb(255 255 255), rgb(13 13 13))
+  );
+  --secondary: var(
+    --color-background-secondary,
+    light-dark(rgb(255 255 255 / 96%), rgb(54 54 54 / 96%))
+  );
+  --secondary-foreground: var(
+    --color-text-primary,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: var(
+    --color-text-secondary,
+    light-dark(rgb(26 28 31 / 49.4%), rgb(255 255 255 / 49.8%))
+  );
+  --accent: var(
+    --color-background-info,
+    light-dark(rgb(229 242 255), rgb(13 39 63))
+  );
+  --accent-foreground: var(
+    --color-text-info,
+    light-dark(rgb(51 156 255), rgb(131 195 255))
+  );
+  --destructive: var(
+    --color-text-warning,
+    light-dark(rgb(226 85 7), rgb(255 133 73))
+  );
+  --border: var(
+    --color-border-secondary,
+    light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%))
+  );
+  --input: var(
+    --color-border-primary,
+    light-dark(
+      rgb(26 28 31 / 11.8%),
+      color-mix(in oklab, rgb(0 0 0) 10%, transparent)
+    )
+  );
+  --ring: var(
+    --color-ring-primary,
+    light-dark(rgb(51 156 255), rgb(131 195 255 / 76%))
+  );
+  --font-size-base: var(--font-text-md-size, 14px);
+  --blue: light-dark(rgb(51 156 255), rgb(51 156 255));
+  --orange: light-dark(rgb(226 85 7), rgb(251 106 34));
+  --green: light-dark(rgb(0 162 64), rgb(64 201 119));
+  --red: light-dark(rgb(224 46 42), rgb(255 103 100));
+  --purple: light-dark(rgb(146 79 247), rgb(173 123 249));
+  --yellow: light-dark(rgb(255 195 0), rgb(255 210 64));
+  --viz-series-1: var(--primary);
+  --viz-series-2: light-dark(rgb(243 136 59), rgb(245 154 86));
+  --viz-series-3: light-dark(rgb(93 201 119), rgb(116 213 139));
+  --viz-series-4: light-dark(rgb(235 119 177), rgb(240 143 192));
+  --viz-series-5: light-dark(rgb(155 121 236), rgb(170 145 239));
+  --viz-series-6: light-dark(rgb(58 185 177), rgb(90 203 194));
+
+  /* Internal implementation variables; not part of the agent contract. */
+  --font-sans: -apple-system, system-ui, &quot;Segoe UI&quot;, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, Menlo, Consolas, &quot;Liberation Mono&quot;,
+    monospace;
+  --font-size-normal: max(11px, var(--font-size-base));
+  --font-size-tooltip: calc(var(--font-size-base) - 1px);
+  --font-size-small: max(11px, calc(var(--font-size-base) - 2px));
+  --font-size-h1: calc(var(--font-size-normal) * 1.7142857143);
+  --font-size-h2: calc(var(--font-size-normal) * 1.4285714286);
+  --font-size-h3: calc(var(--font-size-normal) * 1.2857142857);
+  --font-weight-normal: 430;
+  --font-weight-medium: 500;
+  --line-height-normal: calc(var(--font-size-normal) * 1.5);
+  --line-height-tooltip: calc(var(--font-size-tooltip) * 1.4285714286);
+  --line-height-small: calc(var(--font-size-small) + 4px);
+  --radius: var(--border-radius-lg, 12.5px);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-2xl: calc(var(--radius) * 1.6);
+  --radius-full: 9999px;
+  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 8%);
+  --checkmark-image: url(&quot;data:image/svg+xml,%3Csvg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 17 17&#x27;%3E%3Cpath d=&#x27;M12.8961 3.64101C13.1297 3.41418 13.4984 3.37523 13.7779 3.56581C14.0571 3.75635 14.1554 4.11331 14.0299 4.41347L13.9615 4.53847L7.71151 13.7045C7.59411 13.8767 7.4063 13.9877 7.19881 14.0072C6.99136 14.0267 6.78564 13.9533 6.63826 13.806L2.88826 10.056L2.79842 9.9457C2.6192 9.67407 2.64927 9.30496 2.88826 9.06581C3.12738 8.82669 3.49647 8.79676 3.76815 8.97597L3.8785 9.06581L7.03084 12.2182L12.8053 3.74941L12.8961 3.64101Z&#x27;/%3E%3C/svg%3E&quot;);
+
+  /* Legacy aliases; not part of the current agent contract. */
+  --viz-bg: transparent;
+  --viz-panel: var(--card);
+  --viz-border: var(--border);
+  --viz-text: var(--foreground);
+  --viz-muted: var(--muted-foreground);
+  --viz-accent: var(--primary);
+  --viz-accent-text: var(--primary-foreground);
+  --viz-accent-bg: var(--accent);
+  --viz-font-size: var(--font-size-base);
+  --viz-warning: var(--destructive);
+}
+
+:root[data-theme=&quot;light&quot;] {
+  color-scheme: light;
+}
+
+:root[data-theme=&quot;dark&quot;] {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html &gt; body {
+  /* Preserve MCP aliases for older inline renderers without creating :root cycles. */
+  --color-background-primary: var(
+    --background,
+    light-dark(rgb(255 255 255), rgb(24 24 24))
+  );
+  --color-text-primary: var(
+    --foreground,
+    light-dark(rgb(26 28 31), rgb(255 255 255))
+  );
+  --color-border-secondary: var(
+    --border,
+    light-dark(rgb(26 28 31 / 8%), rgb(255 255 255 / 8.2%))
+  );
+
+  margin: 0;
+  padding: 5px;
+  color: var(--foreground);
+  background: transparent !important;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-normal);
+  font-weight: var(--font-weight-normal);
+  line-height: var(--line-height-normal);
+}
+
+a {
+  color: color-mix(in srgb, var(--viz-accent) 80%, var(--viz-text) 20%);
+  cursor: pointer;
+  font-weight: var(--font-weight-medium, 500);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:is(:hover, :focus-visible) {
+  text-decoration-line: underline;
+  text-decoration-style: dashed;
+  text-decoration-thickness: 0.5px;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-block: 0;
+}
+
+h1 {
+  font-size: var(--font-size-h1);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h2 {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+h3,
+h4,
+h5,
+h6 {
+  font-size: var(--font-size-h3);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.3;
+}
+
+b,
+strong,
+th {
+  font-weight: var(--font-weight-medium);
+}
+
+code:not(pre code) {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  word-break: break-word;
+}
+
+.table-responsive {
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  color: var(--foreground);
+  font: inherit;
+  text-align: start;
+}
+
+.table :is(th, td) {
+  padding-block: 10px;
+  padding-inline: 0 24px;
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--border);
+  text-align: start;
+  vertical-align: top;
+}
+
+.table-responsive &gt; .table :is(th, td) {
+  overflow-wrap: break-word;
+}
+
+.table :is(th, td):last-child {
+  padding-inline-end: 0;
+}
+
+.table :is(caption, thead th) {
+  font-weight: 600;
+}
+
+.table thead th {
+  padding-block: 8px;
+  border-bottom-color: color-mix(in srgb, var(--foreground) 16%, transparent);
+}
+
+.table tbody tr:last-child :is(th, td) {
+  border-bottom: 0;
+}
+
+.table.table-sm :is(th, td) {
+  padding-block: 6px;
+}
+
+.table.table-sm :is(th, td):not(:last-child) {
+  padding-inline-end: 16px;
+}
+
+.table :is(.text-end, [align=&quot;right&quot;]) {
+  text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :is(.text-center, [align=&quot;center&quot;]) {
+  text-align: center;
+}
+
+.table .text-nowrap {
+  white-space: nowrap;
+}
+
+#widget {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  padding: 0;
+  background: transparent !important;
+}
+
+.card {
+  min-width: 0;
+  padding: 12px;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  border-radius: var(--radius-2xl);
+  corner-shape: superellipse(1.5);
+  color: var(--card-foreground);
+  background: var(--card);
+}
+
+#widget &gt; :not(.card) {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 50;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: min(
+    20rem,
+    var(--tooltip-available-width, calc(100vw - 10px)),
+    calc(100vw - 10px)
+  );
+  max-height: min(
+    var(--tooltip-available-height, calc(100vh - 10px)),
+    calc(100vh - 10px)
+  );
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--popover-foreground);
+  background: var(--popover);
+  box-shadow: none;
+  font-size: var(--font-size-tooltip);
+  line-height: var(--line-height-tooltip);
+  overflow-wrap: break-word;
+  white-space: normal;
+  pointer-events: none;
+  user-select: none;
+}
+
+.viz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(max(180px, 24%), 1fr));
+  gap: 10px;
+}
+
+.viz-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.viz-stat-value {
+  font-size: var(--font-size-h2);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.25;
+}
+
+.viz-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.viz-badge {
+  padding: 3px 8px;
+  border-radius: var(--radius-full);
+  color: var(--accent-foreground);
+  background: var(--accent);
+  font-weight: var(--font-weight-medium);
+}
+
+small,
+.text-small,
+.viz-badge {
+  font-size: var(--font-size-small);
+  line-height: var(--line-height-small);
+}
+
+.text-muted {
+  color: var(--muted-foreground);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.viz-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.viz-controls &gt; .form-label {
+  display: grid;
+  min-width: min(100%, 260px);
+  flex: 1 1 280px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin-bottom: 0;
+}
+
+.viz-controls &gt; .form-label &gt; :is(.form-control, .form-range, .form-select) {
+  grid-column: 1 / -1;
+}
+
+.btn,
+.form-check-input,
+.form-control,
+.form-range,
+.form-select {
+  font: inherit;
+}
+
+.btn {
+  appearance: button;
+  display: inline-flex;
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0 8px;
+  -webkit-app-region: no-drag;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: var(--cursor-interaction, pointer);
+  text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.btn:is(.btn-block, .viz-tile) {
+  inline-size: 100%;
+}
+
+.btn.viz-tile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+a.btn {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.btn:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn-primary {
+  border-color: transparent;
+  color: var(--primary-foreground);
+  background: var(--foreground);
+  background-clip: padding-box;
+}
+
+.btn-primary .text-muted {
+  color: color-mix(in srgb, var(--primary-foreground) 50%, transparent);
+}
+
+.btn-primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 80%, transparent);
+  background-clip: padding-box;
+}
+
+.btn-ghost {
+  border-color: transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+.btn-ghost:not(:disabled):hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+[data-lucide] {
+  stroke-width: 1.6;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--foreground);
+}
+
+.form-control {
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background: var(--secondary);
+}
+
+.form-control::placeholder {
+  color: var(--muted-foreground);
+}
+
+.form-control[type=&quot;file&quot;] {
+  padding: 0;
+  overflow: hidden;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control[type=&quot;file&quot;]::file-selector-button {
+  min-height: 26px;
+  margin-right: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid var(--input);
+  color: var(--secondary-foreground);
+  background: var(--secondary);
+  cursor: inherit;
+  font: inherit;
+}
+
+.form-control[type=&quot;file&quot;]:not(:disabled):hover::file-selector-button {
+  background: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-control-color[type=&quot;color&quot;] {
+  width: 40px;
+  height: 28px;
+  padding: 3px;
+  cursor: var(--cursor-interaction, pointer);
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.form-control-color[type=&quot;color&quot;]::-webkit-color-swatch {
+  border: 0;
+  border-radius: calc(var(--radius-lg) - 4px);
+  corner-shape: superellipse(1.5);
+}
+
+textarea.form-control {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.form-control:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-control:disabled,
+.form-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.form-select {
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 28px;
+  margin: 0;
+  padding: 0 32px 0 8px;
+  outline: none;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  corner-shape: superellipse(1.5);
+  color: var(--foreground);
+  background-color: var(--secondary);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 10px) 50%;
+  background-repeat: no-repeat;
+  background-size: 4px 4px;
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-select:not(:disabled):hover {
+  background-color: color-mix(in srgb, var(--foreground) 6%, var(--secondary));
+}
+
+.form-select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-check {
+  display: flex;
+  min-height: 20px;
+  align-items: center;
+  gap: 6px;
+}
+
+.form-check-input {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--input);
+  color: var(--primary-foreground);
+  background-color: transparent;
+  cursor: var(--cursor-interaction, default);
+  transition:
+    background-color 150ms,
+    border-color 150ms,
+    box-shadow 150ms;
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;] {
+  border-color: var(--input);
+  border-radius: var(--radius-sm);
+  corner-shape: superellipse(1.5);
+  background-color: var(--secondary);
+  box-shadow: var(--shadow-sm);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input:not(:disabled):not(:checked):hover {
+  background-color: var(--card);
+}
+
+.form-check:not(.form-switch) .form-check-input[type=&quot;checkbox&quot;]:checked {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.form-check:not(.form-switch)
+  .form-check-input[type=&quot;checkbox&quot;]:checked::before {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--primary-foreground);
+  content: &quot;&quot;;
+  mask: var(--checkmark-image) center / 12px 12px no-repeat;
+}
+
+.form-check-input[type=&quot;radio&quot;] {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+}
+
+.form-check-input[type=&quot;radio&quot;]:checked {
+  border: 2px solid var(--primary);
+  background:
+    radial-gradient(circle, var(--primary-foreground) 0 2.5px, transparent 3px),
+    var(--primary);
+}
+
+.form-check:not(.form-switch) .form-check-input:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled {
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.form-check:not(.form-switch) .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+}
+
+.form-switch .form-check-input:disabled,
+.form-switch .form-check-input:disabled + .form-check-label {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-check-label {
+  color: var(--foreground);
+  cursor: var(--cursor-interaction, default);
+}
+
+.form-switch .form-check-input {
+  position: relative;
+  width: 32px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-full);
+  background: var(--muted);
+  box-shadow: none;
+  transition: background-color 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 16px;
+  height: 16px;
+  box-sizing: border-box;
+  border: 1px solid light-dark(var(--primary-foreground), var(--foreground));
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+  box-shadow: var(--shadow-sm);
+  content: &quot;&quot;;
+  transform: translate(2px, -50%);
+  transition: transform 200ms cubic-bezier(0, 0, 0.2, 1);
+}
+
+.form-switch .form-check-input:checked {
+  background: var(--primary);
+}
+
+.form-switch .form-check-input:checked::before {
+  transform: translate(14px, -50%);
+}
+
+.form-switch .form-check-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--ring);
+}
+
+.form-range {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 28px;
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  outline: none;
+  border: 0;
+  accent-color: var(--primary);
+  background: linear-gradient(
+      color-mix(in srgb, var(--foreground) 7%, transparent),
+      color-mix(in srgb, var(--foreground) 7%, transparent)
+    )
+    center / 100% 2px no-repeat;
+}
+
+.form-range::-webkit-slider-runnable-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-webkit-slider-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range::-moz-range-track {
+  height: 28px;
+  background: transparent;
+}
+
+.form-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: light-dark(var(--primary-foreground), var(--foreground));
+}
+
+.form-range:focus-visible::-moz-range-thumb {
+  border-color: var(--ring);
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+
+.form-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.btn:not(.btn-primary, .viz-tile):is(
+    [aria-pressed=&quot;true&quot;],
+    [aria-selected=&quot;true&quot;],
+    .is-selected
+  ) {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+.btn.viz-tile:is([aria-pressed=&quot;true&quot;], [aria-selected=&quot;true&quot;], .is-selected) {
+  border-color: var(--primary);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+#widget &gt; svg {
+  width: 100%;
+}
+
+/* Model-authored chart rules can otherwise stretch icons after these styles load. */
+svg.lucide {
+  display: block;
+  width: 16px !important;
+  height: 16px !important;
+  flex: none;
+  margin: 0 !important;
+  stroke-width: 1.6;
+}
+
+.text-warning,
+.text-destructive {
+  color: var(--destructive);
+}
+
+html&gt;body{padding:0}&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;div id=&quot;rectangle-label-collision&quot;&gt;
+  &lt;div class=&quot;cv-heading&quot;&gt;
+    &lt;div&gt;
+      &lt;h2&gt;方框标签 · 当前避让逻辑&lt;/h2&gt;
+      &lt;div class=&quot;text-small text-muted&quot; id=&quot;cv-scope&quot;&gt;自动放置只发生在新建方框或隐藏标签重新出现时&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;viz-row&quot; role=&quot;tablist&quot; aria-label=&quot;碰撞逻辑视图&quot;&gt;
+      &lt;button class=&quot;btn btn-primary&quot; type=&quot;button&quot; role=&quot;tab&quot; aria-selected=&quot;true&quot; data-mode=&quot;auto&quot;&gt;
+        &lt;i data-lucide=&quot;scan&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;
+        自动放置
+      &lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; role=&quot;tab&quot; aria-selected=&quot;false&quot; data-mode=&quot;transform&quot;&gt;
+        &lt;i data-lucide=&quot;move&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;
+        移动 / 缩放
+      &lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; role=&quot;tab&quot; aria-selected=&quot;false&quot; data-mode=&quot;manual&quot;&gt;
+        &lt;i data-lucide=&quot;mouse-pointer-2&quot; aria-hidden=&quot;true&quot;&gt;&lt;/i&gt;
+        手动拖标签
+      &lt;/button&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;cv-controls&quot; data-controls=&quot;auto&quot;&gt;
+    &lt;div class=&quot;viz-controls&quot; aria-label=&quot;自动放置场景&quot;&gt;
+      &lt;button class=&quot;btn btn-primary&quot; type=&quot;button&quot; aria-pressed=&quot;true&quot; data-auto=&quot;open&quot;&gt;无遮挡&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-auto=&quot;top-edge&quot;&gt;上方越界&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-auto=&quot;top-blocked&quot;&gt;上方被占&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-auto=&quot;two-blocked&quot;&gt;上下被占&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-auto=&quot;three-blocked&quot;&gt;三面被占&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-auto=&quot;all-blocked&quot;&gt;四面被占&lt;/button&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;cv-controls&quot; data-controls=&quot;transform&quot; hidden&gt;
+    &lt;div class=&quot;viz-controls&quot; aria-label=&quot;移动和缩放场景&quot;&gt;
+      &lt;button class=&quot;btn btn-primary&quot; type=&quot;button&quot; aria-pressed=&quot;true&quot; data-transform=&quot;top&quot;&gt;靠近上边缘&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-transform=&quot;right&quot;&gt;靠近右边缘&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-transform=&quot;obstacle&quot;&gt;撞到其他方框&lt;/button&gt;
+      &lt;button class=&quot;btn&quot; type=&quot;button&quot; aria-pressed=&quot;false&quot; data-transform=&quot;wrap&quot;&gt;缩窄后换行&lt;/button&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;cv-controls&quot; data-controls=&quot;manual&quot; hidden&gt;
+    &lt;div class=&quot;viz-controls cv-range-controls&quot;&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;cv-manual-x&quot;&gt;
+        目标点 X：&lt;span id=&quot;cv-manual-x-value&quot;&gt;84%&lt;/span&gt;
+        &lt;input class=&quot;form-range&quot; id=&quot;cv-manual-x&quot; type=&quot;range&quot; min=&quot;0&quot; max=&quot;100&quot; value=&quot;84&quot;&gt;
+      &lt;/label&gt;
+      &lt;label class=&quot;form-label&quot; for=&quot;cv-manual-y&quot;&gt;
+        目标点 Y：&lt;span id=&quot;cv-manual-y-value&quot;&gt;50%&lt;/span&gt;
+        &lt;input class=&quot;form-range&quot; id=&quot;cv-manual-y&quot; type=&quot;range&quot; min=&quot;0&quot; max=&quot;100&quot; value=&quot;50&quot;&gt;
+      &lt;/label&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;cv-stage&quot;&gt;
+    &lt;svg id=&quot;cv-diagram&quot; role=&quot;img&quot; aria-labelledby=&quot;cv-diagram-title cv-diagram-desc&quot;&gt;&lt;/svg&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;card&quot; aria-live=&quot;polite&quot;&gt;
+    &lt;div class=&quot;viz-row cv-summary-row&quot;&gt;
+      &lt;span class=&quot;viz-badge&quot; id=&quot;cv-status&quot;&gt;选择：上外&lt;/span&gt;
+      &lt;span id=&quot;cv-summary&quot;&gt;第 1 个候选完整位于画布内且不与其他方框相交，立即采用。&lt;/span&gt;
+    &lt;/div&gt;
+  &lt;/div&gt;
+
+  &lt;div class=&quot;cv-rule&quot; data-rule=&quot;auto&quot;&gt;
+    &lt;span class=&quot;text-small text-muted&quot;&gt;固定检测顺序&lt;/span&gt;
+    &lt;span&gt;&lt;b&gt;1&lt;/b&gt; 上外&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;&lt;b&gt;2&lt;/b&gt; 下外&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;&lt;b&gt;3&lt;/b&gt; 左外&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;&lt;b&gt;4&lt;/b&gt; 右外&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;&lt;b&gt;兜底&lt;/b&gt; 上内&lt;/span&gt;
+  &lt;/div&gt;
+  &lt;div class=&quot;cv-rule&quot; data-rule=&quot;transform&quot; hidden&gt;
+    &lt;span class=&quot;text-small text-muted&quot;&gt;变换后的处理&lt;/span&gt;
+    &lt;span&gt;保留原锚点&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;重算标签尺寸&lt;/span&gt;&lt;span class=&quot;text-muted&quot;&gt;→&lt;/span&gt;
+    &lt;span&gt;仅把越界布局框平移进画布&lt;/span&gt;
+  &lt;/div&gt;
+  &lt;div class=&quot;cv-rule&quot; data-rule=&quot;manual&quot; hidden&gt;
+    &lt;span class=&quot;text-small text-muted&quot;&gt;八条吸附轨道&lt;/span&gt;
+    &lt;span&gt;上外 / 上内&lt;/span&gt;&lt;span&gt;下内 / 下外&lt;/span&gt;
+    &lt;span&gt;左外 / 左内&lt;/span&gt;&lt;span&gt;右内 / 右外&lt;/span&gt;
+    &lt;span class=&quot;text-muted&quot;&gt;选择离目标点最近的一条&lt;/span&gt;
+  &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;style&gt;
+  #rectangle-label-collision {
+    width: 100%;
+    display: grid;
+    gap: 14px;
+  }
+
+  #rectangle-label-collision [hidden] {
+    display: none !important;
+  }
+
+  #rectangle-label-collision .cv-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  #rectangle-label-collision .cv-heading &gt; div:first-child {
+    display: grid;
+    gap: 4px;
+  }
+
+  #rectangle-label-collision .cv-controls {
+    min-width: 0;
+  }
+
+  #rectangle-label-collision .cv-range-controls {
+    align-items: end;
+  }
+
+  #rectangle-label-collision .cv-range-controls &gt; label {
+    flex: 1 1 220px;
+    margin: 0;
+  }
+
+  #rectangle-label-collision .cv-stage {
+    width: 100%;
+    min-width: 0;
+  }
+
+  #rectangle-label-collision #cv-diagram {
+    width: 100%;
+    display: block;
+    overflow: visible;
+    font-family: -apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, sans-serif;
+  }
+
+  #rectangle-label-collision .cv-viewport {
+    fill: color-mix(in srgb, var(--foreground) 2.5%, transparent);
+    stroke: var(--border);
+    stroke-width: 2;
+  }
+
+  #rectangle-label-collision .cv-body {
+    fill: color-mix(in srgb, var(--viz-series-1) 9%, transparent);
+    stroke: var(--viz-series-1);
+    stroke-width: 3;
+  }
+
+  #rectangle-label-collision .cv-body-label,
+  #rectangle-label-collision .cv-note,
+  #rectangle-label-collision .cv-track-label {
+    fill: var(--foreground);
+  }
+
+  #rectangle-label-collision .cv-note-muted {
+    fill: var(--muted-foreground);
+  }
+
+  #rectangle-label-collision .cv-label-active {
+    fill: var(--viz-series-1);
+    stroke: var(--viz-series-1);
+    stroke-width: 2;
+  }
+
+  #rectangle-label-collision .cv-label-text {
+    fill: var(--primary-foreground);
+    font-weight: 500;
+  }
+
+  #rectangle-label-collision .cv-candidate-ghost {
+    fill: color-mix(in srgb, var(--foreground) 3%, transparent);
+    stroke: var(--muted-foreground);
+    stroke-width: 1.5;
+    stroke-dasharray: 5 5;
+  }
+
+  #rectangle-label-collision .cv-candidate-failed {
+    fill: color-mix(in srgb, var(--destructive) 5%, transparent);
+    stroke: var(--destructive);
+    stroke-width: 2;
+    stroke-dasharray: 5 4;
+  }
+
+  #rectangle-label-collision .cv-obstacle {
+    fill: color-mix(in srgb, var(--destructive) 10%, transparent);
+    stroke: var(--destructive);
+    stroke-width: 2;
+  }
+
+  #rectangle-label-collision .cv-obstacle-text,
+  #rectangle-label-collision .cv-fail-mark {
+    fill: var(--destructive);
+    font-weight: 500;
+  }
+
+  #rectangle-label-collision .cv-candidate-index {
+    fill: var(--background);
+    stroke: var(--muted-foreground);
+    stroke-width: 1.5;
+  }
+
+  #rectangle-label-collision .cv-candidate-index-active {
+    fill: var(--viz-series-1);
+    stroke: var(--viz-series-1);
+  }
+
+  #rectangle-label-collision .cv-index-text {
+    fill: var(--foreground);
+    font-weight: 500;
+  }
+
+  #rectangle-label-collision .cv-index-text-active {
+    fill: var(--primary-foreground);
+  }
+
+  #rectangle-label-collision .cv-raw-label {
+    fill: color-mix(in srgb, var(--foreground) 3%, transparent);
+    stroke: var(--muted-foreground);
+    stroke-width: 2;
+    stroke-dasharray: 7 5;
+  }
+
+  #rectangle-label-collision .cv-motion-line {
+    fill: none;
+    stroke: var(--muted-foreground);
+    stroke-width: 2;
+    marker-end: url(#cv-arrowhead);
+  }
+
+  #rectangle-label-collision .cv-track {
+    fill: none;
+    stroke: var(--muted-foreground);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 5;
+  }
+
+  #rectangle-label-collision .cv-track-selected {
+    stroke: var(--viz-series-1);
+    stroke-width: 3;
+    stroke-dasharray: none;
+  }
+
+  #rectangle-label-collision .cv-target-point {
+    fill: var(--background);
+    stroke: var(--viz-series-2);
+    stroke-width: 3;
+  }
+
+  #rectangle-label-collision .cv-target-line {
+    stroke: var(--viz-series-2);
+    stroke-width: 2;
+    stroke-dasharray: 5 4;
+  }
+
+  #rectangle-label-collision .cv-summary-row {
+    align-items: center;
+  }
+
+  #rectangle-label-collision .cv-rule {
+    display: flex;
+    align-items: center;
+    gap: 8px 10px;
+    flex-wrap: wrap;
+  }
+
+  #rectangle-label-collision .cv-rule b {
+    display: inline-grid;
+    place-items: center;
+    min-width: 22px;
+    min-height: 22px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+  }
+
+  @media (max-width: 520px) {
+    #rectangle-label-collision .cv-heading {
+      display: grid;
+    }
+
+    #rectangle-label-collision .cv-heading .viz-row {
+      width: 100%;
+      align-items: stretch;
+    }
+
+    #rectangle-label-collision .cv-heading .btn {
+      flex: 1 1 auto;
+    }
+  }
+&lt;/style&gt;
+
+&lt;script&gt;
+(() =&gt; {
+  const root = document.getElementById(&quot;rectangle-label-collision&quot;);
+  if (!root) return;
+
+  const svg = root.querySelector(&quot;#cv-diagram&quot;);
+  const stage = root.querySelector(&quot;.cv-stage&quot;);
+  const status = root.querySelector(&quot;#cv-status&quot;);
+  const summary = root.querySelector(&quot;#cv-summary&quot;);
+  const scope = root.querySelector(&quot;#cv-scope&quot;);
+  const manualX = root.querySelector(&quot;#cv-manual-x&quot;);
+  const manualY = root.querySelector(&quot;#cv-manual-y&quot;);
+  const manualXValue = root.querySelector(&quot;#cv-manual-x-value&quot;);
+  const manualYValue = root.querySelector(&quot;#cv-manual-y-value&quot;);
+
+  const state = {
+    mode: &quot;auto&quot;,
+    auto: &quot;open&quot;,
+    transform: &quot;top&quot;,
+    manualX: Number(manualX.value),
+    manualY: Number(manualY.value),
+  };
+
+  const modeMeta = {
+    auto: &quot;自动放置只发生在新建方框或隐藏标签重新出现时&quot;,
+    transform: &quot;移动、缩放和样式变化不会重新执行四向避让&quot;,
+    manual: &quot;拖动标签时会比较八条内外轨道，但不检查其他方框&quot;,
+  };
+
+  const autoMeta = {
+    open: {
+      selected: 0,
+      failed: [],
+      edge: false,
+      status: &quot;选择：上外&quot;,
+      summary: &quot;第 1 个候选完整位于画布内且不与其他方框相交，立即采用。&quot;,
+    },
+    &quot;top-edge&quot;: {
+      selected: 1,
+      failed: [0],
+      edge: true,
+      status: &quot;选择：下外&quot;,
+      summary: &quot;上外越过画布边缘，跳到第 2 个候选下外。&quot;,
+    },
+    &quot;top-blocked&quot;: {
+      selected: 1,
+      failed: [0],
+      blocked: [0],
+      status: &quot;选择：下外&quot;,
+      summary: &quot;上外与其他方框体或其标签相交，跳到下外。&quot;,
+    },
+    &quot;two-blocked&quot;: {
+      selected: 2,
+      failed: [0, 1],
+      blocked: [0, 1],
+      status: &quot;选择：左外&quot;,
+      summary: &quot;上外、下外依次失败，采用第 3 个候选左外。&quot;,
+    },
+    &quot;three-blocked&quot;: {
+      selected: 3,
+      failed: [0, 1, 2],
+      blocked: [0, 1, 2],
+      status: &quot;选择：右外&quot;,
+      summary: &quot;前三个外侧位置都被占用，采用最后一个外侧候选右外。&quot;,
+    },
+    &quot;all-blocked&quot;: {
+      selected: 4,
+      failed: [0, 1, 2, 3],
+      blocked: [0, 1, 2, 3],
+      status: &quot;兜底：上内&quot;,
+      summary: &quot;四个外侧候选全失败后，无条件回退到上内，不再检查障碍物。&quot;,
+    },
+  };
+
+  const transformMeta = {
+    top: {
+      status: &quot;锚点不变：上外&quot;,
+      summary: &quot;标签原位置越过上边缘后，布局框被下移进画布，可能压进当前方框。&quot;,
+    },
+    right: {
+      status: &quot;锚点不变：上外&quot;,
+      summary: &quot;标签越过右边缘时只向左平移；保存的锚点仍是原来的上外位置。&quot;,
+    },
+    obstacle: {
+      status: &quot;不触发重排&quot;,
+      summary: &quot;移动或缩放后即使标签撞到其他方框，也不会重新尝试下、左、右。&quot;,
+    },
+    wrap: {
+      status: &quot;重算尺寸，不重排&quot;,
+      summary: &quot;方框缩窄会让标签重新换行并变高，但仍保留原锚点，只处理画布越界。&quot;,
+    },
+  };
+
+  const esc = (value) =&gt; String(value)
+    .replaceAll(&quot;&amp;&quot;, &quot;&amp;amp;&quot;)
+    .replaceAll(&quot;&lt;&quot;, &quot;&amp;lt;&quot;)
+    .replaceAll(&quot;&gt;&quot;, &quot;&amp;gt;&quot;)
+    .replaceAll(&#x27;&quot;&#x27;, &quot;&amp;quot;&quot;);
+
+  const rect = (x, y, width, height) =&gt; ({ x, y, width, height });
+  const center = (box) =&gt; ({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+  const clamp = (value, minimum, maximum) =&gt; Math.min(maximum, Math.max(minimum, value));
+  const intersects = (a, b) =&gt;
+    a.x &lt; b.x + b.width &amp;&amp; a.x + a.width &gt; b.x &amp;&amp;
+    a.y &lt; b.y + b.height &amp;&amp; a.y + a.height &gt; b.y;
+
+  function roundedRect(box, className, radius = 6) {
+    return `&lt;rect class=&quot;${className}&quot; x=&quot;${box.x}&quot; y=&quot;${box.y}&quot; width=&quot;${box.width}&quot; height=&quot;${box.height}&quot; rx=&quot;${radius}&quot; /&gt;`;
+  }
+
+  function textAt(x, y, value, className = &quot;cv-note&quot;, anchor = &quot;middle&quot;) {
+    return `&lt;text class=&quot;${className}&quot; x=&quot;${x}&quot; y=&quot;${y}&quot; text-anchor=&quot;${anchor}&quot; dominant-baseline=&quot;middle&quot;&gt;${esc(value)}&lt;/text&gt;`;
+  }
+
+  function multilineText(box, lines, className = &quot;cv-label-text&quot;) {
+    const safeLines = lines.map(esc);
+    const spacing = 18;
+    const start = box.y + box.height / 2 - ((safeLines.length - 1) * spacing) / 2;
+    return safeLines.map((line, index) =&gt;
+      textAt(box.x + box.width / 2, start + index * spacing, line, className)
+    ).join(&quot;&quot;);
+  }
+
+  function viewportMarkup(viewport) {
+    return `${roundedRect(viewport, &quot;cv-viewport&quot;, 4)}
+      ${textAt(viewport.x + 10, viewport.y + 16, &quot;画布&quot;, &quot;cv-note-muted text-small&quot;, &quot;start&quot;)}`;
+  }
+
+  function bodyMarkup(body, label = &quot;当前方框&quot;) {
+    return `${roundedRect(body, &quot;cv-body&quot;, 2)}${textAt(body.x + body.width / 2, body.y + body.height / 2, label, &quot;cv-body-label&quot;)}`;
+  }
+
+  function labelMarkup(box, lines = [&quot;标签&quot;], className = &quot;cv-label-active&quot;) {
+    return `${roundedRect(box, className, 6)}${multilineText(box, lines)}`;
+  }
+
+  function failMark(box) {
+    const size = 8;
+    const cx = box.x + box.width - 11;
+    const cy = box.y + 11;
+    return `&lt;path class=&quot;cv-fail-mark&quot; d=&quot;M ${cx - size / 2} ${cy - size / 2} L ${cx + size / 2} ${cy + size / 2} M ${cx + size / 2} ${cy - size / 2} L ${cx - size / 2} ${cy + size / 2}&quot; fill=&quot;none&quot; stroke=&quot;var(--destructive)&quot; stroke-width=&quot;2.5&quot; stroke-linecap=&quot;round&quot; /&gt;`;
+  }
+
+  function candidateIndex(box, index, active) {
+    const cx = box.x - 4;
+    const cy = box.y - 4;
+    const circleClass = active ? &quot;cv-candidate-index cv-candidate-index-active&quot; : &quot;cv-candidate-index&quot;;
+    const textClass = active ? &quot;cv-index-text cv-index-text-active text-small&quot; : &quot;cv-index-text text-small&quot;;
+    return `&lt;circle class=&quot;${circleClass}&quot; cx=&quot;${cx}&quot; cy=&quot;${cy}&quot; r=&quot;11&quot; /&gt;${textAt(cx, cy + 0.5, index, textClass)}`;
+  }
+
+  function obstacleMarkup(box, short = false) {
+    const expanded = rect(box.x - 5, box.y - 5, box.width + 10, box.height + 10);
+    return `${roundedRect(expanded, &quot;cv-obstacle&quot;, 2)}${textAt(
+      expanded.x + expanded.width / 2,
+      expanded.y + expanded.height / 2,
+      short ? &quot;障碍&quot; : &quot;其他方框&quot;,
+      &quot;cv-obstacle-text text-small&quot;
+    )}`;
+  }
+
+  function fitToViewport(box, viewport) {
+    const x = clamp(box.x, viewport.x, viewport.x + viewport.width - box.width);
+    const y = clamp(box.y, viewport.y, viewport.y + viewport.height - box.height);
+    return rect(x, y, box.width, box.height);
+  }
+
+  function autoGeometry(width, height, edgeScenario) {
+    const narrow = width &lt; 500;
+    const viewport = rect(narrow ? 16 : 36, 52, width - (narrow ? 32 : 72), height - 78);
+    const bodyWidth = narrow ? Math.min(126, viewport.width * 0.4) : 172;
+    const bodyHeight = narrow ? 86 : 104;
+    const labelWidth = narrow ? 78 : 104;
+    const labelHeight = narrow ? 34 : 40;
+    const gap = narrow ? 8 : 10;
+    const bodyX = viewport.x + viewport.width / 2 - bodyWidth / 2;
+    const bodyY = edgeScenario
+      ? viewport.y + 8
+      : viewport.y + viewport.height / 2 - bodyHeight / 2;
+    const body = rect(bodyX, bodyY, bodyWidth, bodyHeight);
+    const candidates = [
+      rect(body.x + gap, body.y - gap - labelHeight, labelWidth, labelHeight),
+      rect(body.x + gap, body.y + body.height + gap, labelWidth, labelHeight),
+      rect(body.x - gap - labelWidth, body.y + gap, labelWidth, labelHeight),
+      rect(body.x + body.width + gap, body.y + gap, labelWidth, labelHeight),
+    ];
+    const fallback = rect(body.x + gap, body.y + gap, labelWidth, labelHeight);
+    return { viewport, body, candidates, fallback };
+  }
+
+  function drawAuto(width, height) {
+    const meta = autoMeta[state.auto];
+    const geometry = autoGeometry(width, height, meta.edge);
+    const { viewport, body, candidates, fallback } = geometry;
+    const blocked = new Set(meta.blocked || []);
+    const failed = new Set(meta.failed);
+    const names = [&quot;上外&quot;, &quot;下外&quot;, &quot;左外&quot;, &quot;右外&quot;];
+    let marks = viewportMarkup(viewport);
+
+    for (const index of blocked) {
+      marks += obstacleMarkup(candidates[index], width &lt; 500);
+    }
+    marks += bodyMarkup(body);
+
+    candidates.forEach((candidate, index) =&gt; {
+      if (failed.has(index)) {
+        marks += roundedRect(candidate, &quot;cv-candidate-failed&quot;, 6);
+        marks += failMark(candidate);
+        marks += candidateIndex(candidate, index + 1, false);
+        marks += textAt(candidate.x + candidate.width / 2, candidate.y + candidate.height + 15, names[index], &quot;cv-obstacle-text text-small&quot;);
+      } else if (meta.selected === index) {
+        marks += labelMarkup(candidate);
+        marks += candidateIndex(candidate, index + 1, true);
+        marks += textAt(candidate.x + candidate.width / 2, candidate.y + candidate.height + 15, names[index], &quot;cv-note text-small&quot;);
+      } else if (index &gt; meta.selected || meta.selected === 4) {
+        marks += roundedRect(candidate, &quot;cv-candidate-ghost&quot;, 6);
+        marks += candidateIndex(candidate, index + 1, false);
+      }
+    });
+
+    if (meta.selected === 4) {
+      marks += labelMarkup(fallback);
+      marks += textAt(fallback.x + fallback.width / 2, fallback.y + fallback.height + 15, &quot;兜底 · 上内&quot;, &quot;cv-note text-small&quot;);
+    }
+
+    if (meta.edge) {
+      marks += textAt(candidates[0].x + candidates[0].width / 2, viewport.y - 17, &quot;越过画布边缘&quot;, &quot;cv-obstacle-text text-small&quot;);
+    }
+
+    const desc = meta.selected === 4
+      ? &quot;四个外侧候选都失败，标签放入当前方框上方内侧。&quot;
+      : `依次检查候选后，标签放在${names[meta.selected]}。`;
+    return { marks, title: &quot;自动放置候选顺序&quot;, desc, status: meta.status, summary: meta.summary };
+  }
+
+  function drawTransform(width, height) {
+    const narrow = width &lt; 500;
+    const viewport = rect(narrow ? 16 : 36, 52, width - (narrow ? 32 : 72), height - 78);
+    const gap = narrow ? 8 : 10;
+    let body;
+    let raw;
+    let actual;
+    let marks = viewportMarkup(viewport);
+    let title = &quot;移动或缩放后的标签布局&quot;;
+    let desc = &quot;保留原标签锚点，只将越界的标签布局框平移到画布内。&quot;;
+
+    if (state.transform === &quot;top&quot;) {
+      const labelSize = { width: narrow ? 92 : 118, height: narrow ? 36 : 42 };
+      body = rect(viewport.x + viewport.width / 2 - (narrow ? 66 : 90), viewport.y + 8, narrow ? 132 : 180, narrow ? 92 : 112);
+      raw = rect(body.x + gap, body.y - gap - labelSize.height, labelSize.width, labelSize.height);
+      actual = fitToViewport(raw, viewport);
+    } else if (state.transform === &quot;right&quot;) {
+      const labelSize = { width: narrow ? 128 : 158, height: narrow ? 36 : 42 };
+      body = rect(viewport.x + viewport.width - (narrow ? 104 : 132), viewport.y + viewport.height / 2 - 52, narrow ? 96 : 122, 104);
+      raw = rect(body.x + gap, body.y - gap - labelSize.height, labelSize.width, labelSize.height);
+      actual = fitToViewport(raw, viewport);
+    } else if (state.transform === &quot;obstacle&quot;) {
+      const labelSize = { width: narrow ? 92 : 118, height: narrow ? 36 : 42 };
+      body = rect(viewport.x + viewport.width / 2 - (narrow ? 66 : 90), viewport.y + viewport.height / 2 - 40, narrow ? 132 : 180, 100);
+      raw = rect(body.x + gap, body.y - gap - labelSize.height, labelSize.width, labelSize.height);
+      actual = raw;
+      marks += obstacleMarkup(rect(raw.x - 12, raw.y - 8, raw.width + 34, raw.height + 18), narrow);
+      desc = &quot;标签与其他方框相交，但移动和缩放流程不会重新选择锚点。&quot;;
+    } else {
+      const labelSize = { width: narrow ? 104 : 136, height: narrow ? 72 : 82 };
+      body = rect(viewport.x + viewport.width / 2 - (narrow ? 46 : 56), viewport.y + 26, narrow ? 92 : 112, narrow ? 118 : 132);
+      raw = rect(body.x + gap, body.y - gap - labelSize.height, labelSize.width, labelSize.height);
+      actual = fitToViewport(raw, viewport);
+      desc = &quot;方框变窄后标签重新换行并变高，锚点仍保持上外。&quot;;
+    }
+
+    marks += bodyMarkup(body);
+    marks += roundedRect(raw, &quot;cv-raw-label&quot;, 6);
+
+    const rawCenter = center(raw);
+    const actualCenter = center(actual);
+    const moved = Math.abs(rawCenter.x - actualCenter.x) &gt; 0.5 || Math.abs(rawCenter.y - actualCenter.y) &gt; 0.5;
+    if (moved) {
+      marks += `&lt;line class=&quot;cv-motion-line&quot; x1=&quot;${rawCenter.x}&quot; y1=&quot;${rawCenter.y}&quot; x2=&quot;${actualCenter.x}&quot; y2=&quot;${actualCenter.y}&quot; /&gt;`;
+    }
+
+    const lines = state.transform === &quot;wrap&quot; ? [&quot;较长的标签&quot;, &quot;重新换行&quot;] : [&quot;实际标签&quot;];
+    marks += labelMarkup(actual, lines);
+
+    const meta = transformMeta[state.transform];
+    return { marks, title, desc, status: meta.status, summary: meta.summary };
+  }
+
+  function manualCandidates(body, desired, viewport, labelWidth, labelHeight, gap) {
+    const horizontal = clamp(
+      (desired.x - labelWidth / 2 - body.x - gap) / body.width,
+      0,
+      1
+    );
+    const vertical = clamp(
+      (desired.y - labelHeight / 2 - body.y - gap) / body.height,
+      0,
+      1
+    );
+    const x = body.x + gap + body.width * horizontal;
+    const y = body.y + gap + body.height * vertical;
+    const definitions = [
+      { name: &quot;上外&quot;, edge: &quot;top&quot;, side: &quot;outside&quot;, box: rect(x, body.y - gap - labelHeight, labelWidth, labelHeight) },
+      { name: &quot;上内&quot;, edge: &quot;top&quot;, side: &quot;inside&quot;, box: rect(x, body.y + gap, labelWidth, labelHeight) },
+      { name: &quot;下内&quot;, edge: &quot;bottom&quot;, side: &quot;inside&quot;, box: rect(x, body.y + body.height - gap - labelHeight, labelWidth, labelHeight) },
+      { name: &quot;下外&quot;, edge: &quot;bottom&quot;, side: &quot;outside&quot;, box: rect(x, body.y + body.height + gap, labelWidth, labelHeight) },
+      { name: &quot;左外&quot;, edge: &quot;left&quot;, side: &quot;outside&quot;, box: rect(body.x - gap - labelWidth, y, labelWidth, labelHeight) },
+      { name: &quot;左内&quot;, edge: &quot;left&quot;, side: &quot;inside&quot;, box: rect(body.x + gap, y, labelWidth, labelHeight) },
+      { name: &quot;右内&quot;, edge: &quot;right&quot;, side: &quot;inside&quot;, box: rect(body.x + body.width - gap - labelWidth, y, labelWidth, labelHeight) },
+      { name: &quot;右外&quot;, edge: &quot;right&quot;, side: &quot;outside&quot;, box: rect(body.x + body.width + gap, y, labelWidth, labelHeight) },
+    ];
+    return definitions.map((definition) =&gt; {
+      const fitted = fitToViewport(definition.box, viewport);
+      const candidateCenter = center(fitted);
+      return {
+        ...definition,
+        box: fitted,
+        distance: Math.hypot(candidateCenter.x - desired.x, candidateCenter.y - desired.y),
+      };
+    });
+  }
+
+  function drawManual(width, height) {
+    const narrow = width &lt; 500;
+    const viewport = rect(narrow ? 16 : 36, 52, width - (narrow ? 32 : 72), height - 78);
+    const body = rect(
+      viewport.x + viewport.width / 2 - (narrow ? 62 : 90),
+      viewport.y + viewport.height / 2 - (narrow ? 45 : 55),
+      narrow ? 124 : 180,
+      narrow ? 90 : 110
+    );
+    const desired = {
+      x: viewport.x + 12 + (viewport.width - 24) * state.manualX / 100,
+      y: viewport.y + 12 + (viewport.height - 24) * state.manualY / 100,
+    };
+    const labelWidth = narrow ? 80 : 106;
+    const labelHeight = narrow ? 34 : 40;
+    const gap = narrow ? 8 : 10;
+    const candidates = manualCandidates(body, desired, viewport, labelWidth, labelHeight, gap);
+    let selected = candidates[0];
+    for (const candidate of candidates.slice(1)) {
+      if (candidate.distance &lt; selected.distance) selected = candidate;
+    }
+
+    const obstacle = rect(
+      body.x + body.width + gap + (narrow ? 2 : 8),
+      body.y + body.height / 2 - 34,
+      narrow ? 74 : 104,
+      68
+    );
+    const collision = intersects(selected.box, obstacle);
+    let marks = viewportMarkup(viewport);
+
+    const trackOffset = narrow ? 14 : 18;
+    const tracks = [
+      { name: &quot;上外&quot;, x1: body.x, y1: body.y - gap - labelHeight / 2, x2: body.x + body.width, y2: body.y - gap - labelHeight / 2 },
+      { name: &quot;上内&quot;, x1: body.x, y1: body.y + gap + labelHeight / 2, x2: body.x + body.width, y2: body.y + gap + labelHeight / 2 },
+      { name: &quot;下内&quot;, x1: body.x, y1: body.y + body.height - gap - labelHeight / 2, x2: body.x + body.width, y2: body.y + body.height - gap - labelHeight / 2 },
+      { name: &quot;下外&quot;, x1: body.x, y1: body.y + body.height + gap + labelHeight / 2, x2: body.x + body.width, y2: body.y + body.height + gap + labelHeight / 2 },
+      { name: &quot;左外&quot;, x1: body.x - gap - labelWidth / 2, y1: body.y, x2: body.x - gap - labelWidth / 2, y2: body.y + body.height },
+      { name: &quot;左内&quot;, x1: body.x + gap + labelWidth / 2, y1: body.y, x2: body.x + gap + labelWidth / 2, y2: body.y + body.height },
+      { name: &quot;右内&quot;, x1: body.x + body.width - gap - labelWidth / 2, y1: body.y, x2: body.x + body.width - gap - labelWidth / 2, y2: body.y + body.height },
+      { name: &quot;右外&quot;, x1: body.x + body.width + gap + labelWidth / 2, y1: body.y, x2: body.x + body.width + gap + labelWidth / 2, y2: body.y + body.height },
+    ];
+
+    tracks.forEach((track) =&gt; {
+      const selectedTrack = track.name === selected.name;
+      marks += `&lt;line class=&quot;cv-track${selectedTrack ? &quot; cv-track-selected&quot; : &quot;&quot;}&quot; x1=&quot;${track.x1}&quot; y1=&quot;${track.y1}&quot; x2=&quot;${track.x2}&quot; y2=&quot;${track.y2}&quot; /&gt;`;
+    });
+
+    marks += obstacleMarkup(obstacle, narrow);
+    marks += bodyMarkup(body);
+    marks += `&lt;line class=&quot;cv-target-line&quot; x1=&quot;${desired.x}&quot; y1=&quot;${desired.y}&quot; x2=&quot;${center(selected.box).x}&quot; y2=&quot;${center(selected.box).y}&quot; /&gt;`;
+    marks += labelMarkup(selected.box);
+    marks += `&lt;circle class=&quot;cv-target-point&quot; cx=&quot;${desired.x}&quot; cy=&quot;${desired.y}&quot; r=&quot;7&quot; /&gt;`;
+    marks += textAt(desired.x, desired.y - trackOffset, &quot;目标点&quot;, &quot;cv-note text-small&quot;);
+    marks += textAt(center(selected.box).x, selected.box.y + selected.box.height + 16, selected.name, &quot;cv-note text-small&quot;);
+
+    const statusText = collision ? `最近：${selected.name} · 与障碍重叠` : `最近：${selected.name}`;
+    const summaryText = collision
+      ? &quot;八条轨道只按目标点距离选最近位置；即使与其他方框重叠，也不会换到次近轨道。&quot;
+      : &quot;八条轨道只按目标点距离选最近位置；其他方框和标签不参与这次判断。&quot;;
+    return {
+      marks,
+      title: &quot;手动拖动标签的八轨吸附&quot;,
+      desc: `目标点最近的轨道是${selected.name}。障碍物不参与距离比较。`,
+      status: statusText,
+      summary: summaryText,
+    };
+  }
+
+  function draw() {
+    const width = Math.max(320, Math.floor(stage.getBoundingClientRect().width || root.getBoundingClientRect().width || 736));
+    const height = width &lt; 500 ? 350 : 390;
+    svg.style.height = `${height}px`;
+    svg.setAttribute(&quot;viewBox&quot;, `0 0 ${width} ${height}`);
+
+    const result = state.mode === &quot;auto&quot;
+      ? drawAuto(width, height)
+      : state.mode === &quot;transform&quot;
+        ? drawTransform(width, height)
+        : drawManual(width, height);
+
+    svg.innerHTML = `&lt;title id=&quot;cv-diagram-title&quot;&gt;${esc(result.title)}&lt;/title&gt;
+      &lt;desc id=&quot;cv-diagram-desc&quot;&gt;${esc(result.desc)}&lt;/desc&gt;
+      &lt;defs&gt;
+        &lt;marker id=&quot;cv-arrowhead&quot; markerWidth=&quot;8&quot; markerHeight=&quot;8&quot; refX=&quot;7&quot; refY=&quot;4&quot; orient=&quot;auto&quot; markerUnits=&quot;strokeWidth&quot;&gt;
+          &lt;path d=&quot;M 0 0 L 8 4 L 0 8 Z&quot; fill=&quot;var(--muted-foreground)&quot; /&gt;
+        &lt;/marker&gt;
+      &lt;/defs&gt;
+      ${result.marks}`;
+    status.textContent = result.status;
+    summary.textContent = result.summary;
+  }
+
+  function selectButtons(selector, selected) {
+    root.querySelectorAll(selector).forEach((button) =&gt; {
+      const active = button === selected;
+      button.classList.toggle(&quot;btn-primary&quot;, active);
+      if (button.hasAttribute(&quot;aria-pressed&quot;)) button.setAttribute(&quot;aria-pressed&quot;, String(active));
+      if (button.hasAttribute(&quot;aria-selected&quot;)) button.setAttribute(&quot;aria-selected&quot;, String(active));
+    });
+  }
+
+  root.querySelectorAll(&quot;[data-mode]&quot;).forEach((button) =&gt; {
+    button.addEventListener(&quot;click&quot;, () =&gt; {
+      state.mode = button.dataset.mode;
+      selectButtons(&quot;[data-mode]&quot;, button);
+      root.querySelectorAll(&quot;[data-controls]&quot;).forEach((group) =&gt; {
+        group.hidden = group.dataset.controls !== state.mode;
+      });
+      root.querySelectorAll(&quot;[data-rule]&quot;).forEach((group) =&gt; {
+        group.hidden = group.dataset.rule !== state.mode;
+      });
+      scope.textContent = modeMeta[state.mode];
+      draw();
+    });
+  });
+
+  root.querySelectorAll(&quot;[data-auto]&quot;).forEach((button) =&gt; {
+    button.addEventListener(&quot;click&quot;, () =&gt; {
+      state.auto = button.dataset.auto;
+      selectButtons(&quot;[data-auto]&quot;, button);
+      draw();
+    });
+  });
+
+  root.querySelectorAll(&quot;[data-transform]&quot;).forEach((button) =&gt; {
+    button.addEventListener(&quot;click&quot;, () =&gt; {
+      state.transform = button.dataset.transform;
+      selectButtons(&quot;[data-transform]&quot;, button);
+      draw();
+    });
+  });
+
+  const updateManual = () =&gt; {
+    state.manualX = Number(manualX.value);
+    state.manualY = Number(manualY.value);
+    manualXValue.textContent = `${state.manualX}%`;
+    manualYValue.textContent = `${state.manualY}%`;
+    draw();
+  };
+  manualX.addEventListener(&quot;input&quot;, updateManual);
+  manualY.addEventListener(&quot;input&quot;, updateManual);
+
+  const observer = new ResizeObserver(() =&gt; draw());
+  observer.observe(stage);
+  draw();
+})();
+&lt;/script&gt;
+
+&lt;script src=&quot;https://unpkg.com/@floating-ui/core@1.7.3/dist/floating-ui.core.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script src=&quot;https://unpkg.com/@floating-ui/dom@1.7.4/dist/floating-ui.dom.umd.min.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  if (window.FloatingUIDOM == null) {
+    return;
+  }
+  const { autoUpdate, computePosition, flip, offset, shift, size } =
+    window.FloatingUIDOM;
+  const tooltipPlacements = new Set([&quot;top&quot;, &quot;right&quot;, &quot;bottom&quot;, &quot;left&quot;]);
+  const tooltipId = `codex-visualization-tooltip-${
+    window.crypto?.randomUUID?.() ?? Date.now().toString(36)
+  }`;
+  const tooltipGap = 5;
+  const hoverDelay = 700;
+  const skipDelay = 300;
+  let activeTrigger = null;
+  let pendingTrigger = null;
+  let tooltip = null;
+  let openTimeout = null;
+  let autoUpdateCleanup = null;
+  let positionRequest = 0;
+  let skipDelayUntil = 0;
+
+  const getTrigger = (target) =&gt;
+    target?.nodeType === Node.ELEMENT_NODE
+      ? target.closest(&quot;[data-tooltip]&quot;)
+      : null;
+  const containsTarget = (trigger, target) =&gt;
+    target?.nodeType != null &amp;&amp; trigger.contains(target);
+  const getContent = (trigger) =&gt;
+    trigger.getAttribute(&quot;data-tooltip&quot;)?.trim() ?? &quot;&quot;;
+  const getPlacement = (trigger) =&gt; {
+    const placement = trigger.getAttribute(&quot;data-tooltip-placement&quot;);
+    return tooltipPlacements.has(placement) ? placement : &quot;top&quot;;
+  };
+  const getTooltip = () =&gt; {
+    if (tooltip == null) {
+      tooltip = document.createElement(&quot;div&quot;);
+      tooltip.id = tooltipId;
+      tooltip.className = &quot;tooltip&quot;;
+      tooltip.setAttribute(&quot;role&quot;, &quot;tooltip&quot;);
+    }
+    return tooltip;
+  };
+  const setDescribedBy = (trigger, described) =&gt; {
+    const ids = new Set(
+      (trigger.getAttribute(&quot;aria-describedby&quot;) ?? &quot;&quot;)
+        .split(/\s+/)
+        .filter(Boolean),
+    );
+    if (described) {
+      ids.add(tooltipId);
+    } else {
+      ids.delete(tooltipId);
+    }
+    if (ids.size === 0) {
+      trigger.removeAttribute(&quot;aria-describedby&quot;);
+    } else {
+      trigger.setAttribute(&quot;aria-describedby&quot;, [...ids].join(&quot; &quot;));
+    }
+  };
+  const clearOpenTimeout = () =&gt; {
+    if (openTimeout != null) {
+      window.clearTimeout(openTimeout);
+      openTimeout = null;
+    }
+    pendingTrigger = null;
+  };
+  const closeTooltip = (activateSkipDelay = true) =&gt; {
+    clearOpenTimeout();
+    positionRequest += 1;
+    autoUpdateCleanup?.();
+    autoUpdateCleanup = null;
+    if (activeTrigger == null) {
+      return;
+    }
+    setDescribedBy(activeTrigger, false);
+    activeTrigger = null;
+    tooltip?.remove();
+    if (activateSkipDelay) {
+      skipDelayUntil = Date.now() + skipDelay;
+    }
+  };
+  const updatePosition = (trigger, floating) =&gt; {
+    const request = ++positionRequest;
+    void computePosition(trigger, floating, {
+      middleware: [
+        offset(tooltipGap),
+        flip({ padding: tooltipGap }),
+        shift({ padding: tooltipGap }),
+        size({
+          padding: tooltipGap,
+          apply({ availableHeight, availableWidth, elements }) {
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-width&quot;,
+              `${Math.max(0, availableWidth)}px`,
+            );
+            elements.floating.style.setProperty(
+              &quot;--tooltip-available-height&quot;,
+              `${Math.max(0, availableHeight)}px`,
+            );
+          },
+        }),
+      ],
+      placement: getPlacement(trigger),
+      strategy: &quot;fixed&quot;,
+    })
+      .then(({ x, y }) =&gt; {
+        if (activeTrigger !== trigger || request !== positionRequest) {
+          return;
+        }
+        const scale = window.devicePixelRatio || 1;
+        floating.style.transform = `translate(${Math.round(x * scale) / scale}px, ${Math.round(y * scale) / scale}px)`;
+        floating.style.visibility = &quot;visible&quot;;
+      })
+      .catch(() =&gt; {
+        if (activeTrigger === trigger &amp;&amp; request === positionRequest) {
+          closeTooltip(false);
+        }
+      });
+  };
+  const openTooltip = (trigger) =&gt; {
+    const content = getContent(trigger);
+    if (!trigger.isConnected || content.length === 0) {
+      return;
+    }
+    clearOpenTimeout();
+    if (activeTrigger === trigger) {
+      return;
+    }
+    closeTooltip();
+    const floating = getTooltip();
+    floating.textContent = content;
+    floating.style.visibility = &quot;hidden&quot;;
+    floating.style.transform = &quot;translate(0, 0)&quot;;
+    document.body.appendChild(floating);
+    activeTrigger = trigger;
+    setDescribedBy(trigger, true);
+    autoUpdateCleanup = autoUpdate(trigger, floating, () =&gt; {
+      updatePosition(trigger, floating);
+    });
+  };
+  const requestOpen = (trigger, immediate = false) =&gt; {
+    if (
+      getContent(trigger).length === 0 ||
+      activeTrigger === trigger ||
+      pendingTrigger === trigger
+    ) {
+      return;
+    }
+    clearOpenTimeout();
+    pendingTrigger = trigger;
+    const delay =
+      immediate || activeTrigger != null || Date.now() &lt; skipDelayUntil
+        ? 0
+        : hoverDelay;
+    if (delay === 0) {
+      openTooltip(trigger);
+      return;
+    }
+    openTimeout = window.setTimeout(() =&gt; {
+      openTimeout = null;
+      pendingTrigger = null;
+      openTooltip(trigger);
+    }, delay);
+  };
+  const handlePointerOpen = (event) =&gt; {
+    if (event.pointerType === &quot;touch&quot;) {
+      return;
+    }
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    requestOpen(trigger);
+  };
+  const handleLeave = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger == null || containsTarget(trigger, event.relatedTarget)) {
+      return;
+    }
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const handleFocusIn = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (trigger?.matches(&quot;:focus-visible&quot;)) {
+      requestOpen(trigger, true);
+    }
+  };
+  const handleKeyDown = (event) =&gt; {
+    if (event.key === &quot;Escape&quot;) {
+      closeTooltip();
+    }
+  };
+  const handleContextMenu = (event) =&gt; {
+    const trigger = getTrigger(event.target);
+    if (activeTrigger === trigger || pendingTrigger === trigger) {
+      closeTooltip();
+    }
+  };
+  const destroy = () =&gt; {
+    closeTooltip(false);
+    document.removeEventListener(&quot;pointerover&quot;, handlePointerOpen);
+    document.removeEventListener(&quot;pointerout&quot;, handleLeave);
+    document.removeEventListener(&quot;focusin&quot;, handleFocusIn);
+    document.removeEventListener(&quot;focusout&quot;, handleLeave);
+    document.removeEventListener(&quot;keydown&quot;, handleKeyDown);
+    document.removeEventListener(&quot;contextmenu&quot;, handleContextMenu);
+    tooltip = null;
+  };
+
+  document.addEventListener(&quot;pointerover&quot;, handlePointerOpen);
+  document.addEventListener(&quot;pointerout&quot;, handleLeave);
+  document.addEventListener(&quot;focusin&quot;, handleFocusIn);
+  document.addEventListener(&quot;focusout&quot;, handleLeave);
+  document.addEventListener(&quot;keydown&quot;, handleKeyDown);
+  document.addEventListener(&quot;contextmenu&quot;, handleContextMenu);
+  window.addEventListener(&quot;pagehide&quot;, destroy, { once: true });
+})();
+&lt;/script&gt;
+&lt;script id=&quot;codex-visualization-lucide&quot; async src=&quot;https://unpkg.com/lucide@1.17.0/dist/umd/lucide.js&quot;&gt;&lt;/script&gt;
+&lt;script&gt;
+(() =&gt; {
+  const initialize = () =&gt; {
+    globalThis.lucide?.createIcons({ attrs: { width: 16, height: 16 } });
+  };
+  if (globalThis.lucide != null) {
+    initialize();
+    return;
+  }
+  document
+    .getElementById(&quot;codex-visualization-lucide&quot;)
+    ?.addEventListener(&quot;load&quot;, initialize, { once: true });
+})();
+&lt;/script&gt;
+
+&lt;/body&gt;
+&lt;/html&gt;
+"></iframe>
+</body>
+</html>
