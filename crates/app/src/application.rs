@@ -3347,12 +3347,8 @@ fn root_close_action(surface: WindowSurface, phase: Phase) -> RootCloseAction {
   }
 }
 
-fn toast_placement(message: &str) -> (egui::Align2, egui::Vec2) {
-  if message == SAVE_SUCCESS_TOAST_MESSAGE {
-    (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
-  } else {
-    (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
-  }
+fn toast_placement(_message: &str) -> (egui::Align2, egui::Vec2) {
+  (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
 }
 
 fn show_default_style_settings(
@@ -3832,12 +3828,15 @@ mod tests {
   }
 
   #[test]
-  fn save_success_toast_is_centered_without_moving_other_toasts() {
+  fn all_toasts_are_centered() {
     assert_eq!(
       toast_placement(SAVE_SUCCESS_TOAST_MESSAGE),
       (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
     );
-    assert_eq!(toast_placement("设置已保存"), (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0)));
+    assert_eq!(
+      toast_placement("设置已保存"),
+      (egui::Align2::CENTER_CENTER, egui::vec2(0.0, -200.0))
+    );
     assert_eq!(SAVE_SUCCESS_TOAST_SHADOW_OFFSET, [2, 3]);
   }
 
