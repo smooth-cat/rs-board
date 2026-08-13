@@ -20,6 +20,8 @@ pub struct Settings {
   pub include_cursor: bool,
   pub launch_at_login: bool,
   pub copy_image_after_save: bool,
+  #[serde(default = "default_global_color")]
+  pub global_color: ColorRgba,
   pub tool_styles: ToolDefaultStyles,
 }
 
@@ -31,9 +33,14 @@ impl Default for Settings {
       include_cursor: false,
       launch_at_login: false,
       copy_image_after_save: true,
+      global_color: default_global_color(),
       tool_styles: ToolDefaultStyles::default(),
     }
   }
+}
+
+fn default_global_color() -> ColorRgba {
+  ColorRgba::RED
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -184,6 +191,7 @@ mod tests {
     assert!(!settings.include_cursor);
     assert!(!settings.launch_at_login);
     assert!(settings.copy_image_after_save);
+    assert_eq!(settings.global_color, ColorRgba::RED);
     assert_eq!(
       settings.tool_styles.rectangle,
       ToolDefaultStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
@@ -200,8 +208,15 @@ mod tests {
   #[test]
   fn settings_round_trip() {
     let path = temp_path();
-    let settings = Settings { include_cursor: true, ..Settings::default() };
+    let settings =
+      Settings { include_cursor: true, global_color: ColorRgba::BLUE, ..Settings::default() };
     settings.save(&path).unwrap();
+
+    let serialized: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+      serialized.get("global_color"),
+      Some(&serde_json::to_value(ColorRgba::BLUE).unwrap())
+    );
     assert_eq!(Settings::load_or_default(&path).unwrap(), settings);
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
   }
@@ -233,6 +248,56 @@ mod tests {
     assert!(loaded.include_cursor);
     assert!(!loaded.copy_image_after_save);
     assert_eq!(loaded.tool_styles, ToolDefaultStyles::default());
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+  }
+
+  #[test]
+  fn legacy_settings_without_global_color_preserve_existing_values() {
+    let path = temp_path();
+    let expected = Settings {
+      global_hotkey: "F2".to_owned(),
+      include_cursor: true,
+      launch_at_login: true,
+      copy_image_after_save: false,
+      global_color: ColorRgba::RED,
+      tool_styles: ToolDefaultStyles {
+        rectangle: ToolDefaultStyle::new(ColorRgba::BLUE, 12.0, 48.0, 0.75),
+        arrow: ToolDefaultStyle::new(ColorRgba::GREEN, 4.0, 18.0, 0.5),
+        text: ToolDefaultStyle::new(ColorRgba::WHITE, 6.0, 30.0, 1.0),
+        stroke: ToolDefaultStyle::new(ColorRgba::YELLOW, 16.0, 20.0, 0.25),
+        sequence: ToolDefaultStyle::new(ColorRgba::BLACK, 10.0, 42.0, 0.9),
+      },
+      ..Settings::default()
+    };
+    let mut legacy_json = serde_json::to_value(&expected).unwrap();
+    assert!(legacy_json.as_object_mut().unwrap().remove("global_color").is_some());
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(&legacy_json).unwrap()).unwrap();
+
+    let loaded = Settings::load_or_default(&path).unwrap();
+
+    assert_eq!(loaded.global_color, ColorRgba::RED);
+    assert_eq!(loaded, expected);
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
+  }
+
+  #[test]
+  fn saving_global_color_does_not_rewrite_legacy_tool_colors() {
+    let path = temp_path();
+    let mut settings = Settings::default();
+    settings.tool_styles.rectangle.color_rgba = ColorRgba::BLUE;
+    settings.tool_styles.arrow.color_rgba = ColorRgba::GREEN;
+    settings.tool_styles.text.color_rgba = ColorRgba::WHITE;
+    settings.tool_styles.stroke.color_rgba = ColorRgba::YELLOW;
+    settings.tool_styles.sequence.color_rgba = ColorRgba::BLACK;
+    let legacy_tool_styles = settings.tool_styles;
+
+    settings.global_color = ColorRgba::GREEN;
+    settings.save(&path).unwrap();
+    let loaded = Settings::load_or_default(&path).unwrap();
+
+    assert_eq!(loaded.global_color, ColorRgba::GREEN);
+    assert_eq!(loaded.tool_styles, legacy_tool_styles);
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
   }
 }

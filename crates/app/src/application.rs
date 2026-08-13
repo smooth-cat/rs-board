@@ -1156,6 +1156,7 @@ impl RsBoardApp {
       editor: EditorController::with_styles(
         self.last_tool,
         editor_styles_from_settings(&self.settings),
+        self.settings.global_color,
       ),
     })
   }
@@ -1928,8 +1929,8 @@ impl RsBoardApp {
           }
         }
         EditorAction::Toast(message) => self.set_toast(message),
-        EditorAction::ToolColorChanged { tool, color_rgba } => {
-          self.remember_tool_color(tool, color_rgba);
+        EditorAction::GlobalColorChanged { color_rgba } => {
+          self.remember_global_color(color_rgba);
         }
         EditorAction::Undo => {
           if let Some(session) = self.session.as_mut()
@@ -3067,18 +3068,15 @@ impl RsBoardApp {
     self.set_toast("设置已保存");
   }
 
-  fn remember_tool_color(&mut self, tool: EditorTool, color_rgba: ColorRgba) {
+  fn remember_global_color(&mut self, color_rgba: ColorRgba) {
     let mut next = self.settings.clone();
-    if !set_tool_default_color(&mut next.tool_styles, tool, color_rgba) {
-      let _ = set_tool_default_color(&mut self.settings_draft.tool_styles, tool, color_rgba);
-      return;
-    }
+    next.global_color = color_rgba;
     if let Err(error) = next.save(&self.settings_path) {
-      self.set_toast(format!("无法保存工具颜色：{error}"));
+      self.set_toast(format!("无法保存全局颜色：{error}"));
       return;
     }
     self.settings = next;
-    let _ = set_tool_default_color(&mut self.settings_draft.tool_styles, tool, color_rgba);
+    self.settings_draft.global_color = color_rgba;
   }
 
   fn show_toast(&mut self, context: &egui::Context) {
@@ -3437,36 +3435,7 @@ fn editor_styles_from_settings(settings: &Settings) -> [ToolStyle; 6] {
 }
 
 fn editor_style(style: ToolDefaultStyle) -> ToolStyle {
-  ToolStyle::new(style.color_rgba, style.width_px, style.font_size_px, style.hardness)
-}
-
-fn set_tool_default_color(
-  styles: &mut ToolDefaultStyles,
-  tool: EditorTool,
-  color_rgba: ColorRgba,
-) -> bool {
-  let Some(style) = tool_default_style_mut(styles, tool) else {
-    return false;
-  };
-  if style.color_rgba == color_rgba {
-    return false;
-  }
-  style.color_rgba = color_rgba;
-  true
-}
-
-fn tool_default_style_mut(
-  styles: &mut ToolDefaultStyles,
-  tool: EditorTool,
-) -> Option<&mut ToolDefaultStyle> {
-  match tool {
-    EditorTool::Select => None,
-    EditorTool::Rectangle => Some(&mut styles.rectangle),
-    EditorTool::Arrow => Some(&mut styles.arrow),
-    EditorTool::Text => Some(&mut styles.text),
-    EditorTool::Stroke => Some(&mut styles.stroke),
-    EditorTool::Sequence => Some(&mut styles.sequence),
-  }
+  ToolStyle::new(ColorRgba::RED, style.width_px, style.font_size_px, style.hardness)
 }
 
 fn format_pt(value: f32) -> String {
@@ -3838,27 +3807,17 @@ mod tests {
   }
 
   #[test]
-  fn settings_styles_map_to_editor_tool_styles() {
-    let mut settings = Settings::default();
+  fn settings_styles_ignore_legacy_colors_when_mapping_to_editor() {
+    let mut settings = Settings { global_color: ColorRgba::YELLOW, ..Settings::default() };
     settings.tool_styles.rectangle = ToolDefaultStyle::new(ColorRgba::BLUE, 12.0, 48.0, 1.0);
     settings.tool_styles.stroke = ToolDefaultStyle::new(ColorRgba::GREEN, 4.0, 24.0, 0.5);
 
     let styles = editor_styles_from_settings(&settings);
 
     assert_eq!(styles[0], ToolStyle::default());
-    assert_eq!(styles[1], ToolStyle::new(ColorRgba::BLUE, 12.0, 48.0, 1.0));
-    assert_eq!(styles[4], ToolStyle::new(ColorRgba::GREEN, 4.0, 24.0, 0.5));
-  }
-
-  #[test]
-  fn tool_color_updates_only_apply_to_creation_tools() {
-    let mut styles = ToolDefaultStyles::default();
-
-    assert!(!set_tool_default_color(&mut styles, EditorTool::Select, ColorRgba::BLUE));
-    assert_eq!(styles, ToolDefaultStyles::default());
-    assert!(set_tool_default_color(&mut styles, EditorTool::Arrow, ColorRgba::BLUE));
-    assert_eq!(styles.arrow.color_rgba, ColorRgba::BLUE);
-    assert_eq!(styles.rectangle.color_rgba, ColorRgba::RED);
+    assert_eq!(styles[1], ToolStyle::new(ColorRgba::RED, 12.0, 48.0, 1.0));
+    assert_eq!(styles[4], ToolStyle::new(ColorRgba::RED, 4.0, 24.0, 0.5));
+    assert_eq!(settings.global_color, ColorRgba::YELLOW);
   }
 
   #[test]
