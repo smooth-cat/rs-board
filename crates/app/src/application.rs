@@ -11,8 +11,8 @@ use std::{
 };
 
 use common::{
-  BoardDocument, CapturedDisplay, CommandHistory, DirtyBaseline, DocumentId, Element,
-  GlobalBoundsPx, SizePx,
+  BoardDocument, CapturedDisplay, ColorRgba, CommandHistory, DirtyBaseline, DocumentId, Element,
+  GlobalBoundsPx, PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, SizePx,
 };
 use eframe::egui::{
   self, Color32, TextureHandle, TextureOptions, ViewportCommand, ViewportId, WindowLevel,
@@ -32,7 +32,7 @@ use crate::{
     CaptureSurfaceCoordinator, DisplayRefreshOutcome, OverlayWindowReadiness, SurfaceLifecycle,
   },
   draft_coordinator::{DraftCoordinator, DraftCoordinatorError, DraftResult, StashJob},
-  editor::{EditorAction, EditorController, EditorTool},
+  editor::{EditorAction, EditorController, EditorTool, ToolStyle},
   export::{copy_image, write_png_atomically},
   instance::InstanceBridge,
   library_index::{LibraryIndexCoordinator, LibraryIndexCoordinatorError, LibraryIndexEvent},
@@ -47,7 +47,7 @@ use crate::{
   preview_loader::{PreviewKey, PreviewLoader, PreviewLoaderError, PreviewRequestToken},
   recent::RecentDocuments,
   renderer::render_document_to_image,
-  settings::{Settings, SettingsError},
+  settings::{Settings, SettingsError, ToolDefaultStyle, ToolDefaultStyles},
   storage::{
     DocumentSummary, GenerationId, ImportRequest, ImportedDocument, LoadedDocument, LoadedDraft,
     LocalStore, PersistenceContext, SaveRequest, SavedDocument, StorageError, StorePaths,
@@ -440,6 +440,29 @@ impl PreviewFailureCache {
   }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsStyleTab {
+  Rectangle,
+  Arrow,
+  Text,
+  Stroke,
+  Sequence,
+}
+
+impl SettingsStyleTab {
+  const ALL: [Self; 5] = [Self::Rectangle, Self::Arrow, Self::Text, Self::Stroke, Self::Sequence];
+
+  fn label(self) -> &'static str {
+    match self {
+      Self::Rectangle => "方框",
+      Self::Arrow => "箭头",
+      Self::Text => "文字",
+      Self::Stroke => "画笔",
+      Self::Sequence => "序号",
+    }
+  }
+}
+
 pub struct RsBoardApp {
   store: LocalStore,
   settings_path: PathBuf,
@@ -475,6 +498,7 @@ pub struct RsBoardApp {
   last_library_priority: Vec<DocumentId>,
   library_bootstrapped: bool,
   show_settings: bool,
+  settings_style_tab: SettingsStyleTab,
   rename_dialog: Option<(DocumentId, String)>,
   delete_document_dialog: Option<DocumentId>,
   delete_draft_dialog: bool,
@@ -594,6 +618,7 @@ impl RsBoardApp {
       last_library_priority: Vec::new(),
       library_bootstrapped: false,
       show_settings: false,
+      settings_style_tab: SettingsStyleTab::Rectangle,
       rename_dialog: None,
       delete_document_dialog: None,
       delete_draft_dialog: false,
@@ -1128,7 +1153,10 @@ impl RsBoardApp {
       prepared_background: background.prepared,
       native_background: background.native,
       background_texture: texture,
-      editor: EditorController::new(self.last_tool),
+      editor: EditorController::with_styles(
+        self.last_tool,
+        editor_styles_from_settings(&self.settings),
+      ),
     })
   }
 
@@ -1900,6 +1928,9 @@ impl RsBoardApp {
           }
         }
         EditorAction::Toast(message) => self.set_toast(message),
+        EditorAction::ToolColorChanged { tool, color_rgba } => {
+          self.remember_tool_color(tool, color_rgba);
+        }
         EditorAction::Undo => {
           if let Some(session) = self.session.as_mut()
             && let Err(error) = session.history.undo(&mut session.document)
@@ -2804,6 +2835,19 @@ impl RsBoardApp {
             ui.end_row();
           });
           ui.separator();
+          ui.label("默认样式");
+          ui.horizontal_wrapped(|ui| {
+            for tab in SettingsStyleTab::ALL {
+              ui.selectable_value(&mut self.settings_style_tab, tab, tab.label());
+            }
+          });
+          ui.add_space(4.0);
+          show_default_style_settings(
+            ui,
+            self.settings_style_tab,
+            &mut self.settings_draft.tool_styles,
+          );
+          ui.separator();
           if ui
             .add_enabled(
               self.phase == Phase::Idle,
@@ -3021,6 +3065,20 @@ impl RsBoardApp {
     self.settings_draft = next;
     self.show_settings = false;
     self.set_toast("设置已保存");
+  }
+
+  fn remember_tool_color(&mut self, tool: EditorTool, color_rgba: ColorRgba) {
+    let mut next = self.settings.clone();
+    if !set_tool_default_color(&mut next.tool_styles, tool, color_rgba) {
+      let _ = set_tool_default_color(&mut self.settings_draft.tool_styles, tool, color_rgba);
+      return;
+    }
+    if let Err(error) = next.save(&self.settings_path) {
+      self.set_toast(format!("无法保存工具颜色：{error}"));
+      return;
+    }
+    self.settings = next;
+    let _ = set_tool_default_color(&mut self.settings_draft.tool_styles, tool, color_rgba);
   }
 
   fn show_toast(&mut self, context: &egui::Context) {
@@ -3262,6 +3320,165 @@ fn toast_placement(message: &str) -> (egui::Align2, egui::Vec2) {
   } else {
     (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
   }
+}
+
+fn show_default_style_settings(
+  ui: &mut egui::Ui,
+  tab: SettingsStyleTab,
+  styles: &mut ToolDefaultStyles,
+) {
+  egui::Grid::new("settings-default-style-grid").num_columns(2).spacing([18.0, 12.0]).show(
+    ui,
+    |ui| match tab {
+      SettingsStyleTab::Rectangle => {
+        preset_combo(
+          ui,
+          "settings-rectangle-font-size",
+          "字号",
+          &mut styles.rectangle.font_size_px,
+          &PRESET_FONT_SIZES_PX,
+          format_pt,
+        );
+        preset_combo(
+          ui,
+          "settings-rectangle-width",
+          "边框",
+          &mut styles.rectangle.width_px,
+          &PRESET_STROKE_WIDTHS_PX,
+          format_px,
+        );
+      }
+      SettingsStyleTab::Arrow => {
+        preset_combo(
+          ui,
+          "settings-arrow-font-size",
+          "字号",
+          &mut styles.arrow.font_size_px,
+          &PRESET_FONT_SIZES_PX,
+          format_pt,
+        );
+        preset_combo(
+          ui,
+          "settings-arrow-width",
+          "边框",
+          &mut styles.arrow.width_px,
+          &PRESET_STROKE_WIDTHS_PX,
+          format_px,
+        );
+      }
+      SettingsStyleTab::Text => {
+        preset_combo(
+          ui,
+          "settings-text-font-size",
+          "字号",
+          &mut styles.text.font_size_px,
+          &PRESET_FONT_SIZES_PX,
+          format_pt,
+        );
+      }
+      SettingsStyleTab::Stroke => {
+        preset_combo(
+          ui,
+          "settings-stroke-width",
+          "宽度",
+          &mut styles.stroke.width_px,
+          &PRESET_STROKE_WIDTHS_PX,
+          format_px,
+        );
+        preset_combo(
+          ui,
+          "settings-stroke-hardness",
+          "硬度",
+          &mut styles.stroke.hardness,
+          &PRESET_BRUSH_HARDNESSES,
+          format_percent,
+        );
+      }
+      SettingsStyleTab::Sequence => {
+        preset_combo(
+          ui,
+          "settings-sequence-font-size",
+          "字号",
+          &mut styles.sequence.font_size_px,
+          &PRESET_FONT_SIZES_PX,
+          format_pt,
+        );
+      }
+    },
+  );
+}
+
+fn preset_combo(
+  ui: &mut egui::Ui,
+  id: &'static str,
+  label: &'static str,
+  value: &mut f32,
+  presets: &[f32],
+  format_value: fn(f32) -> String,
+) {
+  ui.label(label);
+  egui::ComboBox::from_id_salt(id).selected_text(format_value(*value)).show_ui(ui, |ui| {
+    for &preset in presets {
+      ui.selectable_value(value, preset, format_value(preset));
+    }
+  });
+  ui.end_row();
+}
+
+fn editor_styles_from_settings(settings: &Settings) -> [ToolStyle; 6] {
+  [
+    ToolStyle::default(),
+    editor_style(settings.tool_styles.rectangle),
+    editor_style(settings.tool_styles.arrow),
+    editor_style(settings.tool_styles.text),
+    editor_style(settings.tool_styles.stroke),
+    editor_style(settings.tool_styles.sequence),
+  ]
+}
+
+fn editor_style(style: ToolDefaultStyle) -> ToolStyle {
+  ToolStyle::new(style.color_rgba, style.width_px, style.font_size_px, style.hardness)
+}
+
+fn set_tool_default_color(
+  styles: &mut ToolDefaultStyles,
+  tool: EditorTool,
+  color_rgba: ColorRgba,
+) -> bool {
+  let Some(style) = tool_default_style_mut(styles, tool) else {
+    return false;
+  };
+  if style.color_rgba == color_rgba {
+    return false;
+  }
+  style.color_rgba = color_rgba;
+  true
+}
+
+fn tool_default_style_mut(
+  styles: &mut ToolDefaultStyles,
+  tool: EditorTool,
+) -> Option<&mut ToolDefaultStyle> {
+  match tool {
+    EditorTool::Select => None,
+    EditorTool::Rectangle => Some(&mut styles.rectangle),
+    EditorTool::Arrow => Some(&mut styles.arrow),
+    EditorTool::Text => Some(&mut styles.text),
+    EditorTool::Stroke => Some(&mut styles.stroke),
+    EditorTool::Sequence => Some(&mut styles.sequence),
+  }
+}
+
+fn format_pt(value: f32) -> String {
+  format!("{} pt", value as i32)
+}
+
+fn format_px(value: f32) -> String {
+  format!("{} px", value as i32)
+}
+
+fn format_percent(value: f32) -> String {
+  format!("{}%", (value * 100.0).round() as i32)
 }
 
 fn remember_editor_return_surface(
@@ -3618,6 +3835,30 @@ mod tests {
     );
     assert_eq!(toast_placement("设置已保存"), (egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0)));
     assert_eq!(SAVE_SUCCESS_TOAST_SHADOW_OFFSET, [2, 3]);
+  }
+
+  #[test]
+  fn settings_styles_map_to_editor_tool_styles() {
+    let mut settings = Settings::default();
+    settings.tool_styles.rectangle = ToolDefaultStyle::new(ColorRgba::BLUE, 12.0, 48.0, 1.0);
+    settings.tool_styles.stroke = ToolDefaultStyle::new(ColorRgba::GREEN, 4.0, 24.0, 0.5);
+
+    let styles = editor_styles_from_settings(&settings);
+
+    assert_eq!(styles[0], ToolStyle::default());
+    assert_eq!(styles[1], ToolStyle::new(ColorRgba::BLUE, 12.0, 48.0, 1.0));
+    assert_eq!(styles[4], ToolStyle::new(ColorRgba::GREEN, 4.0, 24.0, 0.5));
+  }
+
+  #[test]
+  fn tool_color_updates_only_apply_to_creation_tools() {
+    let mut styles = ToolDefaultStyles::default();
+
+    assert!(!set_tool_default_color(&mut styles, EditorTool::Select, ColorRgba::BLUE));
+    assert_eq!(styles, ToolDefaultStyles::default());
+    assert!(set_tool_default_color(&mut styles, EditorTool::Arrow, ColorRgba::BLUE));
+    assert_eq!(styles.arrow.color_rgba, ColorRgba::BLUE);
+    assert_eq!(styles.rectangle.color_rgba, ColorRgba::RED);
   }
 
   #[test]

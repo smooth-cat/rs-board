@@ -8,9 +8,11 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use common::ColorRgba;
+
 const SETTINGS_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
   pub version: u32,
@@ -18,6 +20,7 @@ pub struct Settings {
   pub include_cursor: bool,
   pub launch_at_login: bool,
   pub copy_image_after_save: bool,
+  pub tool_styles: ToolDefaultStyles,
 }
 
 impl Default for Settings {
@@ -28,8 +31,77 @@ impl Default for Settings {
       include_cursor: false,
       launch_at_login: false,
       copy_image_after_save: true,
+      tool_styles: ToolDefaultStyles::default(),
     }
   }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDefaultStyle {
+  pub color_rgba: ColorRgba,
+  pub width_px: f32,
+  pub font_size_px: f32,
+  pub hardness: f32,
+}
+
+impl ToolDefaultStyle {
+  pub const fn new(color_rgba: ColorRgba, width_px: f32, font_size_px: f32, hardness: f32) -> Self {
+    Self { color_rgba, width_px, font_size_px, hardness }
+  }
+}
+
+impl Default for ToolDefaultStyle {
+  fn default() -> Self {
+    Self::new(ColorRgba::RED, 8.0, 24.0, 1.0)
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolDefaultStyles {
+  #[serde(default = "default_rectangle_style")]
+  pub rectangle: ToolDefaultStyle,
+  #[serde(default = "default_arrow_style")]
+  pub arrow: ToolDefaultStyle,
+  #[serde(default = "default_text_style")]
+  pub text: ToolDefaultStyle,
+  #[serde(default = "default_stroke_style")]
+  pub stroke: ToolDefaultStyle,
+  #[serde(default = "default_sequence_style")]
+  pub sequence: ToolDefaultStyle,
+}
+
+impl Default for ToolDefaultStyles {
+  fn default() -> Self {
+    Self {
+      rectangle: default_rectangle_style(),
+      arrow: default_arrow_style(),
+      text: default_text_style(),
+      stroke: default_stroke_style(),
+      sequence: default_sequence_style(),
+    }
+  }
+}
+
+fn default_rectangle_style() -> ToolDefaultStyle {
+  ToolDefaultStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
+}
+
+fn default_arrow_style() -> ToolDefaultStyle {
+  ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
+}
+
+fn default_text_style() -> ToolDefaultStyle {
+  ToolDefaultStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
+}
+
+fn default_stroke_style() -> ToolDefaultStyle {
+  ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 0.0)
+}
+
+fn default_sequence_style() -> ToolDefaultStyle {
+  ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
 }
 
 impl Settings {
@@ -112,6 +184,17 @@ mod tests {
     assert!(!settings.include_cursor);
     assert!(!settings.launch_at_login);
     assert!(settings.copy_image_after_save);
+    assert_eq!(
+      settings.tool_styles.rectangle,
+      ToolDefaultStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
+    );
+    assert_eq!(settings.tool_styles.arrow, ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0));
+    assert_eq!(settings.tool_styles.text, ToolDefaultStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0));
+    assert_eq!(settings.tool_styles.stroke, ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 0.0));
+    assert_eq!(
+      settings.tool_styles.sequence,
+      ToolDefaultStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
+    );
   }
 
   #[test]
@@ -126,5 +209,30 @@ mod tests {
   #[test]
   fn missing_settings_use_defaults() {
     assert_eq!(Settings::load_or_default(&temp_path()).unwrap(), Settings::default());
+  }
+
+  #[test]
+  fn legacy_settings_without_tool_styles_fill_defaults() {
+    let path = temp_path();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      br#"{
+  "version": 1,
+  "global_hotkey": "F2",
+  "include_cursor": true,
+  "launch_at_login": false,
+  "copy_image_after_save": false
+}"#,
+    )
+    .unwrap();
+
+    let loaded = Settings::load_or_default(&path).unwrap();
+
+    assert_eq!(loaded.global_hotkey, "F2");
+    assert!(loaded.include_cursor);
+    assert!(!loaded.copy_image_after_save);
+    assert_eq!(loaded.tool_styles, ToolDefaultStyles::default());
+    fs::remove_dir_all(path.parent().unwrap()).unwrap();
   }
 }

@@ -107,10 +107,28 @@ impl Default for ToolStyle {
   }
 }
 
+impl ToolStyle {
+  pub const fn new(color_rgba: ColorRgba, width_px: f32, font_size_px: f32, hardness: f32) -> Self {
+    Self { color_rgba, width_px, font_size_px, hardness }
+  }
+}
+
+pub fn default_tool_styles() -> [ToolStyle; 6] {
+  [
+    ToolStyle::default(),
+    ToolStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0),
+    ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0),
+    ToolStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0),
+    ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 0.0),
+    ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0),
+  ]
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
   Command(CommandBatch),
   Toast(String),
+  ToolColorChanged { tool: EditorTool, color_rgba: ColorRgba },
   Undo,
   Redo,
   Save,
@@ -338,9 +356,13 @@ impl Default for EditorController {
 
 impl EditorController {
   pub fn new(restored_tool: impl Into<Option<EditorTool>>) -> Self {
+    Self::with_styles(restored_tool, default_tool_styles())
+  }
+
+  pub fn with_styles(restored_tool: impl Into<Option<EditorTool>>, styles: [ToolStyle; 6]) -> Self {
     Self {
       tool: restored_tool.into().unwrap_or(EditorTool::Rectangle),
-      styles: [ToolStyle::default(); 6],
+      styles,
       selected_element_id: None,
       interaction: None,
       released_preview_element: None,
@@ -2085,6 +2107,7 @@ impl EditorController {
         }
       }
       if change != StyleChange::default() {
+        let changed_color = change.color_rgba;
         let pending_label_text = pending_element_label_text(actions, element_id);
         let effective_arrow_label_text = match &element.payload {
           ElementPayload::Arrow(payload) => {
@@ -2104,10 +2127,16 @@ impl EditorController {
           }
         }
         actions.push(command_action(DocumentCommand::ChangeElementStyle { element_id, change }));
+        if let Some(color_rgba) = changed_color {
+          let tool = tool_for_element(element);
+          self.styles[tool.index()].color_rgba = color_rgba;
+          actions.push(EditorAction::ToolColorChanged { tool, color_rgba });
+        }
       }
       return;
     }
 
+    let changed_color = change.color_rgba.filter(|_| self.tool != EditorTool::Select);
     let style = &mut self.styles[self.tool.index()];
     if let Some(color) = change.color_rgba {
       style.color_rgba = color;
@@ -2120,6 +2149,9 @@ impl EditorController {
     }
     if let Some(hardness) = change.hardness {
       style.hardness = hardness;
+    }
+    if let Some(color_rgba) = changed_color {
+      actions.push(EditorAction::ToolColorChanged { tool: self.tool, color_rgba });
     }
   }
 
@@ -3173,6 +3205,16 @@ fn tool_for_key(key: Key) -> Option<EditorTool> {
   }
 }
 
+fn tool_for_element(element: &Element) -> EditorTool {
+  match element.payload {
+    ElementPayload::Stroke(_) => EditorTool::Stroke,
+    ElementPayload::Arrow(_) => EditorTool::Arrow,
+    ElementPayload::Rectangle(_) => EditorTool::Rectangle,
+    ElementPayload::Text(_) => EditorTool::Text,
+    ElementPayload::SequenceMarker(_) => EditorTool::Sequence,
+  }
+}
+
 fn style_for_element(element: &Element) -> ToolStyle {
   match &element.payload {
     ElementPayload::Stroke(payload) => ToolStyle {
@@ -3459,6 +3501,111 @@ mod tests {
     assert_eq!(payload.hardness, 0.0);
   }
 
+  #[test]
+  fn default_tool_styles_match_the_settings_plan() {
+    let controller = EditorController::default();
+
+    assert_eq!(
+      controller.tool_style(EditorTool::Rectangle),
+      ToolStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
+    );
+    assert_eq!(
+      controller.tool_style(EditorTool::Arrow),
+      ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
+    );
+    assert_eq!(
+      controller.tool_style(EditorTool::Text),
+      ToolStyle::new(ColorRgba::RED, 8.0, 36.0, 1.0)
+    );
+    assert_eq!(
+      controller.tool_style(EditorTool::Stroke),
+      ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 0.0)
+    );
+    assert_eq!(
+      controller.tool_style(EditorTool::Sequence),
+      ToolStyle::new(ColorRgba::RED, 8.0, 24.0, 1.0)
+    );
+  }
+
+  #[test]
+  fn injected_tool_styles_are_used_for_new_elements() {
+    let document = document();
+    let mut styles = default_tool_styles();
+    styles[EditorTool::Rectangle.index()] = ToolStyle::new(ColorRgba::BLUE, 12.0, 48.0, 1.0);
+    styles[EditorTool::Stroke.index()] = ToolStyle::new(ColorRgba::GREEN, 4.0, 24.0, 0.5);
+    let controller = EditorController::with_styles(EditorTool::Rectangle, styles);
+
+    let rectangle =
+      controller.rectangle_payload(PointPx::new(20.0, 20.0), PointPx::new(180.0, 120.0)).unwrap();
+    assert_eq!(rectangle.stroke_style.color_rgba, ColorRgba::BLUE);
+    assert_eq!(rectangle.stroke_style.width_px, 12.0);
+    assert_eq!(rectangle.label.text_style.font_size_px, 48.0);
+
+    let stroke = controller.make_stroke(&document, &[PointPx::new(80.0, 60.0)]).unwrap();
+    let ElementPayload::Stroke(payload) = stroke.payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.stroke_style.color_rgba, ColorRgba::GREEN);
+    assert_eq!(payload.stroke_style.width_px, 4.0);
+    assert_eq!(payload.hardness, 0.5);
+  }
+
+  #[test]
+  fn active_tool_color_selection_updates_style_and_emits_persistence_action() {
+    let document = document();
+    let mut controller = EditorController::new(EditorTool::Rectangle);
+    let mut actions = Vec::new();
+
+    controller.apply_style_change(
+      &document,
+      StyleChange { color_rgba: Some(ColorRgba::BLUE), ..StyleChange::default() },
+      &mut actions,
+    );
+
+    assert_eq!(
+      actions,
+      vec![EditorAction::ToolColorChanged {
+        tool: EditorTool::Rectangle,
+        color_rgba: ColorRgba::BLUE,
+      }]
+    );
+    assert_eq!(controller.tool_style(EditorTool::Rectangle).color_rgba, ColorRgba::BLUE);
+  }
+
+  #[test]
+  fn selected_element_color_selection_persists_to_the_matching_tool() {
+    let mut document = document();
+    let element = text_element(&document, PointPx::new(40.0, 40.0), "text", 120.0);
+    let element_id = element.element_id;
+    document.elements.push(element);
+    document.validate().unwrap();
+    let mut controller = EditorController::new(EditorTool::Select);
+    controller.selected_element_id = Some(element_id);
+    let mut actions = Vec::new();
+
+    controller.apply_style_change(
+      &document,
+      StyleChange { color_rgba: Some(ColorRgba::GREEN), ..StyleChange::default() },
+      &mut actions,
+    );
+
+    assert!(matches!(
+      actions.as_slice(),
+      [
+        EditorAction::Command(batch),
+        EditorAction::ToolColorChanged {
+          tool: EditorTool::Text,
+          color_rgba: ColorRgba::GREEN,
+        },
+      ] if matches!(
+        batch.commands(),
+        [DocumentCommand::ChangeElementStyle { element_id: changed_id, change }]
+          if *changed_id == element_id && change.color_rgba == Some(ColorRgba::GREEN)
+      )
+    ));
+    assert_eq!(controller.tool_style(EditorTool::Text).color_rgba, ColorRgba::GREEN);
+  }
+
   fn text_element(
     document: &BoardDocument,
     anchor_px: PointPx,
@@ -3725,6 +3872,7 @@ mod tests {
       interaction: Some(interaction),
       ..Default::default()
     };
+    controller.styles[EditorTool::Stroke.index()].hardness = 1.0;
 
     let preview = paint_canvas_output(&controller, &document);
     let preview_strokes = preview
