@@ -2,10 +2,12 @@ use common::{
   ArrowEndpoint, ArrowHead, ArrowPayload, BoardDocument, ColorRgba, CommandBatch, CommandHistory,
   DocumentCommand, Element, ElementId, ElementLabel, ElementPayload, PRESET_BRUSH_HARDNESSES,
   PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, PointPx, RectPx, RectangleLabelAnchor,
-  RectangleLabelEdge, RectangleLabelSide, RectanglePayload, SequenceMarkerPayload, SizePx,
-  StrokePayload, StrokePoint, StrokeStyle, StyleChange, TextAlign, TextPayload, TextStyle,
-  arrow_label_layout, arrow_minimum_length_for_label, choose_rectangle_label_anchor, layout_text,
+  RectangleLabelEdge, RectangleLabelScene, RectangleLabelSide, RectangleLabelSolution,
+  RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokePoint, StrokeStyle,
+  StyleChange, TextAlign, TextPayload, TextStyle, arrow_label_layout,
+  arrow_minimum_length_for_label, choose_rectangle_label_anchor, layout_text,
   minimum_geometry_extent, rectangle_label_layout, snap_rectangle_label_layout,
+  solve_rectangle_label_reflow,
 };
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FocusDirection, FontId, Id, ImeEvent, Key,
@@ -210,6 +212,7 @@ impl CanvasTransform {
 #[derive(Debug, Clone)]
 enum PointerInteraction {
   Draw {
+    element_id: ElementId,
     tool: EditorTool,
     start: PointPx,
     current: PointPx,
@@ -309,6 +312,29 @@ struct InlineTextGeometry {
   wrap_width_px: f32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ElementPreviewSet {
+  elements: Vec<Element>,
+}
+
+impl ElementPreviewSet {
+  fn single(element: Element) -> Self {
+    Self { elements: vec![element] }
+  }
+
+  fn is_empty(&self) -> bool {
+    self.elements.is_empty()
+  }
+
+  fn get(&self, element_id: ElementId) -> Option<&Element> {
+    self.elements.iter().find(|element| element.element_id == element_id)
+  }
+
+  fn iter(&self) -> impl Iterator<Item = &Element> {
+    self.elements.iter()
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShortcutAction {
   Tool(EditorTool),
@@ -343,7 +369,7 @@ pub struct EditorController {
   global_color: ColorRgba,
   selected_element_id: Option<ElementId>,
   interaction: Option<PointerInteraction>,
-  released_preview_element: Option<Element>,
+  released_preview_elements: ElementPreviewSet,
   text_editing: Option<TextEditing>,
   last_pointer_document: Option<PointPx>,
   option_panel_anchor: Option<Pos2>,
@@ -381,7 +407,7 @@ impl EditorController {
       global_color,
       selected_element_id: None,
       interaction: None,
-      released_preview_element: None,
+      released_preview_elements: ElementPreviewSet::default(),
       text_editing: None,
       last_pointer_document: None,
       option_panel_anchor: None,
@@ -413,7 +439,7 @@ impl EditorController {
     self.tool = tool;
     self.selected_element_id = None;
     self.interaction = None;
-    self.released_preview_element = None;
+    self.released_preview_elements = ElementPreviewSet::default();
     self.active_tool_button_press_started = false;
     self.reset_stylus_input();
   }
@@ -499,7 +525,7 @@ impl EditorController {
     background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     let ctx = root_ui.ctx().clone();
-    self.released_preview_element = None;
+    self.released_preview_elements = ElementPreviewSet::default();
     if self.selected_element_id.is_some_and(|id| document.element(id).is_none()) {
       self.selected_element_id = None;
     }
@@ -583,7 +609,7 @@ impl EditorController {
           self.paint_selection(&painter, transform, document);
         }
       }
-      self.released_preview_element = None;
+      self.released_preview_elements = ElementPreviewSet::default();
       self.handle_keyboard(&ctx, document, &mut actions);
       self.show_option_panel(&ctx, transform, document, &mut actions);
     } else {
@@ -707,7 +733,11 @@ impl EditorController {
       }
       ShortcutAction::Delete => {
         if let Some(element_id) = self.selected_element_id.take() {
-          actions.push(command_action(DocumentCommand::DeleteElement { element_id }));
+          actions.push(rectangle_command_action(
+            document,
+            DocumentCommand::DeleteElement { element_id },
+            element_id,
+          ));
         }
       }
       ShortcutAction::Copy => {
@@ -909,6 +939,7 @@ impl EditorController {
             Vec::new()
           };
           self.interaction = Some(PointerInteraction::Draw {
+            element_id: ElementId::new(),
             tool: self.tool,
             start,
             current: pointer_position.unwrap_or(start),
@@ -1161,6 +1192,7 @@ impl EditorController {
       }
       TextTarget::NewText { .. } => {
         self.interaction = Some(PointerInteraction::Draw {
+          element_id: ElementId::new(),
           tool: EditorTool::Text,
           start: position,
           current: position,
@@ -1177,15 +1209,10 @@ impl EditorController {
     self
       .interaction
       .as_ref()
-      .and_then(|interaction| interaction_preview_element(interaction, document))
-      .filter(|element| element.element_id == target_id)
-      .or_else(|| {
-        self
-          .released_preview_element
-          .as_ref()
-          .filter(|element| element.element_id == target_id)
-          .cloned()
+      .and_then(|interaction| {
+        interaction_preview_set(self, interaction, document).get(target_id).cloned()
       })
+      .or_else(|| self.released_preview_elements.get(target_id).cloned())
   }
 
   fn text_editing_bounds_px(&self, document: &BoardDocument) -> Option<RectPx> {
@@ -1272,11 +1299,17 @@ impl EditorController {
     let Some(interaction) = self.interaction.take() else {
       return;
     };
-    self.released_preview_element = None;
+    self.released_preview_elements = ElementPreviewSet::default();
     match interaction {
-      PointerInteraction::Draw { tool, start, current, mut stroke_points } => match tool {
+      PointerInteraction::Draw {
+        element_id: draw_element_id,
+        tool,
+        start,
+        current,
+        mut stroke_points,
+      } => match tool {
         EditorTool::Rectangle => {
-          if let Some(element) = self.make_rectangle(document, start, current) {
+          if let Some(element) = self.make_rectangle(document, draw_element_id, start, current) {
             let element_id = element.element_id;
             let ElementPayload::Rectangle(payload) = &element.payload else {
               unreachable!("rectangle tool created a non-rectangle element");
@@ -1399,12 +1432,17 @@ impl EditorController {
           && let ElementPayload::Rectangle(payload) = &element.payload
           && let Ok(layout) =
             snap_rectangle_label_layout(payload, document.canvas_size_px, current + grab_offset_px)
-          && layout.anchor != payload.label_anchor
+          && (layout.anchor != payload.label_anchor
+            || layout.anchor != payload.preferred_label_anchor)
         {
           self.push_pointer_command(
             document,
             actions,
-            DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor: layout.anchor },
+            DocumentCommand::SetRectangleLabelPlacement {
+              element_id,
+              preferred_anchor: layout.anchor,
+              actual_anchor: layout.anchor,
+            },
             element_id,
           );
         }
@@ -1419,15 +1457,19 @@ impl EditorController {
     command: DocumentCommand,
     preview_element_id: ElementId,
   ) {
-    let batch = CommandBatch::single(command);
-    self.released_preview_element =
-      preview_element_after_batch(document, &batch, preview_element_id);
+    let batch = rectangle_reflow_batch(document, vec![command.clone()], preview_element_id, &[])
+      .unwrap_or_else(|| CommandBatch::single(command));
+    self.released_preview_elements = preview_set_after_batch(document, &batch);
+    if self.released_preview_elements.get(preview_element_id).is_none() {
+      self.released_preview_elements = ElementPreviewSet::default();
+    }
     actions.push(EditorAction::Command(batch));
   }
 
   fn make_rectangle(
     &self,
     document: &BoardDocument,
+    element_id: ElementId,
     start_px: PointPx,
     end_px: PointPx,
   ) -> Option<Element> {
@@ -1436,12 +1478,9 @@ impl EditorController {
       coordinate_at_minimum(start_px.x_px, end_px.x_px, minimum, 1.0),
       coordinate_at_minimum(start_px.y_px, end_px.y_px, minimum, 1.0),
     );
-    let mut payload = self.rectangle_payload(start_px, end_px)?;
-    let obstacles = rectangle_label_obstacles(document, None);
-    payload.label_anchor =
-      choose_rectangle_label_anchor(&payload, document.canvas_size_px, &obstacles).ok()?;
+    let payload = self.rectangle_payload(start_px, end_px)?;
     Element::new(
-      ElementId::new(),
+      element_id,
       document.elements.len() as i64,
       ElementPayload::Rectangle(payload),
       document.canvas_size_px,
@@ -1452,6 +1491,7 @@ impl EditorController {
   fn make_rectangle_preview(
     &self,
     document: &BoardDocument,
+    element_id: ElementId,
     start_px: PointPx,
     end_px: PointPx,
   ) -> Option<Element> {
@@ -1459,7 +1499,7 @@ impl EditorController {
     let body = RectPx::from_points(start_px, end_px);
     let minimum = minimum_geometry_extent(payload.stroke_style.width_px).ok()?;
     let mut element = Element {
-      element_id: ElementId::new(),
+      element_id,
       z_index: document.elements.len() as i64,
       bounds_px: RectPx::from_min_max(PointPx::ZERO, PointPx::ZERO),
       payload: ElementPayload::Rectangle(payload),
@@ -1489,6 +1529,11 @@ impl EditorController {
         text_style,
       },
       label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
+      preferred_label_anchor: RectangleLabelAnchor::new(
         RectangleLabelEdge::Top,
         RectangleLabelSide::Outside,
         0.0,
@@ -1743,23 +1788,13 @@ impl EditorController {
           return;
         };
         let text = normalized_label_text(editing.buffer);
-        let anchor = if editing.auto_place_rectangle && text.is_some() {
-          let mut draft = payload.clone();
-          draft.label.text = text.clone();
-          let obstacles = rectangle_label_obstacles(document, Some(element_id));
-          choose_rectangle_label_anchor(&draft, document.canvas_size_px, &obstacles)
-            .unwrap_or(payload.label_anchor)
-        } else {
-          payload.label_anchor
-        };
-        let mut commands = Vec::with_capacity(2);
+        let mut commands = Vec::with_capacity(1);
         if payload.label.text != text {
           commands.push(DocumentCommand::UpdateElementLabel { element_id, text });
         }
-        if payload.label_anchor != anchor {
-          commands.push(DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor });
-        }
-        if let Ok(batch) = CommandBatch::new(commands) {
+        if !commands.is_empty()
+          && let Some(batch) = rectangle_reflow_batch(document, commands, element_id, &[])
+        {
           actions.push(EditorAction::Command(batch));
         }
       }
@@ -2127,16 +2162,32 @@ impl EditorController {
             ui.separator();
             ui.horizontal(|ui| {
               if ui.button("↑").on_hover_text("上移一层").clicked() {
-                actions.push(command_action(DocumentCommand::BringForward { element_id }));
+                actions.push(rectangle_command_action(
+                  document,
+                  DocumentCommand::BringForward { element_id },
+                  element_id,
+                ));
               }
               if ui.button("↓").on_hover_text("下移一层").clicked() {
-                actions.push(command_action(DocumentCommand::SendBackward { element_id }));
+                actions.push(rectangle_command_action(
+                  document,
+                  DocumentCommand::SendBackward { element_id },
+                  element_id,
+                ));
               }
               if ui.button("⇈").on_hover_text("置于顶层").clicked() {
-                actions.push(command_action(DocumentCommand::BringToFront { element_id }));
+                actions.push(rectangle_command_action(
+                  document,
+                  DocumentCommand::BringToFront { element_id },
+                  element_id,
+                ));
               }
               if ui.button("⇊").on_hover_text("置于底层").clicked() {
-                actions.push(command_action(DocumentCommand::SendToBack { element_id }));
+                actions.push(rectangle_command_action(
+                  document,
+                  DocumentCommand::SendToBack { element_id },
+                  element_id,
+                ));
               }
             });
           }
@@ -2218,7 +2269,11 @@ impl EditorController {
             return;
           }
         }
-        actions.push(command_action(DocumentCommand::ChangeElementStyle { element_id, change }));
+        actions.push(rectangle_command_action(
+          document,
+          DocumentCommand::ChangeElementStyle { element_id, change },
+          element_id,
+        ));
       }
       return;
     }
@@ -2257,12 +2312,15 @@ impl EditorController {
     let interaction_preview = self
       .interaction
       .as_ref()
-      .and_then(|interaction| interaction_preview_element(interaction, document));
-    let preview_element = interaction_preview.as_ref().or(self.released_preview_element.as_ref());
+      .map(|interaction| interaction_preview_set(self, interaction, document))
+      .unwrap_or_default();
+    let preview_elements = if interaction_preview.is_empty() {
+      &self.released_preview_elements
+    } else {
+      &interaction_preview
+    };
     for element in &document.elements {
-      let display_element = preview_element
-        .filter(|preview| preview.element_id == element.element_id)
-        .unwrap_or(element);
+      let display_element = preview_elements.get(element.element_id).unwrap_or(element);
       match self.text_editing.as_ref().map(|editing| &editing.target) {
         Some(TextTarget::ExistingText { element_id }) if *element_id == element.element_id => {}
         Some(TextTarget::ArrowLabel { element_id }) if *element_id == element.element_id => {
@@ -2284,10 +2342,10 @@ impl EditorController {
         _ => paint_element(&painter, &transform, display_element, 1.0),
       }
     }
-    if let Some(preview) = preview_element
-      && document.element(preview.element_id).is_none()
-    {
-      paint_element(&painter, &transform, preview, 1.0);
+    for preview in preview_elements.iter() {
+      if document.element(preview.element_id).is_none() {
+        paint_element(&painter, &transform, preview, 1.0);
+      }
     }
   }
 
@@ -2320,12 +2378,8 @@ impl EditorController {
       return;
     };
     match interaction {
-      PointerInteraction::Draw { tool, start, current, stroke_points } => match tool {
-        EditorTool::Rectangle => {
-          if let Some(element) = self.make_rectangle_preview(document, *start, *current) {
-            paint_element(painter, &transform, &element, 0.72);
-          }
-        }
+      PointerInteraction::Draw { tool, start, current, stroke_points, .. } => match tool {
+        EditorTool::Rectangle => {}
         EditorTool::Arrow => {
           if let Some(element) = self.make_arrow_preview(document, *start, *current) {
             paint_element(painter, &transform, &element, 0.72);
@@ -2360,11 +2414,14 @@ impl EditorController {
     let interaction_preview = self
       .interaction
       .as_ref()
-      .and_then(|interaction| interaction_preview_element(interaction, document));
-    let preview_element = interaction_preview.as_ref().or(self.released_preview_element.as_ref());
-    let Some(element) = preview_element
-      .filter(|element| element.element_id == element_id)
-      .or_else(|| document.element(element_id))
+      .map(|interaction| interaction_preview_set(self, interaction, document))
+      .unwrap_or_default();
+    let preview_elements = if interaction_preview.is_empty() {
+      &self.released_preview_elements
+    } else {
+      &interaction_preview
+    };
+    let Some(element) = preview_elements.get(element_id).or_else(|| document.element(element_id))
     else {
       return;
     };
@@ -2795,10 +2852,138 @@ fn interaction_preview_element(
       };
       payload.label_anchor =
         snap_rectangle_label_layout(payload, document.canvas_size_px, *current + *grab_offset_px)
-          .ok()?
-          .anchor;
+          .ok()
+          .map(|layout| layout.anchor)
+          .unwrap_or(payload.label_anchor);
+      payload.preferred_label_anchor = payload.label_anchor;
       preview.refresh_bounds(document.canvas_size_px).ok()?;
       Some(preview)
+    }
+  }
+}
+
+fn interaction_preview_set(
+  controller: &EditorController,
+  interaction: &PointerInteraction,
+  document: &BoardDocument,
+) -> ElementPreviewSet {
+  match interaction {
+    PointerInteraction::Draw {
+      element_id, tool: EditorTool::Rectangle, start, current, ..
+    } => {
+      let Some(preview) =
+        controller.make_rectangle_preview(document, *element_id, *start, *current)
+      else {
+        return ElementPreviewSet::default();
+      };
+      if preview.validate(document.canvas_size_px).is_err() {
+        return ElementPreviewSet::single(preview);
+      }
+      rectangle_reflow_batch(
+        document,
+        vec![DocumentCommand::AddElement { element: preview.clone() }],
+        *element_id,
+        &[],
+      )
+      .map(|batch| preview_set_after_batch(document, &batch))
+      .filter(|set| !set.is_empty())
+      .unwrap_or_else(|| ElementPreviewSet::single(preview))
+    }
+    PointerInteraction::Move { element_id, start, current } => {
+      let Some(element) = document.element(*element_id) else {
+        return ElementPreviewSet::default();
+      };
+      if !matches!(element.payload, ElementPayload::Rectangle(_)) {
+        return interaction_preview_element(interaction, document)
+          .map(ElementPreviewSet::single)
+          .unwrap_or_default();
+      }
+      let delta_px = *current - *start;
+      if delta_px.distance_to(PointPx::ZERO) <= 0.01 {
+        return ElementPreviewSet::default();
+      }
+      rectangle_reflow_batch(
+        document,
+        vec![DocumentCommand::MoveElement { element_id: *element_id, delta_px }],
+        *element_id,
+        &[],
+      )
+      .map(|batch| preview_set_after_batch(document, &batch))
+      .filter(|set| !set.is_empty())
+      .unwrap_or_else(|| {
+        interaction_preview_element(interaction, document)
+          .map(ElementPreviewSet::single)
+          .unwrap_or_default()
+      })
+    }
+    PointerInteraction::ResizeRectangle { element_id, handle, original, current } => {
+      let Some(preview) = interaction_preview_element(interaction, document) else {
+        return ElementPreviewSet::default();
+      };
+      let ElementPayload::Rectangle(payload) = &preview.payload else {
+        return ElementPreviewSet::single(preview);
+      };
+      let Ok(minimum) = minimum_geometry_extent(payload.stroke_style.width_px) else {
+        return ElementPreviewSet::single(preview);
+      };
+      let (raw_start_px, raw_end_px) = resized_rectangle(*original, *handle, *current);
+      let raw_body = RectPx::from_points(raw_start_px, raw_end_px);
+      if raw_body.width() < minimum || raw_body.height() < minimum {
+        return ElementPreviewSet::single(preview);
+      }
+      let (start_px, end_px) = minimum_resized_rectangle(*original, *handle, *current, minimum);
+      rectangle_reflow_batch(
+        document,
+        vec![DocumentCommand::ResizeRectangle { element_id: *element_id, start_px, end_px }],
+        *element_id,
+        &[],
+      )
+      .map(|batch| preview_set_after_batch(document, &batch))
+      .filter(|set| !set.is_empty())
+      .unwrap_or_else(|| ElementPreviewSet::single(preview))
+    }
+    PointerInteraction::DragRectangleLabel { element_id, current, grab_offset_px } => {
+      let Some(element) = document.element(*element_id) else {
+        return ElementPreviewSet::default();
+      };
+      let ElementPayload::Rectangle(payload) = &element.payload else {
+        return interaction_preview_element(interaction, document)
+          .map(ElementPreviewSet::single)
+          .unwrap_or_default();
+      };
+      let Some(layout) =
+        snap_rectangle_label_layout(payload, document.canvas_size_px, *current + *grab_offset_px)
+          .ok()
+      else {
+        return interaction_preview_element(interaction, document)
+          .map(ElementPreviewSet::single)
+          .unwrap_or_default();
+      };
+      if layout.anchor == payload.label_anchor && layout.anchor == payload.preferred_label_anchor {
+        return ElementPreviewSet::default();
+      }
+      rectangle_reflow_batch(
+        document,
+        vec![DocumentCommand::SetRectangleLabelPlacement {
+          element_id: *element_id,
+          preferred_anchor: layout.anchor,
+          actual_anchor: layout.anchor,
+        }],
+        *element_id,
+        &[],
+      )
+      .map(|batch| preview_set_after_batch(document, &batch))
+      .filter(|set| !set.is_empty())
+      .unwrap_or_else(|| {
+        interaction_preview_element(interaction, document)
+          .map(ElementPreviewSet::single)
+          .unwrap_or_default()
+      })
+    }
+    PointerInteraction::Draw { .. } | PointerInteraction::UpdateArrowEndpoint { .. } => {
+      interaction_preview_element(interaction, document)
+        .map(ElementPreviewSet::single)
+        .unwrap_or_default()
     }
   }
 }
@@ -3340,6 +3525,88 @@ fn command_action(command: DocumentCommand) -> EditorAction {
   EditorAction::Command(CommandBatch::single(command))
 }
 
+fn rectangle_command_action(
+  document: &BoardDocument,
+  command: DocumentCommand,
+  primary_id: ElementId,
+) -> EditorAction {
+  let batch = rectangle_reflow_batch(document, vec![command.clone()], primary_id, &[])
+    .unwrap_or_else(|| CommandBatch::single(command));
+  EditorAction::Command(batch)
+}
+
+pub(crate) fn rectangle_reflow_batch(
+  document: &BoardDocument,
+  commands: Vec<DocumentCommand>,
+  primary_id: ElementId,
+  seed_ids: &[ElementId],
+) -> Option<CommandBatch> {
+  let base_batch = CommandBatch::new(commands.clone()).ok()?;
+  let mut staged = document.clone();
+  base_batch.clone().apply(&mut staged).ok()?;
+
+  let before = RectangleLabelScene::from_document(document);
+  let after = RectangleLabelScene::from_document(&staged);
+  let mut solutions = solve_rectangle_label_reflow(&before, &after, primary_id, seed_ids).ok()?;
+  solutions.sort_by(|left, right| {
+    let left_element = staged.element(left.element_id);
+    let right_element = staged.element(right.element_id);
+    right_element
+      .map(|element| element.z_index)
+      .cmp(&left_element.map(|element| element.z_index))
+      .then_with(|| left.element_id.as_uuid().as_u128().cmp(&right.element_id.as_uuid().as_u128()))
+  });
+
+  let mut reflowed_commands = commands;
+  for solution in solutions {
+    let Some(element) = staged.element(solution.element_id) else {
+      continue;
+    };
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      continue;
+    };
+    if payload.preferred_label_anchor == solution.preferred_anchor
+      && payload.label_anchor == solution.actual_anchor
+    {
+      continue;
+    }
+    if document.element(solution.element_id).is_none()
+      && update_added_rectangle_solution(&mut reflowed_commands, solution, document.canvas_size_px)
+    {
+      continue;
+    }
+    reflowed_commands.push(DocumentCommand::SetRectangleLabelPlacement {
+      element_id: solution.element_id,
+      preferred_anchor: solution.preferred_anchor,
+      actual_anchor: solution.actual_anchor,
+    });
+  }
+
+  CommandBatch::new(reflowed_commands).ok()
+}
+
+fn update_added_rectangle_solution(
+  commands: &mut [DocumentCommand],
+  solution: RectangleLabelSolution,
+  canvas_size_px: SizePx,
+) -> bool {
+  for command in commands {
+    let DocumentCommand::AddElement { element } = command else {
+      continue;
+    };
+    if element.element_id != solution.element_id {
+      continue;
+    }
+    let ElementPayload::Rectangle(payload) = &mut element.payload else {
+      return false;
+    };
+    payload.preferred_label_anchor = solution.preferred_anchor;
+    payload.label_anchor = solution.actual_anchor;
+    return element.refresh_bounds(canvas_size_px).is_ok();
+  }
+  false
+}
+
 fn pending_element_label_text(
   actions: &[EditorAction],
   element_id: ElementId,
@@ -3359,14 +3626,19 @@ fn pending_element_label_text(
   })
 }
 
-fn preview_element_after_batch(
-  document: &BoardDocument,
-  batch: &CommandBatch,
-  element_id: ElementId,
-) -> Option<Element> {
+fn preview_set_after_batch(document: &BoardDocument, batch: &CommandBatch) -> ElementPreviewSet {
   let mut staged = document.clone();
-  batch.clone().apply(&mut staged).ok()?;
-  staged.element(element_id).cloned()
+  if batch.clone().apply(&mut staged).is_err() {
+    return ElementPreviewSet::default();
+  }
+  ElementPreviewSet {
+    elements: staged
+      .elements
+      .iter()
+      .filter(|element| document.element(element.element_id) != Some(*element))
+      .cloned()
+      .collect(),
+  }
 }
 
 fn contains(rect: RectPx, point: PointPx) -> bool {
@@ -3970,6 +4242,34 @@ mod tests {
     }
   }
 
+  fn resize_rectangle_command(
+    commands: &[DocumentCommand],
+    expected_id: ElementId,
+  ) -> Option<(PointPx, PointPx)> {
+    commands.iter().find_map(|command| match command {
+      DocumentCommand::ResizeRectangle { element_id, start_px, end_px }
+        if *element_id == expected_id =>
+      {
+        Some((*start_px, *end_px))
+      }
+      _ => None,
+    })
+  }
+
+  fn rectangle_label_placement_command(
+    commands: &[DocumentCommand],
+    expected_id: ElementId,
+  ) -> Option<(RectangleLabelAnchor, RectangleLabelAnchor)> {
+    commands.iter().find_map(|command| match command {
+      DocumentCommand::SetRectangleLabelPlacement {
+        element_id,
+        preferred_anchor,
+        actual_anchor,
+      } if *element_id == expected_id => Some((*preferred_anchor, *actual_anchor)),
+      _ => None,
+    })
+  }
+
   fn rectangle(document: &BoardDocument, z_index: i64, start: PointPx, end: PointPx) -> Element {
     let style = StrokeStyle::default();
     Element::new(
@@ -3988,6 +4288,11 @@ mod tests {
           text_style: TextStyle::mvp(style.color_rgba.contrasting_text(), 24.0).unwrap(),
         },
         label_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
+        preferred_label_anchor: RectangleLabelAnchor::new(
           RectangleLabelEdge::Top,
           RectangleLabelSide::Outside,
           0.0,
@@ -4145,6 +4450,7 @@ mod tests {
       PointPx::new(61.0, 43.0),
     ];
     let interaction = PointerInteraction::Draw {
+      element_id: ElementId::new(),
       tool: EditorTool::Stroke,
       start: points[0],
       current: *points.last().unwrap(),
@@ -4637,7 +4943,7 @@ mod tests {
       controller.finish_pointer_interaction(&document, &mut actions);
       assert!(controller.interaction.is_none(), "case={case}");
       assert!(
-        controller.released_preview_element.is_some(),
+        !controller.released_preview_elements.is_empty(),
         "case={case} should keep the final element for release-frame painting"
       );
 
@@ -4674,7 +4980,9 @@ mod tests {
     ];
 
     for (case, requested) in cases {
-      let preview = preview_controller.make_rectangle_preview(&document, start, requested).unwrap();
+      let element_id = ElementId::new();
+      let preview =
+        preview_controller.make_rectangle_preview(&document, element_id, start, requested).unwrap();
       let ElementPayload::Rectangle(preview_payload) = &preview.payload else {
         unreachable!();
       };
@@ -4691,6 +4999,7 @@ mod tests {
       assert!(preview.validate(document.canvas_size_px).is_err(), "case={case}");
 
       let interaction = PointerInteraction::Draw {
+        element_id,
         tool: EditorTool::Rectangle,
         start,
         current: requested,
@@ -4708,17 +5017,24 @@ mod tests {
       let [EditorAction::Command(batch)] = actions.as_slice() else {
         panic!("expected one added rectangle for {case}, got {actions:?}");
       };
-      let [DocumentCommand::AddElement { element }] = batch.commands() else {
+      let commands = batch.commands();
+      let Some(DocumentCommand::AddElement { element }) = commands.first() else {
         panic!("expected AddElement for {case}");
       };
+      assert!(
+        commands[1..]
+          .iter()
+          .all(|command| matches!(command, DocumentCommand::SetRectangleLabelPlacement { .. })),
+        "expected AddElement followed by placement commands for {case}, got {commands:?}"
+      );
       let committed = element.clone();
       let ElementPayload::Rectangle(committed_payload) = &committed.payload else {
         unreachable!();
       };
       let committed_body =
         RectPx::from_points(committed_payload.start_px, committed_payload.end_px);
-      assert!((committed_body.width() - minimum).abs() < 0.001, "case={case}");
-      assert!((committed_body.height() - minimum).abs() < 0.001, "case={case}");
+      assert!(committed_body.width() >= minimum, "case={case}");
+      assert!(committed_body.height() >= minimum, "case={case}");
       let expected_x_direction = if requested.x_px < start.x_px { -1.0 } else { 1.0 };
       let expected_y_direction = if requested.y_px < start.y_px { -1.0 } else { 1.0 };
       assert_eq!(
@@ -4735,7 +5051,15 @@ mod tests {
 
       let mut applied = document.clone();
       batch.clone().apply(&mut applied).unwrap();
-      assert_eq!(applied.elements, vec![committed], "case={case}");
+      assert_eq!(applied.elements.len(), 1, "case={case}");
+      let applied = applied.element(committed.element_id).unwrap();
+      let ElementPayload::Rectangle(applied_payload) = &applied.payload else {
+        unreachable!();
+      };
+      let applied_body = RectPx::from_points(applied_payload.start_px, applied_payload.end_px);
+      assert!(applied_body.width() >= minimum, "case={case}");
+      assert!(applied_body.height() >= minimum, "case={case}");
+      applied.validate(document.canvas_size_px).unwrap();
     }
   }
 
@@ -4769,6 +5093,7 @@ mod tests {
       assert!(preview.validate(document.canvas_size_px).is_err(), "case={case}");
 
       let interaction = PointerInteraction::Draw {
+        element_id: ElementId::new(),
         tool: EditorTool::Arrow,
         start,
         current: requested,
@@ -4889,10 +5214,15 @@ mod tests {
       let [EditorAction::Command(batch)] = actions.as_slice() else {
         panic!("expected one rectangle command for {handle:?}, got {actions:?}");
       };
-      let [DocumentCommand::ResizeRectangle { start_px, end_px, .. }] = batch.commands() else {
-        panic!("expected rectangle resize for {handle:?}");
+      let Some((start_px, end_px)) = resize_rectangle_command(batch.commands(), element_id) else {
+        panic!("expected rectangle resize for {handle:?}, got {:?}", batch.commands());
       };
-      let committed = RectPx::from_points(*start_px, *end_px);
+      assert_eq!(
+        (start_px, end_px),
+        minimum_resized_rectangle(original, handle, current, minimum),
+        "handle={handle:?}"
+      );
+      let committed = RectPx::from_points(start_px, end_px);
       assert!(committed.width() >= minimum, "handle={handle:?}");
       assert!(committed.height() >= minimum, "handle={handle:?}");
       if raw.width() < minimum {
@@ -4913,7 +5243,9 @@ mod tests {
       original,
       current: crossing_current,
     };
-    let preview = interaction_preview_element(&interaction, &document).unwrap();
+    let preview_controller = EditorController::default();
+    let preview_set = interaction_preview_set(&preview_controller, &interaction, &document);
+    let preview = preview_set.get(element_id).unwrap().clone();
     let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
     let output = paint_canvas_output(&controller, &document);
     assert_eq!(output.shapes.len(), baseline_shape_count);
@@ -4926,12 +5258,10 @@ mod tests {
     let [EditorAction::Command(batch)] = actions.as_slice() else {
       panic!("expected one rectangle command, got {actions:?}");
     };
-    assert!(matches!(
-      batch.commands(),
-      [DocumentCommand::ResizeRectangle { start_px, end_px, .. }]
-        if *start_px == original.min
-          && *end_px == PointPx::new(crossing_current.x_px, original.max.y_px)
-    ));
+    assert_eq!(
+      resize_rectangle_command(batch.commands(), element_id),
+      Some((original.min, PointPx::new(crossing_current.x_px, original.max.y_px)))
+    );
     let mut applied = document.clone();
     batch.clone().apply(&mut applied).unwrap();
     assert_eq!(applied.element(element_id), Some(&preview));
@@ -6269,6 +6599,7 @@ mod tests {
   fn long_new_arrow_enters_empty_label_editing_and_blank_submit_keeps_only_the_arrow() {
     let mut document = document();
     let interaction = PointerInteraction::Draw {
+      element_id: ElementId::new(),
       tool: EditorTool::Arrow,
       start: PointPx::new(40.0, 100.0),
       current: PointPx::new(360.0, 100.0),
@@ -6617,8 +6948,8 @@ mod tests {
     };
     assert!(matches!(
       batch.commands(),
-      [DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor }]
-        if *element_id == rectangle_id && *anchor == expected.anchor
+      [DocumentCommand::SetRectangleLabelPlacement { element_id, actual_anchor, .. }]
+        if *element_id == rectangle_id && *actual_anchor == expected.anchor
     ));
     assert_ne!(expected.bounds_px, current_layout.bounds_px);
     let before_revision = document.revision;
@@ -6626,6 +6957,128 @@ mod tests {
     history.execute_batch(&mut document, batch.clone()).unwrap();
     assert_eq!(document.revision, before_revision + 1);
     assert!(history.undo(&mut document).unwrap());
+  }
+
+  #[test]
+  fn rectangle_label_drag_at_top_right_corner_then_reflows_down_on_intrusion() {
+    let mut document = document_with_size(SizePx::new(942, 332));
+    let mut element =
+      rectangle(&document, 0, PointPx::new(51.0, 132.0), PointPx::new(347.0, 288.0));
+    let element_id = element.element_id;
+    let ElementPayload::Rectangle(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.label.text = Some(
+      "abcdefghijklmnopqrstuv\nabcdefghijklmnopqrstuv\nabcdefghijklmnopqrstuv\nabcdefghijklmnopqrstuv"
+        .to_owned(),
+    );
+    payload.label.max_width_px = 340.0;
+    payload.label.text_style.line_height_px = 25.75;
+    element.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(element);
+    let mut intruder =
+      rectangle(&document, 1, PointPx::new(543.0, 0.0), PointPx::new(841.0, 125.0));
+    let intruder_id = intruder.element_id;
+    let ElementPayload::Rectangle(payload) = &mut intruder.payload else {
+      unreachable!();
+    };
+    payload.label.text = None;
+    intruder.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(intruder);
+    let ElementPayload::Rectangle(payload) = &document.element(element_id).unwrap().payload else {
+      unreachable!();
+    };
+    let corner =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0);
+    let desired_center =
+      common::rectangle_label_layout_at_anchor(payload, corner, document.canvas_size_px)
+        .unwrap()
+        .unwrap()
+        .bounds_px
+        .center();
+    let mut controller = EditorController {
+      interaction: Some(PointerInteraction::DragRectangleLabel {
+        element_id,
+        current: desired_center,
+        grab_offset_px: PointPx::ZERO,
+      }),
+      ..Default::default()
+    };
+    let mut actions = Vec::new();
+
+    controller.finish_pointer_interaction(&document, &mut actions);
+
+    let [EditorAction::Command(drag_batch)] = actions.as_slice() else {
+      panic!("expected one label placement batch, got {actions:?}");
+    };
+    assert!(matches!(
+      drag_batch.commands(),
+      [DocumentCommand::SetRectangleLabelPlacement {
+        element_id: updated_id,
+        preferred_anchor,
+        actual_anchor,
+      }] if *updated_id == element_id
+        && preferred_anchor.edge == RectangleLabelEdge::Right
+        && preferred_anchor.side == RectangleLabelSide::Outside
+        && preferred_anchor.position.abs() < 0.001
+        && *preferred_anchor == *actual_anchor
+    ));
+
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, drag_batch.clone()).unwrap();
+    let move_batch = rectangle_reflow_batch(
+      &document,
+      vec![DocumentCommand::MoveElement {
+        element_id: intruder_id,
+        delta_px: PointPx::new(0.0, 53.0),
+      }],
+      intruder_id,
+      &[],
+    )
+    .unwrap();
+    let (_, actual_anchor) =
+      rectangle_label_placement_command(move_batch.commands(), element_id).unwrap();
+    assert_eq!(actual_anchor.edge, RectangleLabelEdge::Right);
+    assert_eq!(actual_anchor.side, RectangleLabelSide::Outside);
+    assert!(actual_anchor.position > 0.0);
+  }
+
+  #[test]
+  fn rectangle_move_preview_reflows_connected_neighbor_labels() {
+    let mut document = document_with_size(SizePx::new(420, 260));
+    let mut first = rectangle(&document, 0, PointPx::new(60.0, 100.0), PointPx::new(170.0, 180.0));
+    first.element_id = ElementId::from_uuid(Uuid::from_u128(1));
+    let first_id = first.element_id;
+    document.elements.push(first);
+    let mut second =
+      rectangle(&document, 1, PointPx::new(220.0, 100.0), PointPx::new(330.0, 180.0));
+    second.element_id = ElementId::from_uuid(Uuid::from_u128(2));
+    let second_id = second.element_id;
+    let second_anchor = match &second.payload {
+      ElementPayload::Rectangle(payload) => payload.label_anchor,
+      _ => unreachable!(),
+    };
+    document.elements.push(second);
+    document.validate().unwrap();
+    let interaction = PointerInteraction::Move {
+      element_id: first_id,
+      start: PointPx::ZERO,
+      current: PointPx::new(55.0, 0.0),
+    };
+    let controller = EditorController::default();
+
+    let preview = interaction_preview_set(&controller, &interaction, &document);
+
+    let moved = preview.get(first_id).expect("moving rectangle should be previewed");
+    let ElementPayload::Rectangle(moved_payload) = &moved.payload else {
+      unreachable!();
+    };
+    assert_eq!(moved_payload.start_px, PointPx::new(115.0, 100.0));
+    let neighbor = preview.get(second_id).expect("connected neighbor label should be previewed");
+    let ElementPayload::Rectangle(neighbor_payload) = &neighbor.payload else {
+      unreachable!();
+    };
+    assert_ne!(neighbor_payload.label_anchor, second_anchor);
   }
 
   #[test]
@@ -6658,29 +7111,49 @@ mod tests {
     let [EditorAction::Command(batch)] = actions.as_slice() else {
       panic!("expected one atomic label batch, got {actions:?}");
     };
-    let [
-      DocumentCommand::UpdateElementLabel { element_id: text_id, text: Some(text) },
-      DocumentCommand::UpdateRectangleLabelAnchor { element_id: anchor_id, anchor },
-    ] = batch.commands()
+    let commands = batch.commands();
+    assert!(matches!(
+      commands.first(),
+      Some(DocumentCommand::UpdateElementLabel {
+        element_id: text_id,
+        text: Some(text),
+      }) if *text_id == current_id && text == "重新展示"
+    ));
+    assert!(
+      commands[1..]
+        .iter()
+        .all(|command| matches!(command, DocumentCommand::SetRectangleLabelPlacement { .. })),
+      "expected placement commands after text command, got {commands:?}"
+    );
+    let Some((current_preferred, current_actual)) =
+      rectangle_label_placement_command(commands, current_id)
     else {
-      panic!("expected text and anchor commands, got {:?}", batch.commands());
+      panic!("expected current rectangle placement, got {commands:?}");
     };
-    assert_eq!(*text_id, current_id);
-    assert_eq!(*anchor_id, current_id);
-    assert_eq!(text, "重新展示");
-    assert_ne!(anchor.edge, RectangleLabelEdge::Top);
 
     let before_revision = document.revision;
     let mut history = CommandHistory::new();
     history.execute_batch(&mut document, batch.clone()).unwrap();
     assert_eq!(document.revision, before_revision + 1);
-    assert_eq!(document.elements[1], blocker_before);
     let ElementPayload::Rectangle(payload) = &document.element(current_id).unwrap().payload else {
       unreachable!();
     };
     assert_eq!(payload.label.text.as_deref(), Some("重新展示"));
-    assert_eq!(payload.label_anchor, *anchor);
+    assert_eq!(payload.preferred_label_anchor, current_preferred);
+    assert_eq!(payload.label_anchor, current_actual);
+    let ElementPayload::Rectangle(blocker) =
+      &document.element(blocker_before.element_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    let ElementPayload::Rectangle(blocker_before_payload) = &blocker_before.payload else {
+      unreachable!();
+    };
+    assert_eq!(blocker.start_px, blocker_before_payload.start_px);
+    assert_eq!(blocker.end_px, blocker_before_payload.end_px);
+    assert_eq!(blocker.label.text, blocker_before_payload.label.text);
     assert!(history.undo(&mut document).unwrap());
+    assert_eq!(document.elements[1], blocker_before);
     let ElementPayload::Rectangle(payload) = &document.element(current_id).unwrap().payload else {
       unreachable!();
     };
@@ -6938,7 +7411,7 @@ mod tests {
         start: PointPx::new(90.0, 70.0),
         current: PointPx::new(100.0, 80.0),
       }),
-      released_preview_element: Some(element),
+      released_preview_elements: ElementPreviewSet::single(element),
       text_editing: Some(TextEditing {
         target: TextTarget::ExistingText { element_id },
         buffer: "after".to_owned(),
@@ -6965,7 +7438,7 @@ mod tests {
     assert!(actions.is_empty());
     assert_eq!(controller.selected_element_id, Some(element_id));
     assert!(controller.interaction.is_some());
-    assert!(controller.released_preview_element.is_some());
+    assert!(!controller.released_preview_elements.is_empty());
     assert_eq!(
       controller.text_editing.as_ref().map(|editing| editing.buffer.as_str()),
       Some("after")
@@ -6989,7 +7462,7 @@ mod tests {
     assert_eq!(controller.tool, EditorTool::Arrow);
     assert!(controller.selected_element_id.is_none());
     assert!(controller.interaction.is_none());
-    assert!(controller.released_preview_element.is_none());
+    assert!(controller.released_preview_elements.is_empty());
     assert!(controller.text_editing.is_none());
     assert!(controller.active_stylus_id.is_none());
     assert!(controller.queued_stylus_events.is_empty());
@@ -7274,6 +7747,7 @@ mod tests {
     assert!(matches!(
       controller.interaction,
       Some(PointerInteraction::Draw {
+        element_id: _,
         tool: EditorTool::Rectangle,
         start: interaction_start,
         current,

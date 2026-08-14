@@ -18,20 +18,58 @@ pub enum ArrowEndpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocumentCommand {
-  AddElement { element: Element },
-  UpdateElement { element_id: ElementId, payload: ElementPayload },
-  MoveElement { element_id: ElementId, delta_px: PointPx },
-  DeleteElement { element_id: ElementId },
-  ChangeElementStyle { element_id: ElementId, change: StyleChange },
-  ResizeRectangle { element_id: ElementId, start_px: PointPx, end_px: PointPx },
-  UpdateArrowEndpoint { element_id: ElementId, endpoint: ArrowEndpoint, position_px: PointPx },
-  UpdateElementLabel { element_id: ElementId, text: Option<String> },
-  UpdateRectangleLabelAnchor { element_id: ElementId, anchor: RectangleLabelAnchor },
-  SetNextSequenceNumber { next_sequence_number: u64 },
-  BringForward { element_id: ElementId },
-  SendBackward { element_id: ElementId },
-  BringToFront { element_id: ElementId },
-  SendToBack { element_id: ElementId },
+  AddElement {
+    element: Element,
+  },
+  UpdateElement {
+    element_id: ElementId,
+    payload: ElementPayload,
+  },
+  MoveElement {
+    element_id: ElementId,
+    delta_px: PointPx,
+  },
+  DeleteElement {
+    element_id: ElementId,
+  },
+  ChangeElementStyle {
+    element_id: ElementId,
+    change: StyleChange,
+  },
+  ResizeRectangle {
+    element_id: ElementId,
+    start_px: PointPx,
+    end_px: PointPx,
+  },
+  UpdateArrowEndpoint {
+    element_id: ElementId,
+    endpoint: ArrowEndpoint,
+    position_px: PointPx,
+  },
+  UpdateElementLabel {
+    element_id: ElementId,
+    text: Option<String>,
+  },
+  SetRectangleLabelPlacement {
+    element_id: ElementId,
+    preferred_anchor: RectangleLabelAnchor,
+    actual_anchor: RectangleLabelAnchor,
+  },
+  SetNextSequenceNumber {
+    next_sequence_number: u64,
+  },
+  BringForward {
+    element_id: ElementId,
+  },
+  SendBackward {
+    element_id: ElementId,
+  },
+  BringToFront {
+    element_id: ElementId,
+  },
+  SendToBack {
+    element_id: ElementId,
+  },
 }
 
 impl DocumentCommand {
@@ -317,13 +355,14 @@ fn prepare_command(
         Ok(element)
       })
     }
-    DocumentCommand::UpdateRectangleLabelAnchor { element_id, anchor } => {
+    DocumentCommand::SetRectangleLabelPlacement { element_id, preferred_anchor, actual_anchor } => {
       prepare_replace(document, element_id, |mut element, canvas| {
         let actual = element.kind();
         let ElementPayload::Rectangle(payload) = &mut element.payload else {
           return Err(CommandError::WrongElementKind { expected: ElementKind::Rectangle, actual });
         };
-        payload.label_anchor = anchor;
+        payload.preferred_label_anchor = preferred_anchor;
+        payload.label_anchor = actual_anchor;
         element.refresh_bounds(canvas)?;
         element.validate(canvas)?;
         Ok(element)
@@ -576,6 +615,11 @@ mod tests {
           anchor_offset_px: 4.0,
           text_style: TextStyle::mvp(color.contrasting_text(), 24.0).unwrap(),
         },
+        preferred_label_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
         label_anchor: RectangleLabelAnchor::new(
           RectangleLabelEdge::Top,
           RectangleLabelSide::Outside,
@@ -790,9 +834,14 @@ mod tests {
     );
     assert_content_round_trip(
       base.clone(),
-      DocumentCommand::UpdateRectangleLabelAnchor {
+      DocumentCommand::SetRectangleLabelPlacement {
         element_id: rectangle_id,
-        anchor: RectangleLabelAnchor::new(
+        preferred_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
+        actual_anchor: RectangleLabelAnchor::new(
           RectangleLabelEdge::Right,
           RectangleLabelSide::Inside,
           0.5,
@@ -872,7 +921,11 @@ mod tests {
         element_id: rectangle_id,
         text: Some("重新展示".to_owned()),
       },
-      DocumentCommand::UpdateRectangleLabelAnchor { element_id: rectangle_id, anchor },
+      DocumentCommand::SetRectangleLabelPlacement {
+        element_id: rectangle_id,
+        preferred_anchor: anchor,
+        actual_anchor: anchor,
+      },
     ])
     .unwrap();
     let applied = batch.apply(&mut document).unwrap();

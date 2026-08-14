@@ -13,6 +13,7 @@ pub const PRESET_BRUSH_HARDNESSES: [f32; 3] = [0.0, 0.5, 1.0];
 pub const PRESET_STROKE_WIDTHS_PX: [f32; 3] = [4.0, 8.0, 12.0];
 pub const PRESET_FONT_SIZES_PX: [f32; 6] = [12.0, 16.0, 24.0, 36.0, 48.0, 64.0];
 const BOUNDS_EPSILON_PX: f32 = 0.5;
+const RECTANGLE_LABEL_SNAP_TIE_EPSILON_PX: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -424,6 +425,14 @@ impl RectangleLabelAnchor {
   }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RectangleLabelTrack {
+  pub edge: RectangleLabelEdge,
+  pub side: RectangleLabelSide,
+  pub fallback_phase: u8,
+  pub fallback_order: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RectanglePayload {
@@ -432,13 +441,15 @@ pub struct RectanglePayload {
   pub stroke_style: StrokeStyle,
   pub fill_rgba: Option<ColorRgba>,
   pub label: ElementLabel,
+  pub preferred_label_anchor: RectangleLabelAnchor,
   pub label_anchor: RectangleLabelAnchor,
 }
 
 impl RectanglePayload {
-  fn validate_for_layout(&self) -> Result<(), ElementError> {
+  pub(crate) fn validate_for_layout(&self) -> Result<(), ElementError> {
     self.stroke_style.validate()?;
     self.label.validate()?;
+    self.preferred_label_anchor.validate()?;
     self.label_anchor.validate()?;
     if self.label.text_style.color_rgba != self.stroke_style.color_rgba.contrasting_text() {
       return Err(ElementError::InvalidContrastColor);
@@ -461,6 +472,76 @@ impl RectanglePayload {
     }
     Ok(())
   }
+}
+
+pub(crate) fn ordered_rectangle_label_tracks(
+  canvas_size_px: SizePx,
+  rectangle: &RectanglePayload,
+) -> Vec<RectangleLabelTrack> {
+  let body_center = RectPx::from_points(rectangle.start_px, rectangle.end_px).center();
+  let canvas_center = canvas_size_px.bounds().center();
+  let preferred = rectangle.preferred_label_anchor;
+  let mut tracks = Vec::with_capacity(8);
+
+  push_rectangle_label_track(&mut tracks, preferred.edge, preferred.side, 0, 0);
+
+  let vertical_outside = if body_center.y_px <= canvas_center.y_px {
+    [RectangleLabelEdge::Top, RectangleLabelEdge::Bottom]
+  } else {
+    [RectangleLabelEdge::Bottom, RectangleLabelEdge::Top]
+  };
+  for (order, edge) in vertical_outside.into_iter().enumerate() {
+    push_rectangle_label_track(&mut tracks, edge, RectangleLabelSide::Outside, 1, order as u8);
+  }
+
+  let horizontal_outside = if body_center.x_px > canvas_center.x_px {
+    [RectangleLabelEdge::Right, RectangleLabelEdge::Left]
+  } else {
+    [RectangleLabelEdge::Left, RectangleLabelEdge::Right]
+  };
+  for (order, edge) in horizontal_outside.into_iter().enumerate() {
+    push_rectangle_label_track(&mut tracks, edge, RectangleLabelSide::Outside, 2, order as u8);
+  }
+
+  const INSIDE_CLOCKWISE: [RectangleLabelEdge; 4] = [
+    RectangleLabelEdge::Top,
+    RectangleLabelEdge::Right,
+    RectangleLabelEdge::Bottom,
+    RectangleLabelEdge::Left,
+  ];
+  let start = INSIDE_CLOCKWISE.iter().position(|edge| *edge == preferred.edge).unwrap_or(0);
+  for order in 0..INSIDE_CLOCKWISE.len() {
+    push_rectangle_label_track(
+      &mut tracks,
+      INSIDE_CLOCKWISE[(start + order) % INSIDE_CLOCKWISE.len()],
+      RectangleLabelSide::Inside,
+      3,
+      order as u8,
+    );
+  }
+
+  push_rectangle_label_track(
+    &mut tracks,
+    RectangleLabelEdge::Top,
+    RectangleLabelSide::Inside,
+    4,
+    0,
+  );
+
+  tracks
+}
+
+fn push_rectangle_label_track(
+  tracks: &mut Vec<RectangleLabelTrack>,
+  edge: RectangleLabelEdge,
+  side: RectangleLabelSide,
+  fallback_phase: u8,
+  fallback_order: u8,
+) {
+  if tracks.iter().any(|track| track.edge == edge && track.side == side) {
+    return;
+  }
+  tracks.push(RectangleLabelTrack { edge, side, fallback_phase, fallback_order });
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -965,13 +1046,10 @@ pub fn choose_rectangle_label_anchor(
   if rectangle.label.visible_text().is_none() {
     return Err(ElementError::LabelIsHidden);
   }
-  let candidates = [
-    RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0),
-    RectangleLabelAnchor::new(RectangleLabelEdge::Bottom, RectangleLabelSide::Outside, 0.0),
-    RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Outside, 0.0),
-    RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0),
-  ];
-  for anchor in candidates {
+  for track in ordered_rectangle_label_tracks(canvas_size_px, rectangle) {
+    let position =
+      default_rectangle_label_anchor_position(rectangle, canvas_size_px, track.edge, track.side)?;
+    let anchor = RectangleLabelAnchor::new(track.edge, track.side, position);
     let layout = raw_rectangle_label_layout(rectangle, anchor, canvas_size_px)?;
     if canvas_size_px.bounds().contains_rect(layout.bounds_px)
       && obstacles.iter().all(|obstacle| !layout.bounds_px.intersects(*obstacle))
@@ -980,6 +1058,68 @@ pub fn choose_rectangle_label_anchor(
     }
   }
   Ok(RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Inside, 0.0))
+}
+
+fn default_rectangle_label_anchor_position(
+  rectangle: &RectanglePayload,
+  canvas_size_px: SizePx,
+  edge: RectangleLabelEdge,
+  side: RectangleLabelSide,
+) -> Result<f32, ElementError> {
+  let preferred = rectangle.preferred_label_anchor;
+  if rectangle_label_edges_share_axis(edge, preferred.edge) {
+    return Ok(preferred.position);
+  }
+  let sample = raw_rectangle_label_layout(
+    rectangle,
+    RectangleLabelAnchor::new(edge, side, 0.0),
+    canvas_size_px,
+  )?;
+  Ok(rectangle_label_position_for_center(
+    rectangle,
+    edge,
+    sample.bounds_px.width(),
+    sample.bounds_px.height(),
+    canvas_size_px.bounds().center(),
+  ))
+}
+
+fn rectangle_label_edges_share_axis(left: RectangleLabelEdge, right: RectangleLabelEdge) -> bool {
+  matches!(
+    (left, right),
+    (
+      RectangleLabelEdge::Top | RectangleLabelEdge::Bottom,
+      RectangleLabelEdge::Top | RectangleLabelEdge::Bottom
+    ) | (
+      RectangleLabelEdge::Left | RectangleLabelEdge::Right,
+      RectangleLabelEdge::Left | RectangleLabelEdge::Right
+    )
+  )
+}
+
+fn rectangle_label_position_for_center(
+  rectangle: &RectanglePayload,
+  edge: RectangleLabelEdge,
+  width_px: f32,
+  height_px: f32,
+  center: PointPx,
+) -> f32 {
+  let body = RectPx::from_points(rectangle.start_px, rectangle.end_px);
+  let gap = rectangle.label.anchor_offset_px;
+  match edge {
+    RectangleLabelEdge::Top | RectangleLabelEdge::Bottom => {
+      if body.width() <= f32::EPSILON {
+        return 0.0;
+      }
+      ((center.x_px - width_px / 2.0 - body.min.x_px - gap) / body.width()).clamp(0.0, 1.0)
+    }
+    RectangleLabelEdge::Left | RectangleLabelEdge::Right => {
+      if body.height() <= f32::EPSILON {
+        return 0.0;
+      }
+      ((center.y_px - height_px / 2.0 - body.min.y_px - gap) / body.height()).clamp(0.0, 1.0)
+    }
+  }
 }
 
 pub fn snap_rectangle_label_layout(
@@ -1053,23 +1193,75 @@ pub fn snap_rectangle_label_layout(
       vertical_position,
     ),
   ];
+  let current_anchor = rectangle.label_anchor;
+  let preferred_anchor = rectangle.preferred_label_anchor;
   anchors
     .into_iter()
-    .map(|anchor| {
+    .enumerate()
+    .map(|(anchor_order, anchor)| {
       let mut layout = raw_rectangle_label_layout(rectangle, anchor, canvas_size_px)?;
       layout.bounds_px = fit_label_bounds_to_canvas(layout.bounds_px, canvas_size_px)?;
       let center = layout.bounds_px.center();
       let distance = center.distance_to(desired_center_px);
-      Ok((distance, layout))
+      // Corner endpoints can share identical bounds; keep the visible exterior placement outside.
+      let inside_track_cost = u8::from(anchor.side == RectangleLabelSide::Inside);
+      let current_track_cost = u8::from(!same_rectangle_label_track(anchor, current_anchor));
+      let preferred_track_cost = u8::from(!same_rectangle_label_track(anchor, preferred_anchor));
+      Ok((
+        distance,
+        inside_track_cost,
+        current_track_cost,
+        preferred_track_cost,
+        anchor_order,
+        layout,
+      ))
     })
     .collect::<Result<Vec<_>, ElementError>>()?
     .into_iter()
-    .min_by(|left, right| left.0.total_cmp(&right.0))
-    .map(|(_, layout)| layout)
+    .min_by(|left, right| {
+      let distance_order = if (left.0 - right.0).abs() <= RECTANGLE_LABEL_SNAP_TIE_EPSILON_PX {
+        std::cmp::Ordering::Equal
+      } else {
+        left.0.total_cmp(&right.0)
+      };
+      distance_order
+        .then_with(|| left.1.cmp(&right.1))
+        .then_with(|| left.2.cmp(&right.2))
+        .then_with(|| left.3.cmp(&right.3))
+        .then_with(|| left.4.cmp(&right.4))
+    })
+    .map(|(_, _, _, _, _, layout)| layout)
     .ok_or(ElementError::InvalidLabelLayout)
 }
 
-fn raw_rectangle_label_layout(
+pub(crate) fn canonical_rectangle_label_anchor(
+  rectangle: &RectanglePayload,
+  canvas_size_px: SizePx,
+  anchor: RectangleLabelAnchor,
+) -> Result<RectangleLabelAnchor, ElementError> {
+  let mut staged = rectangle.clone();
+  staged.preferred_label_anchor = anchor;
+  staged.label_anchor = anchor;
+  let source = raw_rectangle_label_layout(&staged, anchor, canvas_size_px)?;
+  let snapped = snap_rectangle_label_layout(&staged, canvas_size_px, source.bounds_px.center())?;
+  let canonical = raw_rectangle_label_layout(&staged, snapped.anchor, canvas_size_px)?;
+  if same_rectangle_label_bounds(source.bounds_px, canonical.bounds_px) {
+    Ok(snapped.anchor)
+  } else {
+    Ok(anchor)
+  }
+}
+
+fn same_rectangle_label_track(left: RectangleLabelAnchor, right: RectangleLabelAnchor) -> bool {
+  left.edge == right.edge && left.side == right.side
+}
+
+fn same_rectangle_label_bounds(left: RectPx, right: RectPx) -> bool {
+  left.min.distance_to(right.min) <= RECTANGLE_LABEL_SNAP_TIE_EPSILON_PX
+    && left.max.distance_to(right.max) <= RECTANGLE_LABEL_SNAP_TIE_EPSILON_PX
+}
+
+pub(crate) fn raw_rectangle_label_layout(
   rectangle: &RectanglePayload,
   anchor: RectangleLabelAnchor,
   canvas_size_px: SizePx,
@@ -1564,6 +1756,11 @@ mod tests {
       stroke_style: StrokeStyle::default(),
       fill_rgba: None,
       label: label(ColorRgba::RED, Some("标题")),
+      preferred_label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
       label_anchor: RectangleLabelAnchor::new(
         RectangleLabelEdge::Top,
         RectangleLabelSide::Outside,
@@ -1667,30 +1864,70 @@ mod tests {
   }
 
   #[test]
-  fn rectangle_auto_anchor_checks_candidates_in_top_bottom_left_right_order() {
+  fn rectangle_auto_anchor_prefers_preferred_track_and_position() {
+    let canvas = SizePx::new(500, 400);
+    let mut rectangle = rectangle(PointPx::new(180.0, 150.0), PointPx::new(300.0, 260.0));
+    rectangle.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.35);
+
+    let selected = choose_rectangle_label_anchor(&rectangle, canvas, &[]).unwrap();
+
+    assert_eq!(selected, rectangle.preferred_label_anchor);
+  }
+
+  #[test]
+  fn rectangle_auto_anchor_uses_canvas_center_for_outer_order() {
+    let canvas = SizePx::new(500, 400);
+    let mut rectangle = rectangle(PointPx::new(280.0, 220.0), PointPx::new(360.0, 300.0));
+    rectangle.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Inside, 0.25);
+    let mut obstacles = Vec::new();
+
+    for expected in [
+      (RectangleLabelEdge::Top, RectangleLabelSide::Inside),
+      (RectangleLabelEdge::Bottom, RectangleLabelSide::Outside),
+      (RectangleLabelEdge::Top, RectangleLabelSide::Outside),
+      (RectangleLabelEdge::Right, RectangleLabelSide::Outside),
+      (RectangleLabelEdge::Left, RectangleLabelSide::Outside),
+    ] {
+      let selected = choose_rectangle_label_anchor(&rectangle, canvas, &obstacles).unwrap();
+      assert_eq!((selected.edge, selected.side), expected);
+      obstacles.push(raw_rectangle_label_layout(&rectangle, selected, canvas).unwrap().bounds_px);
+    }
+  }
+
+  #[test]
+  fn rectangle_auto_anchor_enters_inside_clockwise_from_preferred_edge() {
+    let canvas = SizePx::new(500, 400);
+    let mut rectangle = rectangle(PointPx::new(180.0, 130.0), PointPx::new(300.0, 230.0));
+    rectangle.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Outside, 0.5);
+    let mut obstacles = Vec::new();
+
+    for _ in 0..4 {
+      let selected = choose_rectangle_label_anchor(&rectangle, canvas, &obstacles).unwrap();
+      assert_eq!(selected.side, RectangleLabelSide::Outside);
+      obstacles.push(raw_rectangle_label_layout(&rectangle, selected, canvas).unwrap().bounds_px);
+    }
+
+    let selected = choose_rectangle_label_anchor(&rectangle, canvas, &obstacles).unwrap();
+    assert_eq!(
+      (selected.edge, selected.side),
+      (RectangleLabelEdge::Left, RectangleLabelSide::Inside)
+    );
+  }
+
+  #[test]
+  fn rectangle_auto_anchor_falls_back_to_top_inside_when_all_tracks_collide() {
     let canvas = SizePx::new(500, 400);
     let rectangle = rectangle(PointPx::new(180.0, 150.0), PointPx::new(300.0, 260.0));
-    let candidates = [
-      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0),
-      RectangleLabelAnchor::new(RectangleLabelEdge::Bottom, RectangleLabelSide::Outside, 0.0),
-      RectangleLabelAnchor::new(RectangleLabelEdge::Left, RectangleLabelSide::Outside, 0.0),
-      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0),
-    ];
-    let candidate_bounds = candidates
-      .iter()
-      .map(|anchor| raw_rectangle_label_layout(&rectangle, *anchor, canvas).unwrap().bounds_px)
-      .collect::<Vec<_>>();
-    for blocked_count in 0..=candidates.len() {
-      let selected =
-        choose_rectangle_label_anchor(&rectangle, canvas, &candidate_bounds[..blocked_count])
-          .unwrap();
-      let expected = candidates.get(blocked_count).copied().unwrap_or(RectangleLabelAnchor::new(
-        RectangleLabelEdge::Top,
-        RectangleLabelSide::Inside,
-        0.0,
-      ));
-      assert_eq!(selected, expected);
-    }
+
+    let selected = choose_rectangle_label_anchor(&rectangle, canvas, &[canvas.bounds()]).unwrap();
+
+    assert_eq!(
+      selected,
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Inside, 0.0)
+    );
   }
 
   #[test]
@@ -1713,6 +1950,37 @@ mod tests {
         assert_eq!(snapped.anchor.side, side);
         assert!((snapped.anchor.position - 0.35).abs() < 0.001);
       }
+    }
+  }
+
+  #[test]
+  fn rectangle_snap_canonicalizes_ambiguous_top_right_corner_to_outside_track() {
+    let canvas = SizePx::new(600, 500);
+    let mut rectangle = rectangle(PointPx::new(220.0, 180.0), PointPx::new(380.0, 330.0));
+    let corner =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.0);
+    let expected = rectangle_label_layout_at_anchor(&rectangle, corner, canvas).unwrap().unwrap();
+
+    let top_outside =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.25);
+    let top_inside =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Inside, 1.0);
+    let right_outside =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Outside, 0.35);
+    for (preferred, actual) in [
+      (top_outside, top_outside),
+      (top_inside, top_inside),
+      (right_outside, top_inside),
+      (top_inside, right_outside),
+    ] {
+      rectangle.preferred_label_anchor = preferred;
+      rectangle.label_anchor = actual;
+      let snapped =
+        snap_rectangle_label_layout(&rectangle, canvas, expected.bounds_px.center()).unwrap();
+
+      assert_eq!(snapped.anchor.edge, RectangleLabelEdge::Right);
+      assert_eq!(snapped.anchor.side, RectangleLabelSide::Outside);
+      assert!(snapped.anchor.position.abs() < 0.001);
     }
   }
 

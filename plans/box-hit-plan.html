@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<title>方框标签 · 联合避让方案</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --background:light-dark(rgb(255 255 255),rgb(24 24 24));
+  --foreground:light-dark(rgb(26 28 31),rgb(255 255 255));
+  --card:color-mix(in oklab,var(--foreground) 5%,var(--background));
+  --muted:color-mix(in srgb,var(--foreground) 10%,transparent);
+  --muted-foreground:light-dark(rgb(26 28 31 / 49.4%),rgb(255 255 255 / 49.8%));
+  --border:light-dark(rgb(26 28 31 / 8%),rgb(255 255 255 / 8.2%));
+  --input:light-dark(rgb(26 28 31 / 11.8%),color-mix(in oklab,rgb(0 0 0) 10%,transparent));
+  --primary:light-dark(rgb(51 156 255),rgb(131 195 255));
+  --primary-foreground:light-dark(rgb(255 255 255),rgb(13 13 13));
+  --viz-series-1:var(--primary);
+  --viz-series-2:light-dark(rgb(243 136 59),rgb(245 154 86));
+  --viz-series-3:light-dark(rgb(93 201 119),rgb(116 213 139));
+  --destructive:light-dark(rgb(226 85 7),rgb(255 133 73));
+}
+html,body{margin:0}
+body{box-sizing:border-box;padding:1rem;color:var(--foreground);background:var(--background);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;font-size:14px;font-weight:430;line-height:1.5}
+#widget{display:flex;flex-direction:column;gap:12px;max-width:1060px;margin:0 auto}
+.card{min-width:0;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--card)}
+h2,h3{margin:0;font-weight:500;line-height:1.3}
+h2{font-size:20px}
+h3{font-size:15px;margin-bottom:8px}
+[hidden]{display:none !important}
+.text-small{font-size:12px}
+.text-muted{color:var(--muted-foreground)}
+.viz-badge{padding:3px 9px;border-radius:999px;color:var(--primary);background:color-mix(in srgb,var(--primary) 12%,transparent);font-size:12px;font-weight:500}
+.head-row{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:8px 12px}
+.badges{display:flex;flex-wrap:wrap;gap:6px}
+.tabs,.controls{display:flex;flex-wrap:wrap;gap:8px}
+.btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:0 12px;border:1px solid var(--input);border-radius:10px;color:var(--foreground);background:color-mix(in srgb,var(--foreground) 4%,transparent);cursor:pointer;font:inherit;font-size:13px}
+.btn:hover{background:color-mix(in srgb,var(--foreground) 8%,transparent)}
+.btn-primary{border-color:transparent;color:var(--primary-foreground);background:var(--foreground)}
+.btn-primary:hover{background:color-mix(in srgb,var(--foreground) 85%,transparent)}
+.stage{overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+svg{display:block}
+.summary-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px}
+#rule{font-size:12px;color:var(--muted-foreground)}
+.chip-group{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
+.chip-title{min-width:84px;font-size:12px;color:var(--muted-foreground)}
+.chip{display:inline-block;padding:3px 9px;border:1px solid var(--border);border-radius:999px;background:color-mix(in srgb,var(--foreground) 3%,transparent);font-size:12px}
+.chip.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
+.ph-vp{fill:color-mix(in srgb,var(--foreground) 2.5%,transparent);stroke:var(--border);stroke-width:2}
+.ph-body{fill:color-mix(in srgb,var(--viz-series-1) 8%,transparent);stroke:var(--viz-series-1);stroke-width:2.5}
+.ph-body-op{fill:color-mix(in srgb,var(--viz-series-2) 10%,transparent);stroke:var(--viz-series-2);stroke-width:3}
+.ph-body-off{fill:color-mix(in srgb,var(--foreground) 3%,transparent);stroke:var(--muted-foreground);stroke-width:2;stroke-dasharray:6 5}
+.ph-label{fill:var(--viz-series-1);stroke:var(--viz-series-1);stroke-width:1.5}
+.ph-label-moved{fill:var(--viz-series-2);stroke:var(--viz-series-2);stroke-width:1.5}
+.ph-label-text{fill:var(--primary-foreground);font-weight:500;font-size:13px}
+.ph-ghost{fill:transparent;stroke:var(--muted-foreground);stroke-width:1.5;stroke-dasharray:5 5}
+.ph-ghost-bad{fill:color-mix(in srgb,var(--destructive) 6%,transparent);stroke:var(--destructive);stroke-width:1.5;stroke-dasharray:5 5}
+.ph-edge{stroke:var(--muted-foreground);stroke-width:2;fill:none}
+.ph-edge-op{stroke:var(--viz-series-2);stroke-width:2.5;fill:none}
+.ph-edge-p{stroke:var(--viz-series-1);stroke-width:2;fill:none}
+.ph-edge-old{stroke:var(--muted-foreground);stroke-width:2;stroke-dasharray:6 5;fill:none}
+.ph-txt{fill:var(--foreground)}
+.ph-sub{fill:var(--muted-foreground)}
+.ph-small{font-size:11px}
+.ph-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.ph-mono-sm{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px}
+.ph-group{fill:transparent;stroke:var(--viz-series-3);stroke-width:1.5;stroke-dasharray:7 6}
+.ph-badge{fill:var(--background);stroke:var(--viz-series-1);stroke-width:1.5}
+.ph-badge-txt{fill:var(--foreground);font-weight:600;font-size:11px}
+.ph-obstacle{fill:color-mix(in srgb,var(--destructive) 10%,transparent);stroke:var(--destructive);stroke-width:2}
+.ph-obstacle-txt{fill:var(--destructive)}
+.ph-legal{stroke:var(--viz-series-3);stroke-width:4;stroke-linecap:round}
+.ph-track{stroke:var(--muted-foreground);stroke-width:1;stroke-dasharray:3 4;fill:none}
+.ph-pipe{fill:var(--card);stroke:var(--border);stroke-width:1.5}
+.ph-pipe-title{fill:var(--foreground);font-weight:600;font-size:12.5px}
+.ph-node{fill:color-mix(in srgb,var(--viz-series-1) 6%,transparent);stroke:var(--viz-series-1);stroke-width:1.5}
+.ph-node-op{fill:color-mix(in srgb,var(--viz-series-2) 8%,transparent);stroke:var(--viz-series-2);stroke-width:2}
+.ph-node-off{fill:color-mix(in srgb,var(--foreground) 3%,transparent);stroke:var(--muted-foreground);stroke-dasharray:5 4}
+.ph-dot{fill:var(--background);stroke:var(--viz-series-1);stroke-width:2}
+.ph-dot-bad{fill:transparent;stroke:var(--destructive);stroke-width:2;stroke-dasharray:2 2}
+</style>
+</head>
+<body>
+<div id="widget">
+  <div class="card">
+    <div class="head-row">
+      <div>
+        <h2>方框标签 · 联合避让方案</h2>
+        <div class="text-small text-muted" id="scope">方框本体继续允许相邻、交叉和包含，只重排方框标签。</div>
+      </div>
+      <div class="badges">
+        <span class="viz-badge">schema v4</span>
+        <span class="viz-badge">beam 128 × 4096</span>
+        <span class="viz-badge">≤ 32 标签</span>
+        <span class="viz-badge">preferred + actual 双锚点</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="方案视图">
+    <button class="btn btn-primary" type="button" role="tab" aria-selected="true" data-mode="joint">① 联合避让</button>
+    <button class="btn" type="button" role="tab" aria-selected="false" data-mode="graph">② 冲突图</button>
+    <button class="btn" type="button" role="tab" aria-selected="false" data-mode="solver">③ 求解流程</button>
+    <button class="btn" type="button" role="tab" aria-selected="false" data-mode="pref">④ 偏好与回位</button>
+    <button class="btn" type="button" role="tab" aria-selected="false" data-mode="editor">⑤ 编辑集成</button>
+    <button class="btn" type="button" role="tab" aria-selected="false" data-mode="data">⑥ 数据与迁移</button>
+  </div>
+
+  <div class="controls" data-controls="joint">
+    <button class="btn btn-primary" type="button" aria-pressed="true" data-joint="initial">初始 · 无冲突</button>
+    <button class="btn" type="button" aria-pressed="false" data-joint="near">靠近 · 标签冲突</button>
+    <button class="btn" type="button" aria-pressed="false" data-joint="push">压入 · 本体相交</button>
+    <button class="btn" type="button" aria-pressed="false" data-joint="chain">连锁传播</button>
+  </div>
+  <div class="controls" data-controls="pref" hidden>
+    <button class="btn btn-primary" type="button" aria-pressed="true" data-pref="blocked">障碍在位</button>
+    <button class="btn" type="button" aria-pressed="false" data-pref="free">障碍移开</button>
+  </div>
+
+  <div class="stage"><svg id="diagram" role="img" aria-labelledby="diagram-title diagram-desc"></svg></div>
+
+  <div class="card summary-row" aria-live="polite">
+    <span class="viz-badge" id="status"></span>
+    <span id="summary"></span>
+  </div>
+
+  <div class="card" id="rule"></div>
+
+  <div class="card">
+    <h3>测试计划</h3>
+    <div class="chip-group"><span class="chip-title">几何场景</span><span class="chip">水平相邻</span><span class="chip">垂直相邻</span><span class="chip">部分交叉</span><span class="chip">十字交叉</span><span class="chip">完全包含</span><span class="chip">画布四边</span></div>
+    <div class="chip-group"><span class="chip-title">求解行为</span><span class="chip">优先沿原轨滑动</span><span class="chip">同边换内外侧</span><span class="chip">换边</span><span class="chip">冲突解除回 preferred</span></div>
+    <div class="chip-group"><span class="chip-title">图与规模</span><span class="chip">3+ 连锁传播</span><span class="chip">隐藏标签方框</span><span class="chip">外部标签扩组</span><span class="chip">&gt;32 标签稳定降级</span></div>
+    <div class="chip-group"><span class="chip-title">边界与降级</span><span class="chip">长中文换行</span><span class="chip">上内兜底</span><span class="chip">最小重叠降级</span><span class="chip">安全间距</span><span class="chip">边缘接触</span></div>
+    <div class="chip-group"><span class="chip-title">稳定性</span><span class="chip">固定 UUID 重复求解</span><span class="chip">与遍历顺序无关</span><span class="chip">连续帧无闪烁</span></div>
+    <div class="chip-group"><span class="chip-title">编辑触发</span><span class="chip">创建</span><span class="chip">粘贴</span><span class="chip">删除</span><span class="chip">移动</span><span class="chip">缩放</span><span class="chip">拖标签</span><span class="chip">文字显隐</span><span class="chip">字号</span><span class="chip">线宽</span><span class="chip">非方框元素不参与</span></div>
+    <div class="chip-group"><span class="chip-title">历史一致性</span><span class="chip">预览与提交逐元素一致</span><span class="chip">一次操作一次 revision</span><span class="chip">撤销 / 重做完整恢复</span></div>
+    <div class="chip-group"><span class="chip-title">迁移</span><span class="chip">v2 → v4</span><span class="chip">v3 → v4</span><span class="chip">JSON / snapshot 往返</span><span class="chip">摘要读取</span><span class="chip">拒绝未知高版本</span></div>
+    <div class="chip-group"><span class="chip-title">收尾</span><span class="chip mono">cargo test --workspace</span><span class="chip mono">cargo clippy --workspace --all-targets -- -D warnings</span></div>
+  </div>
+</div>
+<script>
+(() => {
+  const root = document.getElementById("widget");
+  if (!root) return;
+  const svg = root.querySelector("#diagram");
+  const stage = root.querySelector(".stage");
+  const statusEl = root.querySelector("#status");
+  const summaryEl = root.querySelector("#summary");
+  const scopeEl = root.querySelector("#scope");
+  const ruleEl = root.querySelector("#rule");
+
+  const state = { mode: "joint", joint: "initial", pref: "blocked" };
+  const HEIGHTS = { joint: 440, graph: 490, solver: 540, pref: 430, editor: 400, data: 490 };
+
+  const modeMeta = {
+    joint: "移动、缩放、创建、粘贴、删除、标签拖动、文字/字号/线宽变化及层级调整，均重排相关冲突连通组。",
+    graph: "节点 = 所有方框；边 = 本体相交 / 标签-本体 / 标签-标签；取前后边集并集，从操作框 BFS 得到重排集合。",
+    solver: "八条内外轨道 → 合法区间减障碍投影 → 候选 ≤24 → 确定性 beam search（128 × 4096，≤32 标签）→ 逐级兜底。",
+    pref: "preferred_label_anchor 保存默认 / 手拖意图；label_anchor 保存求解结果；自动避让保持偏好不变。",
+    editor: "每帧重建轻量场景只求解一次；提交批次顺序固定；一次 revision；撤销 / 重做不重跑求解器。",
+    data: "schema 升至 v4：v3 的 label_anchor 迁移为 preferred + actual；v2 推导旧锚点；摘要兼容 v2–v4。",
+  };
+
+  const rules = {
+    joint: "比较顺序：保持原轨沿边滑动 → 同边换内外侧 → 换边 → 偏离 preferred 距离 → 相对 current 视觉位移 · 解优先级：操作框 → z_index 降序 → UUID 升序",
+    graph: "隐藏标签不参与放置，本体仍是障碍 · 障碍仅方框本体与方框标签（箭头/文字/画笔/序号忽略）· 标签-外部方框间距 = 该标签 anchor_offset_px，标签间取双方较大值",
+    solver: "边缘接触算冲突（0.01px 余量）· 全部浮点比较 total_cmp · 固定锚点序决胜 · 标签必须完整位于画布内 · 不用 fit_label_bounds_to_canvas 平移后的框参与求解",
+    pref: "新方框 preferred 与 actual 初始均 = Top · Outside · 0.0 · 手拖标签先更新临时 preferred，再联合求解 actual · 邻框标签允许同时移动",
+    editor: "移动 / 缩放先约束本体与描边，再解标签 · 批次顺序：基础命令在前、受影响标签按最终层级与 UUID 排序、过滤无变化 · 创建 / 粘贴直接携带最终 actual",
+    data: "摘要读取接受 v2 / v3 / v4，未知高版本拒绝 · 迁移与打开文档不主动重排，避免视觉漂移 · 删除操作用旧图找回需恢复偏好的邻框",
+  };
+
+  const esc = (v) => String(v)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+
+  const R = (x, y, w, h) => ({ x, y, w, h });
+  const cc = (b) => ({ x: b.x + b.w / 2, y: b.y + b.h / 2 });
+  const rr = (b, cls, rx = 6) => `<rect class="${cls}" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="${rx}"/>`;
+  const txt = (x, y, s, cls = "ph-txt", anchor = "middle") => `<text class="${cls}" x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="middle">${esc(s)}</text>`;
+  const line = (x1, y1, x2, y2, cls, marker) => `<line class="${cls}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"${marker ? ` marker-end="url(#${marker})"` : ""}/>`;
+  const curve = (x1, y1, x2, y2, c1x, c1y, c2x, c2y, cls, marker) => `<path class="${cls}" d="M ${x1} ${y1} C ${c1x} ${c1y} ${c2x} ${c2y} ${x2} ${y2}" fill="none"${marker ? ` marker-end="url(#${marker})"` : ""}/>`;
+  const vpMarkup = (vp) => rr(vp, "ph-vp", 4) + txt(vp.x + 10, vp.y + 15, "画布", "ph-sub ph-small", "start");
+
+  function labelAt(body, edge, side, t, lw = 150, lh = 30, gap = 8) {
+    const x = body.x + gap + (body.w - 2 * gap - lw) * t;
+    const y = body.y + gap + (body.h - 2 * gap - lh) * t;
+    const s = edge + side;
+    if (s === "topout") return R(x, body.y - gap - lh, lw, lh);
+    if (s === "topin") return R(x, body.y + gap, lw, lh);
+    if (s === "bottomin") return R(x, body.y + body.h - gap - lh, lw, lh);
+    if (s === "bottomout") return R(x, body.y + body.h + gap, lw, lh);
+    if (s === "leftout") return R(body.x - gap - lw, y, lw, lh);
+    if (s === "leftin") return R(body.x + gap, y, lw, lh);
+    if (s === "rightin") return R(body.x + body.w - gap - lw, y, lw, lh);
+    if (s === "rightout") return R(body.x + body.w + gap, y, lw, lh);
+    return R(x, y, lw, lh);
+  }
+
+  function boxMarkup(b, cls, name, sub, cap, capCls) {
+    let s = rr(b, cls, 2);
+    s += txt(cc(b).x, cc(b).y - 6, name, "ph-txt");
+    if (sub) s += txt(cc(b).x, cc(b).y + 14, sub, "ph-sub ph-small");
+    if (cap) s += txt(cc(b).x, b.y + b.h + 15, cap, capCls || "ph-sub ph-small");
+    return s;
+  }
+
+  function labelMarkup(r, text, cap, moved, capAbove) {
+    let s = rr(r, moved ? "ph-label-moved" : "ph-label", 6);
+    s += txt(cc(r).x, cc(r).y + 0.5, text, "ph-label-text");
+    if (cap) s += txt(cc(r).x, capAbove ? r.y - 7 : r.y + r.h + 13, cap, "ph-sub ph-small");
+    return s;
+  }
+
+  const jointScenes = {
+    initial: {
+      a: (Bx, Yb, bw, bh) => R(Bx - 170, Yb, bw, bh),
+      cx: (Bx) => Bx + 200,
+      cgrp: false,
+      labels: (A, B, C) => [
+        { r: labelAt(A, "top", "out", 0.5), text: "标签 A", cap: "上外 · t=0.5", capAbove: true, moved: false },
+        { r: labelAt(B, "top", "out", 0.5), text: "标签 B", cap: "上外 · t=0.5", capAbove: true, moved: false },
+        { r: labelAt(C, "top", "out", 0.5), text: "标签 C", cap: "上外 · t=0.5", capAbove: true, moved: false },
+      ],
+      ghosts: () => [],
+      arrows: () => [],
+      group: (A, B, C) => [A],
+      status: "全部位于偏好位置",
+      summary: "不存在任何冲突边，BFS 连通组只含操作框 A；所有标签保持 preferred（上外 · t=0.5）不动。",
+    },
+    near: {
+      a: (Bx, Yb, bw, bh) => R(Bx - 145, Yb, bw, bh),
+      cx: (Bx) => Bx + 200,
+      cgrp: false,
+      labels: (A, B, C) => [
+        { r: labelAt(A, "top", "out", 1), text: "标签 A", cap: "上外 · t=1（沿原轨滑动）", capAbove: true, moved: true },
+        { r: labelAt(B, "top", "out", 0.5), text: "标签 B", cap: "上外 · t=0.5", capAbove: true, moved: false },
+        { r: labelAt(C, "top", "out", 0.5), text: "标签 C", cap: "上外 · t=0.5", capAbove: true, moved: false },
+      ],
+      ghosts: (A, B, C) => [{ r: labelAt(A, "top", "out", 0.5), bad: true }],
+      arrows: (A, B, C) => {
+        const g = labelAt(A, "top", "out", 0.5);
+        const a = labelAt(A, "top", "out", 1);
+        return [{ d: `M ${cc(g).x} ${cc(g).y} L ${cc(a).x} ${cc(a).y}`, cls: "ph-edge" }];
+      },
+      group: (A, B, C) => [A, B],
+      status: "A 沿原轨滑动",
+      summary: "A 靠近后其标签与 B 标签相交（标签-标签冲突），组 {A,B} 联合求解：A 优先沿上外轨道滑动避让，B 保持 preferred。",
+    },
+    push: {
+      a: (Bx, Yb, bw, bh) => R(Bx - 100, Yb - 40, bw, bh),
+      cx: (Bx) => Bx + 200,
+      cgrp: false,
+      labels: (A, B, C) => [
+        { r: labelAt(A, "top", "out", 0.5), text: "标签 A", cap: "上外 · t=0.5", capAbove: true, moved: false },
+        { r: labelAt(B, "bottom", "out", 0.5), text: "标签 B", cap: "下外 · t=0.5（换边）", capAbove: false, moved: true },
+        { r: labelAt(C, "top", "out", 0.5), text: "标签 C", cap: "上外 · t=0.5", capAbove: true, moved: false },
+      ],
+      ghosts: (A, B, C) => [{ r: labelAt(B, "top", "out", 0.5), cap: "preferred · 上外" }],
+      arrows: (A, B, C) => {
+        const g = labelAt(B, "top", "out", 0.5);
+        const a = labelAt(B, "bottom", "out", 0.5);
+        return [{ d: `M ${cc(g).x} ${cc(g).y} C ${cc(g).x + 80} ${cc(g).y + 40} ${cc(a).x + 80} ${cc(a).y - 40} ${cc(a).x} ${cc(a).y}`, cls: "ph-edge" }];
+      },
+      group: (A, B, C) => [A, B],
+      status: "B 换到下外",
+      summary: "A 本体压入 B：本体相交，且 A 本体挡住 B 的上外标签；B 在上外无合法区间，改换下外轨道，A、C 不动。",
+    },
+    chain: {
+      a: (Bx, Yb, bw, bh) => R(Bx - 60, Yb - 40, bw, bh),
+      cx: (Bx) => Bx + 120,
+      cgrp: true,
+      labels: (A, B, C) => [
+        { r: labelAt(A, "top", "out", 0.5), text: "标签 A", cap: "上外 · t=0.5", capAbove: true, moved: false },
+        { r: labelAt(B, "bottom", "out", 0.5), text: "标签 B", cap: "下外 · t=0.5", capAbove: false, moved: true },
+        { r: labelAt(C, "bottom", "out", 0.5), text: "标签 C", cap: "下外 · t=0.5（连锁）", capAbove: false, moved: true },
+      ],
+      ghosts: (A, B, C) => [
+        { r: labelAt(B, "top", "out", 0.5), cap: "preferred · 上外" },
+        { r: labelAt(C, "top", "out", 0.5), cap: "preferred · 上外 · 与 B 冲突", bad: true },
+      ],
+      arrows: (A, B, C) => {
+        const gb = labelAt(B, "top", "out", 0.5);
+        const ab = labelAt(B, "bottom", "out", 0.5);
+        const gc = labelAt(C, "top", "out", 0.5);
+        const ac = labelAt(C, "bottom", "out", 0.5);
+        return [
+          { d: `M ${cc(gb).x} ${cc(gb).y} C ${cc(gb).x + 80} ${cc(gb).y + 40} ${cc(ab).x + 80} ${cc(ab).y - 40} ${cc(ab).x} ${cc(ab).y}`, cls: "ph-edge" },
+          { d: `M ${cc(gc).x} ${cc(gc).y} C ${cc(gc).x + 100} ${cc(gc).y + 40} ${cc(ac).x + 100} ${cc(ac).y - 40} ${cc(ac).x} ${cc(ac).y}`, cls: "ph-edge" },
+        ];
+      },
+      group: (A, B, C) => [A, B, C],
+      status: "B → 下外 · C → 下外",
+      summary: "A 压入 B 后，B 换到下外又撞上 C 的标签（标签-标签）与 C 本体（标签-本体）；BFS 组 {A,B,C} 连锁重排，C 也换到下外。",
+    },
+  };
+
+  function drawJoint(W, H) {
+    const vp = R(36, 56, W - 72, H - 88);
+    const bw = 140, bh = 76, lw = 150, lh = 30, gap = 8;
+    const Bx = vp.x + vp.w / 2 - bw / 2;
+    const Yb = vp.y + vp.h * 0.30;
+    const sc = jointScenes[state.joint];
+    const A = sc.a(Bx, Yb, bw, bh);
+    const B = R(Bx, Yb, bw, bh);
+    const C = R(sc.cx(Bx), Yb + 100, bw, bh);
+    const labels = sc.labels(A, B, C);
+    const ghosts = sc.ghosts(A, B, C);
+    const arrows = sc.arrows(A, B, C);
+    const group = sc.group(A, B, C);
+
+    let m = vpMarkup(vp);
+
+    const gs = [
+      Math.min(...group.map((b) => b.x)) - 22,
+      Math.min(...group.map((b) => b.y)) - 40,
+      Math.max(...group.map((b) => b.x + b.w)) + 22,
+      Math.max(...group.map((b) => b.y + b.h)) + 22,
+    ];
+    m += `<rect class="ph-group" x="${gs[0]}" y="${gs[1]}" width="${gs[2] - gs[0]}" height="${gs[3] - gs[1]}" rx="16"/>`;
+    m += txt(gs[0] + 12, gs[3] + 14, "BFS 连通组 · 联合重排", "ph-sub ph-small", "start");
+
+    m += boxMarkup(A, "ph-body-op", "A", "操作框", null);
+    m += boxMarkup(B, "ph-body", "B", null, "邻框");
+    m += boxMarkup(C, sc.cgrp ? "ph-body" : "ph-body-off", "C", null, sc.cgrp ? "连锁邻框" : "无关方框 · 不参与");
+
+    if (state.joint === "near") {
+      m += txt((A.x + A.w + B.x) / 2, Yb - 52, "标签-标签冲突", "ph-obstacle-txt ph-small");
+    }
+    if (state.joint === "push") {
+      m += txt(Bx + 30, Yb + 18, "本体相交", "ph-obstacle-txt ph-small");
+    }
+    if (state.joint === "chain") {
+      m += txt(Bx + 68, Yb + 10, "本体相交", "ph-obstacle-txt ph-small");
+    }
+
+    ghosts.forEach((g) => {
+      m += rr(g.r, g.bad ? "ph-ghost-bad" : "ph-ghost", 6);
+      if (g.cap) {
+        m += g.bad
+          ? txt(cc(g.r).x, g.r.y - 20, g.cap, "ph-obstacle-txt ph-small")
+          : txt(g.r.x + g.r.w + 10, cc(g.r).y, g.cap, "ph-sub ph-small", "start");
+      }
+    });
+
+    arrows.forEach((a) => {
+      m += `<path class="${a.cls}" d="${a.d}" marker-end="url(#ph-ar)"/>`;
+    });
+
+    labels.forEach((l) => {
+      m += labelMarkup(l.r, l.text, l.cap, l.moved, l.capAbove);
+    });
+
+    m += `<rect x="${vp.x + 10}" y="${vp.y + vp.h - 17}" width="12" height="12" rx="3" fill="var(--viz-series-2)"/>`;
+    m += txt(vp.x + 28, vp.y + vp.h - 11, "本次移动的标签", "ph-sub ph-small", "start");
+    m += `<rect x="${vp.x + 150}" y="${vp.y + vp.h - 17}" width="12" height="12" rx="3" fill="var(--viz-series-1)"/>`;
+    m += txt(vp.x + 168, vp.y + vp.h - 11, "保持原位的标签", "ph-sub ph-small", "start");
+    m += `<rect x="${vp.x + 288}" y="${vp.y + vp.h - 17}" width="12" height="12" rx="3" fill="none" stroke="var(--muted-foreground)" stroke-dasharray="3 3"/>`;
+    m += txt(vp.x + 306, vp.y + vp.h - 11, "preferred（虚线）", "ph-sub ph-small", "start");
+
+    return { marks: m, title: "方框相邻与交叉时的标签联合避让", desc: sc.summary, status: sc.status, summary: sc.summary };
+  }
+
+  function drawGraph(W, H) {
+    const vp = R(36, 52, W - 72, H - 96);
+    const ox = Math.max(0, (W - 780) / 2);
+    const n = R(ox + 160, 150, 96, 56);
+    const b = R(ox + 400, 150, 96, 56);
+    const c = R(ox + 170, 310, 96, 56);
+    const d = R(ox + 410, 310, 96, 56);
+    const e = R(ox + 620, 160, 96, 56);
+
+    let m = vpMarkup(vp);
+
+    m += line(n.x + n.w, n.y + n.h / 2, b.x, b.y + n.h / 2, "ph-edge-op", "ph-ar-op");
+    m += txt((n.x + n.w + b.x) / 2, n.y + n.h / 2 - 12, "本体相交", "ph-obstacle-txt ph-small");
+    m += line(b.x + n.w / 2, b.y + n.h, c.x + n.w / 2, c.y, "ph-edge-p", "ph-ar-p");
+    m += txt(b.x + n.w / 2 + 14, (b.y + n.h + c.y) / 2, "标签-本体", "ph-sub ph-small", "start");
+    m += line(c.x + c.w, c.y + n.h / 2, d.x, d.y + n.h / 2, "ph-edge-p", "ph-ar-p");
+    m += txt((c.x + c.w + d.x) / 2, c.y + n.h / 2 - 12, "标签-标签", "ph-sub ph-small");
+    m += line(n.x + n.w / 2, n.y + n.h, c.x + n.w / 2, c.y, "ph-edge-old", "ph-ar");
+    m += txt(n.x + n.w / 2 - 12, (n.y + n.h + c.y) / 2, "移动前存在 · 并集仍计入", "ph-sub ph-small", "end");
+
+    m += `<rect class="ph-group" x="${n.x - 30}" y="${n.y - 34}" width="${d.x + d.w - n.x + 60}" height="${d.y + d.h - n.y + 64}" rx="16"/>`;
+    m += txt(n.x - 18, n.y - 20, "BFS 连通组 {A,B,C,D} · 从操作框 A 按前后边集并集扩散", "ph-sub ph-small", "start");
+
+    m += boxMarkup(n, "ph-node-op", "A", "操作框", null);
+    m += boxMarkup(b, "ph-node", "B", null, "邻框");
+    m += boxMarkup(c, "ph-node", "C", null, "邻框");
+    m += boxMarkup(d, "ph-node", "D", null, "邻框");
+    m += boxMarkup(e, "ph-node-off", "E · 无关", null, "不参与重排");
+
+    [[n, "0"], [b, "1"], [c, "1"], [d, "2"]].forEach(([r, dist]) => {
+      m += `<circle class="ph-badge" cx="${r.x + r.w - 2}" cy="${r.y + 2}" r="12"/>`;
+      m += txt(r.x + r.w - 2, r.y + 2.5, dist, "ph-badge-txt");
+    });
+
+    const ly = vp.y + vp.h - 22;
+    m += line(vp.x + 10, ly, vp.x + 36, ly, "ph-edge-op");
+    m += txt(vp.x + 44, ly, "本体相交", "ph-sub ph-small", "start");
+    m += line(vp.x + 130, ly, vp.x + 156, ly, "ph-edge-p");
+    m += txt(vp.x + 164, ly, "标签-本体 / 标签-标签", "ph-sub ph-small", "start");
+    m += line(vp.x + 310, ly, vp.x + 336, ly, "ph-edge-old");
+    m += txt(vp.x + 344, ly, "移动前旧边（并集保留）", "ph-sub ph-small", "start");
+
+    m += txt(vp.x + 10, ly + 24, "隐藏标签的方框：标签不参与放置，方框本体仍是障碍。", "ph-sub ph-small", "start");
+    m += txt(vp.x + 10, ly + 42, "障碍 = 其他方框本体 + 方框标签；箭头 / 文字 / 画笔 / 序号忽略。", "ph-sub ph-small", "start");
+    m += txt(vp.x + 10, ly + 60, "标签-外部方框间距 = 该标签 anchor_offset_px；标签之间取双方 offset 较大值。", "ph-sub ph-small", "start");
+
+    return {
+      marks: m,
+      title: "冲突图与 BFS 连通组",
+      desc: "前后两张图的边集取并集，从操作框 BFS。",
+      status: "BFS 连通组 {A,B,C,D}",
+      summary: "旧边 A–C 已消失但仍计入前后并集：障碍移开或删除后，被挤开的标签也会回到偏好位置。",
+    };
+  }
+
+  function drawSolver(W, H) {
+    const vp = R(36, 52, W - 72, H - 88);
+    const stages = [
+      ["1 · 八条内外轨道", "上外/上内 · 下内/下外 · 左外/左内 · 右内/右外"],
+      ["2 · 画布合法区间", "按原始布局计算，再减去障碍投影区间"],
+      ["3 · 候选集 ≤ 24", "preferred 投影 · current 投影 · 两个端点"],
+      ["4 · 确定性 beam search", "宽度 128 · 状态 ≤ 4096 · 一次最多 32 个可见标签"],
+      ["5 · 首轮只接受零碰撞", "是 → 完成；否 → 第 6 步"],
+      ["6 · 外部标签阻塞", "最多扩展一次其 owner 后重新求解"],
+      ["7 · 专项兜底", "操作框的 Top / Inside 合法位置"],
+      ["8 · 最小重叠兜底", "重叠面积 + 碰撞对数 + 偏好代价 + 稳定锚点序"],
+    ];
+    let m = vpMarkup(vp);
+
+    const px = 46, pw = 308, y0 = 78, ph = 40, gap = 10;
+    stages.forEach(([t, d], i) => {
+      const y = y0 + i * (ph + gap);
+      m += rr(R(px, y, pw, ph), "ph-pipe", 8);
+      m += txt(px + 12, y + 15, t, "ph-pipe-title", "start");
+      m += txt(px + 12, y + 31, d, "ph-sub ph-small", "start");
+      if (i < stages.length - 1) m += line(px + pw / 2, y + ph + 2, px + pw / 2, y + ph + gap - 2, "ph-edge", "ph-ar");
+    });
+
+    m += txt(46, 484, "标签尺寸本身无法放入画布时：拒绝引发该尺寸的编辑，保持原文档不变。", "ph-sub ph-small", "start");
+
+    const cardX = W - 380;
+    m += rr(R(cardX, 78, 344, 252), "ph-pipe", 10);
+    m += txt(cardX + 10, 96, "一条轨道上的候选（上外轨）", "ph-pipe-title", "start");
+
+    const bx = cardX + 86, by = 182, bw = 170, bh = 100;
+    m += rr(R(bx, by, bw, bh), "ph-body", 2);
+    m += txt(bx + bw / 2, by + bh / 2, "目标方框", "ph-txt");
+
+    const trackL = bx - 30, trackR = bx + bw + 30;
+    const topY = by - 8 - 14;
+    [[trackL, trackR, topY], [trackL, trackR, by + 8 + 14], [trackL, trackR, by + bh - 8 - 14], [trackL, trackR, by + bh + 8 + 14]].forEach(([x1, x2, y]) => {
+      m += line(x1, y, x2, y, "ph-track");
+    });
+    [[bx - 8 - 75, by, by + bh], [bx + 8 + 75, by, by + bh], [bx + bw - 8 - 75, by, by + bh], [bx + bw + 8 + 75, by, by + bh]].forEach(([x, y1, y2]) => {
+      m += line(x, y1, x, y2, "ph-track");
+    });
+
+    m += line(trackL, topY, 500, topY, "ph-legal");
+    m += line(610, topY, trackR, topY, "ph-legal");
+    m += rr(R(500, topY - 13, 110, 26), "ph-obstacle", 4);
+    m += txt(555, topY, "障碍投影", "ph-obstacle-txt ph-small");
+
+    [[478, "P", "ph-dot"], [500, "E", "ph-dot"], [560, "C", "ph-dot-bad"], [610, "E", "ph-dot"]].forEach(([x, lbl, cls]) => {
+      m += `<circle class="${cls}" cx="${x}" cy="${topY}" r="5"/>`;
+      m += txt(x, topY - 20, lbl, "ph-sub ph-small");
+    });
+
+    m += txt(46, 344, "P = preferred 投影 · C = current 投影 · E = 区间端点（C 落在障碍投影内，空心红点）", "ph-sub ph-small", "start");
+    m += txt(46, 364, "不用 fit_label_bounds_to_canvas 平移后的框参与求解 · 全浮点 total_cmp · 固定锚点序决胜 · 边缘接触算冲突（0.01px 余量）", "ph-sub ph-small", "start");
+
+    return {
+      marks: m,
+      title: "标签求解流水线",
+      desc: "八轨道 → 合法区间 → 候选 → beam search → 逐级兜底。",
+      status: "8 阶段流水线",
+      summary: "每条轨道：合法区间减障碍投影 → preferred/current 投影与端点候选 → 确定性 beam search → 零碰撞优先，逐级兜底。",
+    };
+  }
+
+  function drawPref(W, H) {
+    const vp = R(36, 52, W - 72, H - 76);
+    const cx = W / 2;
+    const A = R(cx - 70, 252, 140, 76);
+    const blocked = state.pref === "blocked";
+    const gO = R(cx - 70, 168, 140, 56);
+    const O = R(cx + 190, 168, 140, 56);
+    let m = vpMarkup(vp);
+
+    const aTop = labelAt(A, "top", "out", 0.5);
+    const aBot = labelAt(A, "bottom", "out", 0.5);
+
+    if (blocked) {
+      m += rr(gO, "ph-obstacle", 6);
+      m += txt(cc(gO).x, cc(gO).y, "外部方框 O", "ph-obstacle-txt");
+      m += txt(cc(gO).x - 85, cc(gO).y, "固定障碍", "ph-sub ph-small", "end");
+      m += rr(aTop, "ph-ghost", 6);
+      m += txt(cc(A).x - 95, cc(aTop).y, "preferred · 上外", "ph-sub ph-small", "end");
+      m += txt(cc(A).x + 95, cc(aTop).y, "冲突", "ph-obstacle-txt ph-small", "start");
+      m += curve(cc(aTop).x, aTop.y + aTop.h, cc(aBot).x, aBot.y, cc(aTop).x - 70, aTop.y + aTop.h + 60, cc(aBot).x - 70, aBot.y - 60, "ph-edge", "ph-ar");
+      m += labelMarkup(aBot, "标签 A（actual）", "下外 · 被挤开", true, false);
+      m += txt(cx, H - 20, "虚线 = preferred（偏好） · 实线 = actual（求解结果）；手拖标签先写临时 preferred 再联合求解，邻框标签允许同时移动。", "ph-sub ph-small");
+    } else {
+      m += rr(gO, "ph-ghost", 6);
+      m += txt(cc(gO).x, cc(gO).y, "O 已移开", "ph-sub ph-small");
+      m += rr(O, "ph-obstacle", 6);
+      m += txt(cc(O).x, cc(O).y, "外部方框 O", "ph-obstacle-txt");
+      m += line(gO.x + gO.w, cc(gO).y, O.x, cc(O).y, "ph-edge-op", "ph-ar-op");
+      m += labelMarkup(aTop, "标签 A（actual）", null, false, false);
+      m += txt(cc(A).x + 95, cc(aTop).y, "actual · 回到 preferred", "ph-sub ph-small", "start");
+      m += rr(aBot, "ph-ghost", 6);
+      m += txt(cc(A).x - 95, cc(aBot).y, "被挤开的位置", "ph-sub ph-small", "end");
+      m += curve(cc(aBot).x, aBot.y, cc(aTop).x, aTop.y + aTop.h, cc(aBot).x + 70, aBot.y - 30, cc(aTop).x + 70, aTop.y + aTop.h + 30, "ph-edge", "ph-ar");
+      m += txt(cx, H - 20, "O 移走后，前后边集并集 BFS 重新纳入 A：被挤开的标签自动回到偏好位置（虚线为原位置）。", "ph-sub ph-small");
+    }
+
+    m += boxMarkup(A, "ph-body", "A", null, null);
+
+    return {
+      marks: m,
+      title: "preferred 与 actual 双锚点",
+      desc: blocked ? "偏好被挡，求解结果被挤开。" : "障碍移开，标签回位。",
+      status: blocked ? "actual：下外 · preferred：上外" : "回到 preferred · 上外",
+      summary: blocked
+        ? "障碍 O 挡住上外偏好位置；联合求解把 actual 挤到下外，preferred 保持上外不变。"
+        : "O 移走后，前后边集并集 BFS 重新纳入 A：被挤开的标签自动回到偏好位置（虚线为原位置）。",
+    };
+  }
+
+  function drawEditor(W, H) {
+    const vp = R(36, 52, W - 72, H - 84);
+    let m = vpMarkup(vp);
+    const nodes = [
+      ["按下指针", "立即分配稳定", "ElementId · 拖动全程", "求解顺序不闪烁"],
+      ["每帧预览", "持久文档 + 当前输入", "重建轻量场景", "每帧只求解一次"],
+      ["松手 / 离散操作", "基础命令在前", "受影响标签按", "z_index↓ · UUID↑"],
+      ["提交批次", "过滤无变化命令", "一次 revision", "一条撤销记录"],
+      ["撤销 / 重做", "直接恢复几何 +", "preferred + actual", "不重跑求解器"],
+    ];
+    const nw = 122, nh = 96, gap = 26;
+    const ox = (W - 714) / 2, ny = 118;
+    nodes.forEach(([t, l1, l2, l3], i) => {
+      const x = ox + i * (nw + gap);
+      m += rr(R(x, ny, nw, nh), "ph-pipe", 10);
+      m += txt(x + nw / 2, ny + 17, t, "ph-pipe-title");
+      m += txt(x + nw / 2, ny + 40, l1, "ph-sub ph-small");
+      m += txt(x + nw / 2, ny + 58, l2, "ph-sub ph-small");
+      m += txt(x + nw / 2, ny + 76, l3, "ph-sub ph-small");
+      if (i < nodes.length - 1) m += line(x + nw + 4, ny + 48, x + nw + gap - 4, ny + 48, "ph-edge-p", "ph-ar-p");
+    });
+
+    m += txt(W / 2, 96, "每帧从持久文档与当前输入重建轻量场景，只求解一次；正文 / 内联文本框 / 选择控制点共用 ElementPreviewSet。", "ph-sub ph-small");
+
+    const chips = [
+      "正文 / 内联文本框 / 选择控制点共用 ElementPreviewSet",
+      "创建 / 粘贴的新元素直接携带最终 actual",
+      "删除操作用旧图找回需要恢复偏好的邻框",
+      "移动 / 缩放先约束本体与描边，再求解标签位置",
+    ];
+    const cw = (W - 82) / 2;
+    chips.forEach((c, i) => {
+      const x = 36 + (i % 2) * (cw + 10);
+      const y = 240 + Math.floor(i / 2) * 40;
+      m += rr(R(x, y, cw, 32), "ph-pipe", 8);
+      m += txt(x + cw / 2, y + 16, c, "ph-sub ph-small");
+    });
+
+    m += txt(W / 2, 352, "一次操作 = 一次 revision + 一条撤销记录；预览与提交逐元素一致。", "ph-sub ph-small");
+
+    return {
+      marks: m,
+      title: "编辑器集成时序",
+      desc: "从按下指针到撤销 / 重做的一条链路。",
+      status: "一次操作 = 一次 revision",
+      summary: "预览与提交共用同一求解结果；批次顺序确定；撤销 / 重做直接恢复数据，不重跑求解器。",
+    };
+  }
+
+  function drawData(W, H) {
+    const vp = R(36, 52, W - 72, H - 84);
+    let m = vpMarkup(vp);
+    const xr = W - 364;
+
+    m += rr(R(40, 58, 336, 122), "ph-pipe", 10);
+    m += txt(56, 80, "RectanglePayload", "ph-pipe-title", "start");
+    m += txt(56, 104, "label_anchor — 求解后的实际位置", "ph-txt", "start");
+    m += txt(56, 124, "preferred_label_anchor — 默认 / 手拖偏好", "ph-txt", "start");
+    m += txt(56, 168, "新建方框：两者初始均 = Top · Outside · 0.0", "ph-sub ph-small", "start");
+
+    m += rr(R(xr, 58, 328, 122), "ph-pipe", 10);
+    m += txt(xr + 16, 80, "命令", "ph-pipe-title", "start");
+    m += txt(xr + 16, 104, "SetRectangleLabelPlacement", "ph-mono ph-small", "start");
+    m += txt(xr + 16, 124, "{ element_id, preferred_anchor, actual_anchor }", "ph-mono-sm", "start");
+    m += txt(xr + 16, 168, "一次更新偏好与实际；自动避让不改 preferred", "ph-sub ph-small", "start");
+
+    m += rr(R(40, 196, 336, 122), "ph-pipe", 10);
+    m += txt(56, 218, "求解器 API（common）", "ph-pipe-title", "start");
+    m += txt(56, 242, "RectangleLabelScene / RectangleLabelSolution", "ph-txt", "start");
+    m += txt(56, 262, "solve_rectangle_label_reflow", "ph-mono ph-small", "start");
+    m += txt(56, 282, "(before, after, primary_id, seed_ids)", "ph-mono-sm", "start");
+    m += txt(56, 306, "场景只复制方框数据；app 新增 ElementPreviewSet", "ph-sub ph-small", "start");
+
+    m += rr(R(xr, 196, 328, 122), "ph-pipe", 10);
+    m += txt(xr + 16, 218, "摘要读取", "ph-pipe-title", "start");
+    m += txt(xr + 16, 242, "接受 v2 · v3 · v4", "ph-txt", "start");
+    m += txt(xr + 16, 262, "未知更高版本一律拒绝", "ph-txt", "start");
+    m += txt(xr + 16, 306, "迁移 / 打开文档不主动重排，避免视觉漂移", "ph-sub ph-small", "start");
+
+    m += rr(R(40, 334, W - 76, 126), "ph-pipe", 10);
+    m += txt(56, 356, "schema v4 · 迁移", "ph-pipe-title", "start");
+    m += rr(R(84, 376, 84, 40), "ph-pipe", 8);
+    m += txt(126, 396, "v2", "ph-txt");
+    m += rr(R(240, 376, 84, 40), "ph-pipe", 8);
+    m += txt(282, 396, "v3", "ph-txt");
+    m += rr(R(474, 372, 116, 44), "ph-node", 8);
+    m += txt(532, 394, "v4", "ph-txt");
+    m += line(168, 392, 470, 392, "ph-edge-op", "ph-ar-op");
+    m += txt(319, 380, "推导旧锚点 → 写 preferred + actual", "ph-sub ph-small");
+    m += line(324, 410, 470, 410, "ph-edge-op", "ph-ar-op");
+    m += txt(397, 428, "label_anchor → preferred + actual", "ph-sub ph-small");
+    m += txt(56, 452, "摘要读取接受 v2 / v3 / v4，未知更高版本拒绝；迁移与打开文档不主动重排，避免旧文档视觉漂移。", "ph-sub ph-small", "start");
+
+    return {
+      marks: m,
+      title: "数据与迁移",
+      desc: "v4 双锚点与兼容链。",
+      status: "schema v4",
+      summary: "preferred 与 actual 双锚点；v2/v3 迁移为 v4；摘要兼容 v2–v4，未知高版本拒绝。",
+    };
+  }
+
+  const drawFns = { joint: drawJoint, graph: drawGraph, solver: drawSolver, pref: drawPref, editor: drawEditor, data: drawData };
+
+  const DEFS = `
+    <marker id="ph-ar" viewBox="0 0 8 8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--muted-foreground)"/></marker>
+    <marker id="ph-ar-op" viewBox="0 0 8 8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--viz-series-2)"/></marker>
+    <marker id="ph-ar-p" viewBox="0 0 8 8" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M 0 0 L 8 4 L 0 8 Z" fill="var(--viz-series-1)"/></marker>`;
+
+  function draw() {
+    const W = Math.min(980, Math.max(760, Math.floor(stage.getBoundingClientRect().width || 760)));
+    const H = HEIGHTS[state.mode];
+    const result = drawFns[state.mode](W, H);
+    svg.style.width = `${W}px`;
+    svg.style.height = `${H}px`;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.innerHTML = `<title id="diagram-title">${esc(result.title)}</title>
+      <desc id="diagram-desc">${esc(result.desc)}</desc>
+      <defs>${DEFS}</defs>
+      ${result.marks}`;
+    statusEl.textContent = result.status;
+    summaryEl.textContent = result.summary;
+  }
+
+  function selectButtons(selector, selected) {
+    root.querySelectorAll(selector).forEach((btn) => {
+      const active = btn === selected;
+      btn.classList.toggle("btn-primary", active);
+      if (btn.hasAttribute("aria-pressed")) btn.setAttribute("aria-pressed", String(active));
+      if (btn.hasAttribute("aria-selected")) btn.setAttribute("aria-selected", String(active));
+    });
+  }
+
+  root.querySelectorAll("[data-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.mode = btn.dataset.mode;
+      selectButtons("[data-mode]", btn);
+      root.querySelectorAll("[data-controls]").forEach((g) => {
+        g.hidden = g.dataset.controls !== state.mode;
+      });
+      scopeEl.textContent = modeMeta[state.mode];
+      ruleEl.textContent = rules[state.mode];
+      draw();
+    });
+  });
+
+  root.querySelectorAll("[data-joint]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.joint = btn.dataset.joint;
+      selectButtons("[data-joint]", btn);
+      draw();
+    });
+  });
+
+  root.querySelectorAll("[data-pref]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.pref = btn.dataset.pref;
+      selectButtons("[data-pref]", btn);
+      draw();
+    });
+  });
+
+  const observer = new ResizeObserver(() => draw());
+  observer.observe(stage);
+  draw();
+})();
+</script>
+</body>
+</html>

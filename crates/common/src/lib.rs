@@ -4,6 +4,7 @@ pub mod element;
 pub mod format;
 pub mod geometry;
 pub mod history;
+pub mod rectangle_label_reflow;
 
 pub use command::{AppliedCommand, ArrowEndpoint, CommandBatch, CommandError, DocumentCommand};
 pub use document::{
@@ -32,4 +33,8 @@ pub use geometry::{
 };
 pub use history::{
   CommandHistory, HistoryError, HistoryLimits, MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES,
+};
+pub use rectangle_label_reflow::{
+  RectangleLabelScene, RectangleLabelSceneItem, RectangleLabelSolution,
+  solve_rectangle_label_reflow,
 };

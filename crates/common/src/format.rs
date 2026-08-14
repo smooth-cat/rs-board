@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::path::{Component, Path};
 
 use chrono::{DateTime, Utc};
@@ -49,7 +51,6 @@ pub fn decode_document(bytes: &[u8]) -> Result<BoardDocument, FormatError> {
       document.validate()?;
       Ok(document)
     }
-    LEGACY_SCHEMA_VERSION => decode_v2_document(bytes),
     _ => Err(FormatError::UnsupportedSchema { found: schema, supported: CURRENT_SCHEMA_VERSION }),
   }
 }
@@ -73,7 +74,7 @@ pub fn decode_document_summary(bytes: &[u8]) -> Result<DocumentManifestSummary, 
 
   let envelope: SummaryEnvelope =
     serde_json::from_slice(bytes).map_err(|error| FormatError::Json(error.to_string()))?;
-  if !matches!(envelope.schema_version, LEGACY_SCHEMA_VERSION | CURRENT_SCHEMA_VERSION) {
+  if envelope.schema_version != CURRENT_SCHEMA_VERSION {
     return Err(FormatError::UnsupportedSchema {
       found: envelope.schema_version,
       supported: CURRENT_SCHEMA_VERSION,
@@ -344,6 +345,7 @@ fn migrate_v2_element(legacy: V2Element, canvas_size_px: SizePx) -> Result<Eleme
         anchor_offset_px: payload.label.anchor_offset_px,
         text_style: payload.label.text_style,
       };
+      let anchor = RectangleLabelAnchor::new(edge, RectangleLabelSide::Outside, position);
       (
         ElementPayload::Rectangle(RectanglePayload {
           start_px: payload.start_px,
@@ -351,7 +353,8 @@ fn migrate_v2_element(legacy: V2Element, canvas_size_px: SizePx) -> Result<Eleme
           stroke_style: payload.stroke_style,
           fill_rgba: payload.fill_rgba,
           label,
-          label_anchor: RectangleLabelAnchor::new(edge, RectangleLabelSide::Outside, position),
+          preferred_label_anchor: anchor,
+          label_anchor: anchor,
         }),
         expected,
       )
@@ -586,6 +589,11 @@ mod tests {
           anchor_offset_px: 8.0,
           text_style: TextStyle::mvp(rectangle_color.contrasting_text(), 36.0).unwrap(),
         },
+        preferred_label_anchor: RectangleLabelAnchor::new(
+          RectangleLabelEdge::Top,
+          RectangleLabelSide::Outside,
+          0.0,
+        ),
         label_anchor: RectangleLabelAnchor::new(
           RectangleLabelEdge::Top,
           RectangleLabelSide::Outside,
@@ -685,7 +693,7 @@ mod tests {
     let decoded = decode_document(&encoded).unwrap();
     assert_eq!(decoded, document);
     let json = String::from_utf8(encoded).unwrap();
-    assert!(json.contains("\"schema_version\": 3"));
+    assert!(json.contains("\"schema_version\": 4"));
     assert!(json.contains("\"document_id\": \"00000000-0000-0000-0000-000000000000\""));
     assert!(!json.contains("history"));
     assert!(!json.contains("selection"));
@@ -696,16 +704,14 @@ mod tests {
     let document = document_with_all_elements();
     let mut value = serde_json::to_value(&document).unwrap();
     value["elements"] = serde_json::json!([{"unsupported_future_element": true}]);
-    for schema_version in [LEGACY_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION] {
-      value["schema_version"] = schema_version.into();
-      let summary = decode_document_summary(&serde_json::to_vec(&value).unwrap()).unwrap();
-      assert_eq!(summary.document_id, document.document_id);
-      assert_eq!(summary.title, document.title);
-      assert_eq!(summary.revision, document.revision);
-      assert_eq!(summary.updated_at, document.updated_at);
-      assert_eq!(summary.preview_file, document.preview_file);
-      assert_eq!(summary.preview_revision, document.preview_revision);
-    }
+    value["schema_version"] = CURRENT_SCHEMA_VERSION.into();
+    let summary = decode_document_summary(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(summary.document_id, document.document_id);
+    assert_eq!(summary.title, document.title);
+    assert_eq!(summary.revision, document.revision);
+    assert_eq!(summary.updated_at, document.updated_at);
+    assert_eq!(summary.preview_file, document.preview_file);
+    assert_eq!(summary.preview_revision, document.preview_revision);
     assert!(decode_document(&serde_json::to_vec(&value).unwrap()).is_err());
 
     for schema_version in [1, CURRENT_SCHEMA_VERSION + 1] {
@@ -721,194 +727,16 @@ mod tests {
   }
 
   #[test]
-  fn v2_document_migrates_labels_anchors_and_bounds_without_metadata_churn() {
-    let document = document_with_all_elements();
-    let value = v2_value(&document);
-    let legacy_rectangle: V2RectanglePayload =
-      serde_json::from_value(value["elements"][2]["payload"].clone()).unwrap();
-    let legacy_label_layout =
-      v2_rectangle_label_layout(&legacy_rectangle, document.canvas_size_px).unwrap();
-    let bytes = serde_json::to_vec(&value).unwrap();
-    let migrated = decode_document(&bytes).unwrap();
-
-    assert_eq!(migrated.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(migrated.document_id, document.document_id);
-    assert_eq!(migrated.title, document.title);
-    assert_eq!(migrated.preview_file, document.preview_file);
-    assert_eq!(migrated.preview_revision, document.preview_revision);
-    assert_eq!(migrated.revision, document.revision);
-    assert_eq!(migrated.created_at, document.created_at);
-    assert_eq!(migrated.updated_at, document.updated_at);
-
-    let arrow = migrated
-      .elements
-      .iter()
-      .find_map(|element| match &element.payload {
-        ElementPayload::Arrow(payload) => Some(payload),
-        _ => None,
-      })
-      .unwrap();
-    assert_eq!(arrow.label.text, None);
-    assert_eq!(arrow.label.max_width_px, 420.0);
-    assert_eq!(arrow.label.padding_px, 8.0);
-    assert_eq!(arrow.label.anchor_offset_px, 8.0);
-    assert_eq!(arrow.label.text_style.font_size_px, 24.0);
-    assert_eq!(arrow.label.text_style.color_rgba, arrow.stroke_style.color_rgba.contrasting_text());
-
-    let rectangle_element = migrated
-      .elements
-      .iter()
-      .find(|element| matches!(element.payload, ElementPayload::Rectangle(_)))
-      .unwrap();
-    let ElementPayload::Rectangle(rectangle) = &rectangle_element.payload else {
-      unreachable!();
-    };
-    assert_eq!(rectangle.label.text.as_deref(), Some("章节标题"));
-    assert_eq!(rectangle.label.max_width_px, 480.0);
-    assert_eq!(rectangle.label.padding_px, 8.0);
-    assert_eq!(rectangle.label.anchor_offset_px, 8.0);
-    assert_eq!(rectangle.label_anchor.edge, RectangleLabelEdge::Top);
-    assert_eq!(rectangle.label_anchor.side, RectangleLabelSide::Outside);
-    assert_eq!(rectangle.label_anchor.position, 0.0);
-    rectangle_element.validate(migrated.canvas_size_px).unwrap();
-    let migrated_label_layout =
-      crate::element::rectangle_label_layout(rectangle, migrated.canvas_size_px).unwrap().unwrap();
-    assert!(v2_bounds_approximately_equal(
-      migrated_label_layout.bounds_px,
-      legacy_label_layout.bounds_px,
-    ));
-
-    let snapshot = decode_snapshot(&bytes).unwrap();
-    assert_eq!(snapshot.schema_version, CURRENT_SCHEMA_VERSION);
-    assert_eq!(snapshot.revision, document.revision);
-    assert_eq!(snapshot.updated_at, document.updated_at);
-  }
-
-  #[test]
-  fn v2_rectangle_near_the_top_migrates_to_bottom_outside() {
-    let mut document = document_with_all_elements();
-    let rectangle_element = document
-      .elements
-      .iter_mut()
-      .find(|element| matches!(element.payload, ElementPayload::Rectangle(_)))
-      .unwrap();
-    let ElementPayload::Rectangle(rectangle) = &mut rectangle_element.payload else {
-      unreachable!();
-    };
-    rectangle.start_px.y_px = 10.0;
-    rectangle.end_px.y_px = 280.0;
-    rectangle_element.refresh_bounds(document.canvas_size_px).unwrap();
-    document.validate().unwrap();
-
-    let migrated = decode_document(&serde_json::to_vec(&v2_value(&document)).unwrap()).unwrap();
-    let rectangle = migrated
-      .elements
-      .iter()
-      .find_map(|element| match &element.payload {
-        ElementPayload::Rectangle(payload) => Some(payload),
-        _ => None,
-      })
-      .unwrap();
-    assert_eq!(rectangle.label_anchor.edge, RectangleLabelEdge::Bottom);
-    assert_eq!(rectangle.label_anchor.side, RectangleLabelSide::Outside);
-  }
-
-  #[test]
-  fn v2_rectangle_canvas_correction_keeps_the_legacy_label_position() {
-    let mut document = document_with_all_elements();
-    let rectangle_element = document
-      .elements
-      .iter_mut()
-      .find(|element| matches!(element.payload, ElementPayload::Rectangle(_)))
-      .unwrap();
-    let ElementPayload::Rectangle(rectangle) = &mut rectangle_element.payload else {
-      unreachable!();
-    };
-    rectangle.start_px.x_px = 1_160.0;
-    rectangle.end_px.x_px = 1_270.0;
-    rectangle_element.refresh_bounds(document.canvas_size_px).unwrap();
-    document.validate().unwrap();
-
-    let value = v2_value(&document);
-    let legacy_rectangle: V2RectanglePayload =
-      serde_json::from_value(value["elements"][2]["payload"].clone()).unwrap();
-    let legacy_layout =
-      v2_rectangle_label_layout(&legacy_rectangle, document.canvas_size_px).unwrap();
-    let migrated = decode_document(&serde_json::to_vec(&value).unwrap()).unwrap();
-    let rectangle = migrated
-      .elements
-      .iter()
-      .find_map(|element| match &element.payload {
-        ElementPayload::Rectangle(payload) => Some(payload),
-        _ => None,
-      })
-      .unwrap();
-    let migrated_layout =
-      crate::element::rectangle_label_layout(rectangle, migrated.canvas_size_px).unwrap().unwrap();
-    assert!(v2_bounds_approximately_equal(migrated_layout.bounds_px, legacy_layout.bounds_px,));
-  }
-
-  #[test]
-  fn v2_narrow_rectangle_keeps_the_legacy_label_inset() {
-    let mut document = document_with_all_elements();
-    let rectangle_element = document
-      .elements
-      .iter_mut()
-      .find(|element| matches!(element.payload, ElementPayload::Rectangle(_)))
-      .unwrap();
-    let ElementPayload::Rectangle(rectangle) = &mut rectangle_element.payload else {
-      unreachable!();
-    };
-    rectangle.end_px.x_px = rectangle.start_px.x_px + 6.0;
-    rectangle.stroke_style = StrokeStyle::mvp(ColorRgba::YELLOW, 4.0).unwrap();
-    rectangle_element.refresh_bounds(document.canvas_size_px).unwrap();
-    document.validate().unwrap();
-
-    let value = v2_value(&document);
-    let legacy_rectangle: V2RectanglePayload =
-      serde_json::from_value(value["elements"][2]["payload"].clone()).unwrap();
-    let legacy_layout =
-      v2_rectangle_label_layout(&legacy_rectangle, document.canvas_size_px).unwrap();
-    let migrated = decode_document(&serde_json::to_vec(&value).unwrap()).unwrap();
-    let rectangle = migrated
-      .elements
-      .iter()
-      .find_map(|element| match &element.payload {
-        ElementPayload::Rectangle(payload) => Some(payload),
-        _ => None,
-      })
-      .unwrap();
-    let migrated_layout =
-      crate::element::rectangle_label_layout(rectangle, migrated.canvas_size_px).unwrap().unwrap();
-    assert_eq!(rectangle.label_anchor.position, 0.0);
-    assert!(v2_bounds_approximately_equal(migrated_layout.bounds_px, legacy_layout.bounds_px,));
-  }
-
-  #[test]
-  fn v2_decode_remains_strict_and_rejects_stale_legacy_bounds() {
-    let document = document_with_all_elements();
-    let mut value = v2_value(&document);
-    value.as_object_mut().unwrap().insert("runtime_selection".to_owned(), true.into());
-    assert!(matches!(
-      decode_document(&serde_json::to_vec(&value).unwrap()),
-      Err(FormatError::Json(_))
-    ));
-
-    let mut value = v2_value(&document);
-    value["elements"][1]["payload"]
-      .as_object_mut()
-      .unwrap()
-      .insert("future_arrow_field".to_owned(), true.into());
-    assert!(matches!(
-      decode_document(&serde_json::to_vec(&value).unwrap()),
-      Err(FormatError::Json(_))
-    ));
-
-    let mut value = v2_value(&document);
-    value["elements"][2]["bounds_px"]["min"]["x_px"] = 395.0.into();
+  fn schema_two_documents_are_rejected_without_migration() {
+    let mut value = serde_json::to_value(document_with_all_elements()).unwrap();
+    value["schema_version"] = 2.into();
     assert_eq!(
       decode_document(&serde_json::to_vec(&value).unwrap()),
-      Err(FormatError::InvalidDocument(DocumentError::Element(ElementError::StaleBounds)))
+      Err(FormatError::UnsupportedSchema { found: 2, supported: CURRENT_SCHEMA_VERSION })
+    );
+    assert_eq!(
+      decode_document_summary(&serde_json::to_vec(&value).unwrap()),
+      Err(FormatError::UnsupportedSchema { found: 2, supported: CURRENT_SCHEMA_VERSION })
     );
   }
 
@@ -986,7 +814,7 @@ mod tests {
 
     let encoded = encode_document(&document).unwrap();
     let json = String::from_utf8(encoded.clone()).unwrap();
-    assert!(json.contains("\"schema_version\": 3"));
+    assert!(json.contains("\"schema_version\": 4"));
     assert!(json.contains("\"pressure\": 0.25"));
     assert!(json.contains("\"pressure\": 0.75"));
     assert_eq!(decode_document(&encoded).unwrap(), document);

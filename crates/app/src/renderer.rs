@@ -1199,6 +1199,11 @@ mod tests {
         RectangleLabelSide::Outside,
         0.0,
       ),
+      preferred_label_anchor: RectangleLabelAnchor::new(
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        0.0,
+      ),
     }
   }
 
@@ -1473,6 +1478,11 @@ mod tests {
             text_style: label_style,
           },
           label_anchor: RectangleLabelAnchor::new(
+            RectangleLabelEdge::Top,
+            RectangleLabelSide::Outside,
+            0.0,
+          ),
+          preferred_label_anchor: RectangleLabelAnchor::new(
             RectangleLabelEdge::Top,
             RectangleLabelSide::Outside,
             0.0,
@@ -1839,6 +1849,11 @@ mod tests {
             text_style,
           },
           label_anchor: RectangleLabelAnchor::new(
+            RectangleLabelEdge::Top,
+            RectangleLabelSide::Outside,
+            0.0,
+          ),
+          preferred_label_anchor: RectangleLabelAnchor::new(
             RectangleLabelEdge::Top,
             RectangleLabelSide::Outside,
             0.0,

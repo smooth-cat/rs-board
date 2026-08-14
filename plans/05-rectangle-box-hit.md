@@ -16,11 +16,9 @@
 - 将命令调整为 `SetRectangleLabelPlacement { element_id, preferred_anchor, actual_anchor }`，一次更新偏好与实际位置；自动避让时保持原偏好不变。
 - 在 `common` 新增轻量的 `RectangleLabelScene`、`RectangleLabelSolution` 和 `solve_rectangle_label_reflow(before, after, primary_id, seed_ids)`；场景只复制方框数据，不复制画笔点。
 - `app` 新增按 `ElementId` 覆盖的 `ElementPreviewSet`，替换当前单个 `released_preview_element`。
-- 存档 schema 升至 `4`：
-  - v3 的旧 `label_anchor` 同时迁移为 preferred 和 actual。
-  - v2 继续推导旧锚点，再写入两个字段。
-  - 摘要读取接受 v2、v3、v4，未来版本继续拒绝。
-  - 迁移和打开文档时不主动重排，避免旧文档产生视觉漂移。
+-  旧 schema 处理
+  - **app 未发布，无视所有 旧 schema 只处理新 schema**
+  
 
 ## Collision Solver
 
@@ -58,5 +56,5 @@
 - 使用固定 UUID 重复求解，验证结果与输入遍历顺序无关且连续帧无闪烁。
 - 验证创建、粘贴、删除、移动、缩放、拖标签、文字显隐、字号和线宽变化均触发重排；非方框元素始终不参与。
 - 验证实时预览与提交结果逐元素一致，一次操作只增加一次 revision，撤销/重做完整恢复所有联动标签。
-- 验证 v2/v3 到 v4 的迁移、v4 JSON/snapshot 往返、摘要读取以及未知高版本拒绝。
+- 仅验证 v4 JSON/snapshot 往返。
 - 最后运行 `cargo test --workspace` 和 `cargo clippy --workspace --all-targets -- -D warnings`。

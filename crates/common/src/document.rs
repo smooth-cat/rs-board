@@ -11,7 +11,7 @@ use crate::{
   geometry::{GeometryError, SizePx},
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const MAX_ELEMENTS: usize = 10_000;
 pub const MAX_STROKE_POINTS: usize = 1_000_000;
 

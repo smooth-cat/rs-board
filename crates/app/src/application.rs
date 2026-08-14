@@ -1964,20 +1964,30 @@ impl RsBoardApp {
           let Some(source) = session.element_clipboard.as_ref() else {
             continue;
           };
+          let new_element_id = common::ElementId::new();
           match common::DocumentCommand::paste_copy(
             source,
-            common::ElementId::new(),
+            new_element_id,
             position,
             &session.document,
           ) {
-            Ok(command) => match session.history.execute(&mut session.document, command) {
-              Ok(_) => {
-                session.editor.set_selected_element_id(
-                  session.document.highest_element().map(|e| e.element_id),
-                );
+            Ok(command) => {
+              let batch = crate::editor::rectangle_reflow_batch(
+                &session.document,
+                vec![command.clone()],
+                new_element_id,
+                &[],
+              )
+              .unwrap_or_else(|| common::CommandBatch::single(command));
+              match session.history.execute_batch(&mut session.document, batch) {
+                Ok(_) => {
+                  session.editor.set_selected_element_id(
+                    session.document.highest_element().map(|e| e.element_id),
+                  );
+                }
+                Err(error) => self.persistent_error = Some(error.to_string()),
               }
-              Err(error) => self.persistent_error = Some(error.to_string()),
-            },
+            }
             Err(error) => self.persistent_error = Some(error.to_string()),
           }
         }
