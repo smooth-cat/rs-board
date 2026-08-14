@@ -1436,19 +1436,36 @@ impl EditorController {
           && (layout.anchor != payload.label_anchor
             || layout.anchor != payload.preferred_label_anchor)
         {
-          self.push_pointer_command(
-            document,
-            actions,
-            DocumentCommand::SetRectangleLabelPlacement {
-              element_id,
-              preferred_anchor: layout.anchor,
-              actual_anchor: layout.anchor,
-            },
+          let command = DocumentCommand::SetRectangleLabelPlacement {
             element_id,
-          );
+            preferred_anchor: layout.anchor,
+            actual_anchor: layout.anchor,
+          };
+          if let Some(batch) = rectangle_reflow_batch(document, vec![command], element_id, &[]) {
+            self.push_pointer_batch(document, actions, batch, element_id);
+          }
         }
       }
     }
+  }
+
+  fn push_pointer_batch(
+    &mut self,
+    document: &BoardDocument,
+    actions: &mut Vec<EditorAction>,
+    batch: CommandBatch,
+    preview_element_id: ElementId,
+  ) {
+    let preview = preview_set_after_batch(document, &batch);
+    if preview.is_empty() {
+      self.released_preview_elements = ElementPreviewSet::default();
+      return;
+    }
+    self.released_preview_elements = preview;
+    if self.released_preview_elements.get(preview_element_id).is_none() {
+      self.released_preview_elements = ElementPreviewSet::default();
+    }
+    actions.push(EditorAction::Command(batch));
   }
 
   fn push_pointer_command(
@@ -1460,11 +1477,7 @@ impl EditorController {
   ) {
     let batch = rectangle_reflow_batch(document, vec![command.clone()], preview_element_id, &[])
       .unwrap_or_else(|| CommandBatch::single(command));
-    self.released_preview_elements = preview_set_after_batch(document, &batch);
-    if self.released_preview_elements.get(preview_element_id).is_none() {
-      self.released_preview_elements = ElementPreviewSet::default();
-    }
-    actions.push(EditorAction::Command(batch));
+    self.push_pointer_batch(document, actions, batch, preview_element_id);
   }
 
   fn make_rectangle(
@@ -2948,17 +2961,13 @@ fn interaction_preview_set(
         return ElementPreviewSet::default();
       };
       let ElementPayload::Rectangle(payload) = &element.payload else {
-        return interaction_preview_element(interaction, document)
-          .map(ElementPreviewSet::single)
-          .unwrap_or_default();
+        return ElementPreviewSet::default();
       };
       let Some(layout) =
         snap_rectangle_label_layout(payload, document.canvas_size_px, *current + *grab_offset_px)
           .ok()
       else {
-        return interaction_preview_element(interaction, document)
-          .map(ElementPreviewSet::single)
-          .unwrap_or_default();
+        return ElementPreviewSet::default();
       };
       if layout.anchor == payload.label_anchor && layout.anchor == payload.preferred_label_anchor {
         return ElementPreviewSet::default();
@@ -2975,11 +2984,7 @@ fn interaction_preview_set(
       )
       .map(|batch| preview_set_after_batch(document, &batch))
       .filter(|set| !set.is_empty())
-      .unwrap_or_else(|| {
-        interaction_preview_element(interaction, document)
-          .map(ElementPreviewSet::single)
-          .unwrap_or_default()
-      })
+      .unwrap_or_default()
     }
     PointerInteraction::Draw { .. } | PointerInteraction::UpdateArrowEndpoint { .. } => {
       interaction_preview_element(interaction, document)
@@ -3636,10 +3641,55 @@ fn preview_set_after_batch(document: &BoardDocument, batch: &CommandBatch) -> El
     elements: staged
       .elements
       .iter()
-      .filter(|element| document.element(element.element_id) != Some(*element))
+      .filter(|element| {
+        document
+          .element(element.element_id)
+          .is_none_or(|before| !elements_equivalent_for_preview(before, element))
+      })
       .cloned()
       .collect(),
   }
+}
+
+fn elements_equivalent_for_preview(before: &Element, after: &Element) -> bool {
+  if before == after {
+    return true;
+  }
+  if before.element_id != after.element_id || before.z_index != after.z_index {
+    return false;
+  }
+  let (ElementPayload::Rectangle(before_payload), ElementPayload::Rectangle(after_payload)) =
+    (&before.payload, &after.payload)
+  else {
+    return false;
+  };
+  before_payload.start_px == after_payload.start_px
+    && before_payload.end_px == after_payload.end_px
+    && before_payload.stroke_style == after_payload.stroke_style
+    && before_payload.fill_rgba == after_payload.fill_rgba
+    && before_payload.label == after_payload.label
+    && rectangle_label_anchor_equivalent_for_preview(
+      before_payload.preferred_label_anchor,
+      after_payload.preferred_label_anchor,
+    )
+    && rectangle_label_anchor_equivalent_for_preview(
+      before_payload.label_anchor,
+      after_payload.label_anchor,
+    )
+    && rect_equivalent_for_preview(before.bounds_px, after.bounds_px)
+}
+
+fn rectangle_label_anchor_equivalent_for_preview(
+  before: RectangleLabelAnchor,
+  after: RectangleLabelAnchor,
+) -> bool {
+  before.edge == after.edge
+    && before.side == after.side
+    && (before.position - after.position).abs() <= 0.001
+}
+
+fn rect_equivalent_for_preview(before: RectPx, after: RectPx) -> bool {
+  before.min.distance_to(after.min) <= 0.001 && before.max.distance_to(after.max) <= 0.001
 }
 
 fn contains(rect: RectPx, point: PointPx) -> bool {
@@ -7110,6 +7160,70 @@ mod tests {
   }
 
   #[test]
+  fn rectangle_label_drag_back_to_blocked_preferred_track_is_ignored() {
+    let mut document = document_with_size(SizePx::new(420, 500));
+    let mut upper = rectangle(&document, 0, PointPx::new(80.0, 50.0), PointPx::new(280.0, 140.0));
+    let ElementPayload::Rectangle(payload) = &mut upper.payload else {
+      unreachable!();
+    };
+    payload.label.text = None;
+    upper.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(upper);
+
+    let lower = rectangle(&document, 1, PointPx::new(80.0, 210.0), PointPx::new(280.0, 290.0));
+    let lower_id = lower.element_id;
+    document.elements.push(lower);
+    document.validate().unwrap();
+
+    let long_text = "第一行\n第二行\n第三行\n第四行".to_owned();
+    let text_batch = rectangle_reflow_batch(
+      &document,
+      vec![DocumentCommand::UpdateElementLabel { element_id: lower_id, text: Some(long_text) }],
+      lower_id,
+      &[],
+    )
+    .expect("long label should reflow away from the blocked top track");
+    let (_, backed_off_actual) = rectangle_label_placement_command(text_batch.commands(), lower_id)
+      .expect("long label should include a placement command");
+    assert_eq!(backed_off_actual.edge, RectangleLabelEdge::Bottom);
+    assert_eq!(backed_off_actual.side, RectangleLabelSide::Outside);
+
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, text_batch).unwrap();
+    let ElementPayload::Rectangle(payload) = &document.element(lower_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.preferred_label_anchor.edge, RectangleLabelEdge::Top);
+    assert_eq!(payload.preferred_label_anchor.side, RectangleLabelSide::Outside);
+    assert_eq!(payload.label_anchor, backed_off_actual);
+
+    let blocked_layout = common::rectangle_label_layout_at_anchor(
+      payload,
+      payload.preferred_label_anchor,
+      document.canvas_size_px,
+    )
+    .unwrap()
+    .unwrap();
+    let interaction = PointerInteraction::DragRectangleLabel {
+      element_id: lower_id,
+      current: blocked_layout.bounds_px.center(),
+      grab_offset_px: PointPx::ZERO,
+    };
+
+    let preview = interaction_preview_set(&EditorController::default(), &interaction, &document);
+    assert!(
+      preview.get(lower_id).is_none(),
+      "blocked drag should not preview an uncommittable outer-track placement"
+    );
+
+    let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+
+    assert!(actions.is_empty(), "blocked drag should not emit a no-op placement command");
+  }
+
+  #[test]
   fn rectangle_move_preview_reflows_connected_neighbor_labels() {
     let mut document = document_with_size(SizePx::new(420, 260));
     let mut first = rectangle(&document, 0, PointPx::new(60.0, 100.0), PointPx::new(170.0, 180.0));
@@ -7348,6 +7462,77 @@ mod tests {
       payload.label_anchor,
       RectangleLabelAnchor::new(RectangleLabelEdge::Right, RectangleLabelSide::Inside, 0.8,)
     );
+  }
+
+  #[test]
+  fn rectangle_label_drag_back_to_blocked_outer_gap_is_ignored() {
+    let mut document = document_with_size(SizePx::new(420, 360));
+    let mut upper = rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(280.0, 160.0));
+    let ElementPayload::Rectangle(payload) = &mut upper.payload else {
+      unreachable!();
+    };
+    payload.label.text = None;
+    upper.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(upper);
+
+    let mut lower = rectangle(&document, 1, PointPx::new(80.0, 200.0), PointPx::new(280.0, 300.0));
+    let lower_id = lower.element_id;
+    let ElementPayload::Rectangle(payload) = &mut lower.payload else {
+      unreachable!();
+    };
+    payload.label.text = Some("line one\nline two\nline three".to_owned());
+    payload.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0);
+    payload.label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Bottom, RectangleLabelSide::Outside, 0.0);
+    lower.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(lower);
+    document.validate().unwrap();
+
+    let blocked_top_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0);
+    let reflow_batch = rectangle_reflow_batch(
+      &document,
+      vec![DocumentCommand::SetRectangleLabelPlacement {
+        element_id: lower_id,
+        preferred_anchor: blocked_top_anchor,
+        actual_anchor: blocked_top_anchor,
+      }],
+      lower_id,
+      &[],
+    )
+    .unwrap();
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, reflow_batch).unwrap();
+
+    let ElementPayload::Rectangle(payload) = &document.element(lower_id).unwrap().payload else {
+      unreachable!();
+    };
+    assert_eq!(payload.label_anchor.edge, RectangleLabelEdge::Top);
+    assert_eq!(payload.label_anchor.side, RectangleLabelSide::Inside);
+    let blocked_top_center = common::rectangle_label_layout_at_anchor(
+      payload,
+      payload.preferred_label_anchor,
+      document.canvas_size_px,
+    )
+    .unwrap()
+    .unwrap()
+    .bounds_px
+    .center();
+    let interaction = PointerInteraction::DragRectangleLabel {
+      element_id: lower_id,
+      current: blocked_top_center,
+      grab_offset_px: PointPx::ZERO,
+    };
+
+    let preview = interaction_preview_set(&EditorController::default(), &interaction, &document);
+    assert!(preview.is_empty());
+
+    let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+
+    assert!(actions.is_empty());
   }
 
   #[test]
