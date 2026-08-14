@@ -1329,7 +1329,8 @@ impl EditorController {
               ime: InlineImeState::default(),
               request_focus: true,
               select_all: true,
-              auto_place_rectangle: true,
+              // The release-time reflow already chose the anchor for this new label.
+              auto_place_rectangle: false,
             });
           }
         }
@@ -7144,6 +7145,126 @@ mod tests {
       unreachable!();
     };
     assert_ne!(neighbor_payload.label_anchor, second_anchor);
+  }
+
+  #[test]
+  fn new_rectangle_reflowed_label_keeps_its_actual_anchor_during_inline_editing() {
+    let mut document = document_with_size(SizePx::new(420, 400));
+    let mut blocker = rectangle(&document, 0, PointPx::new(24.0, 40.0), PointPx::new(300.0, 160.0));
+    let ElementPayload::Rectangle(payload) = &mut blocker.payload else {
+      unreachable!();
+    };
+    payload.label.text = None;
+    blocker.refresh_bounds(document.canvas_size_px).unwrap();
+    document.elements.push(blocker);
+    document.validate().unwrap();
+
+    let element_id = ElementId::from_uuid(Uuid::from_u128(3));
+    let interaction = PointerInteraction::Draw {
+      element_id,
+      tool: EditorTool::Rectangle,
+      start: PointPx::new(24.0, 170.0),
+      current: PointPx::new(360.0, 300.0),
+      stroke_points: Vec::new(),
+    };
+    let mut controller = EditorController {
+      tool: EditorTool::Rectangle,
+      interaction: Some(interaction),
+      ..Default::default()
+    };
+
+    let drag_preview =
+      interaction_preview_set(&controller, controller.interaction.as_ref().unwrap(), &document);
+    let ElementPayload::Rectangle(drag_payload) =
+      &drag_preview.get(element_id).expect("new rectangle should be previewed").payload
+    else {
+      unreachable!();
+    };
+    let drag_actual = drag_payload.label_anchor;
+    assert_eq!(drag_actual.edge, RectangleLabelEdge::Top);
+    assert_eq!(drag_actual.side, RectangleLabelSide::Outside);
+    assert!(drag_actual.position > 0.0);
+
+    let mut add_actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut add_actions);
+    let [EditorAction::Command(add_batch)] = add_actions.as_slice() else {
+      panic!("expected one rectangle add batch, got {add_actions:?}");
+    };
+    let released = controller
+      .released_preview_elements
+      .get(element_id)
+      .expect("released rectangle should remain available for inline editing")
+      .clone();
+    let ElementPayload::Rectangle(released_payload) = &released.payload else {
+      unreachable!();
+    };
+    assert_eq!(released_payload.label_anchor, drag_actual);
+    assert_eq!(released_payload.label_anchor.edge, RectangleLabelEdge::Top);
+    assert_eq!(released_payload.label_anchor.side, RectangleLabelSide::Outside);
+    assert!(released_payload.label_anchor.position > 0.0);
+    assert_eq!(released_payload.preferred_label_anchor.position, 0.0);
+
+    let editing = controller.text_editing.as_ref().expect("new rectangle should edit its label");
+    assert!(matches!(
+      editing.target,
+      TextTarget::RectangleLabel { element_id: editing_id } if editing_id == element_id
+    ));
+    assert!(!editing.auto_place_rectangle);
+    let released_draft = rectangle_label_draft(released_payload, editing, &document, element_id);
+    assert_eq!(released_draft.label_anchor, released_payload.label_anchor);
+    let released_layout =
+      rectangle_label_layout(&released_draft, document.canvas_size_px).unwrap().unwrap();
+    let released_geometry =
+      inline_text_geometry_with_preview(editing, &document, Some(&released)).unwrap();
+    assert!(
+      released_geometry.origin_px.distance_to(
+        released_layout.bounds_px.min
+          + PointPx::new(released_draft.label.padding_px, released_draft.label.padding_px)
+      ) < 0.01
+    );
+
+    let before_add_revision = document.revision;
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, add_batch.clone()).unwrap();
+    assert_eq!(document.revision, before_add_revision + 1);
+    let ElementPayload::Rectangle(persisted_payload) =
+      &document.element(element_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(persisted_payload.label_anchor, released_payload.label_anchor);
+    let editing = controller.text_editing.as_ref().unwrap();
+    let persisted_draft = rectangle_label_draft(persisted_payload, editing, &document, element_id);
+    assert_eq!(persisted_draft.label_anchor, persisted_payload.label_anchor);
+    let persisted_geometry = inline_text_geometry(editing, &document).unwrap();
+    assert!(persisted_geometry.origin_px.distance_to(released_geometry.origin_px) < 0.01);
+    assert!((persisted_geometry.wrap_width_px - released_geometry.wrap_width_px).abs() < 0.01);
+
+    let committed_text = "这是一个需要重新排布的长标题";
+    controller.text_editing.as_mut().unwrap().buffer = committed_text.to_owned();
+    let mut commit_actions = Vec::new();
+    controller.commit_text(&document, &mut commit_actions);
+    let [EditorAction::Command(commit_batch)] = commit_actions.as_slice() else {
+      panic!("expected one label commit batch, got {commit_actions:?}");
+    };
+    assert!(matches!(
+      commit_batch.commands().first(),
+      Some(DocumentCommand::UpdateElementLabel {
+        element_id: updated_id,
+        text: Some(text),
+      }) if *updated_id == element_id && text == committed_text
+    ));
+    let committed_actual = rectangle_label_placement_command(commit_batch.commands(), element_id)
+      .map_or(persisted_payload.label_anchor, |(_, actual)| actual);
+
+    history.execute_batch(&mut document, commit_batch.clone()).unwrap();
+    let ElementPayload::Rectangle(committed_payload) =
+      &document.element(element_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(committed_payload.label.text.as_deref(), Some(committed_text));
+    assert_eq!(committed_payload.label_anchor, committed_actual);
   }
 
   #[test]
