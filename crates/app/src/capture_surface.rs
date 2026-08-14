@@ -581,6 +581,8 @@ mod macos {
   };
   use crate::capture::NativeCaptureImage;
 
+  const EDITOR_WINDOW_SHARING_TYPE: NSWindowSharingType = NSWindowSharingType::ReadOnly;
+
   pub(super) struct OverlayWindow {
     window: Retained<NSWindow>,
     title: String,
@@ -701,8 +703,9 @@ mod macos {
       return OverlayWindowReadiness::Pending("overlay_window_unavailable");
     };
     let window = &overlay_window.window;
+    allow_window_pair_capture(window, frozen_panel);
     if overlay_window.ready
-      && window_pair_is_ready(&application, &screen, window, frozen_panel)
+      && window_pair_is_ready(&application, &screen, window, frozen_panel, true)
       && overlay_input_target_is_ready(true, content_view_is_first_responder(window))
     {
       return OverlayWindowReadiness::Ready;
@@ -733,7 +736,6 @@ mod macos {
         | NSWindowCollectionBehavior::IgnoresCycle
         | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
-    window.setSharingType(NSWindowSharingType::None);
 
     // Do not reveal the frozen image until the editor window can receive the escape/cancel input.
     #[allow(deprecated)]
@@ -762,11 +764,13 @@ mod macos {
       return OverlayWindowReadiness::Pending("first_responder_rejected");
     }
 
-    let pending_reason = window_pair_pending_reason(&application, &screen, window, frozen_panel)
-      .or_else(|| {
-        (!overlay_input_target_is_ready(false, content_view_is_first_responder(window)))
-          .then_some("content_view_not_first_responder")
-      });
+    let pending_reason =
+      window_pair_pending_reason(&application, &screen, window, frozen_panel, false).or_else(
+        || {
+          (!overlay_input_target_is_ready(false, content_view_is_first_responder(window)))
+            .then_some("content_view_not_first_responder")
+        },
+      );
     if let Some(reason) = pending_reason {
       prepare_window_pair_retry(window, frozen_panel);
       OverlayWindowReadiness::Pending(reason)
@@ -860,6 +864,11 @@ mod macos {
     conceal_frozen_panel(frozen_panel);
   }
 
+  fn allow_window_pair_capture(window: &NSWindow, frozen_panel: &FrozenImagePanel) {
+    window.setSharingType(EDITOR_WINDOW_SHARING_TYPE);
+    frozen_panel.panel.setSharingType(EDITOR_WINDOW_SHARING_TYPE);
+  }
+
   fn demote_overlay_window(window: &NSWindow) {
     window.setIgnoresMouseEvents(true);
     if window.isKeyWindow() {
@@ -881,8 +890,9 @@ mod macos {
     screen: &NSScreen,
     window: &NSWindow,
     frozen_panel: &FrozenImagePanel,
+    was_ready: bool,
   ) -> bool {
-    window_pair_is_structurally_ready(application, screen, window, frozen_panel)
+    window_pair_is_structurally_ready(application, screen, window, frozen_panel, was_ready)
       && !window.ignoresMouseEvents()
   }
 
@@ -900,13 +910,22 @@ mod macos {
     was_ready || content_view_is_first_responder
   }
 
+  fn overlay_activation_is_ready(
+    was_ready: bool,
+    application_is_active: bool,
+    window_is_key: bool,
+  ) -> bool {
+    was_ready || (application_is_active && window_is_key)
+  }
+
   fn window_pair_is_structurally_ready(
     application: &NSApplication,
     screen: &NSScreen,
     window: &NSWindow,
     frozen_panel: &FrozenImagePanel,
+    was_ready: bool,
   ) -> bool {
-    window_pair_pending_reason(application, screen, window, frozen_panel).is_none()
+    window_pair_pending_reason(application, screen, window, frozen_panel, was_ready).is_none()
   }
 
   fn window_pair_pending_reason(
@@ -914,10 +933,15 @@ mod macos {
     screen: &NSScreen,
     window: &NSWindow,
     frozen_panel: &FrozenImagePanel,
+    was_ready: bool,
   ) -> Option<&'static str> {
     let screen_frame = screen.frame();
-    if !application.isActive() {
-      Some("application_inactive")
+    if !overlay_activation_is_ready(was_ready, application.isActive(), window.isKeyWindow()) {
+      if !application.isActive() {
+        Some("application_inactive")
+      } else {
+        Some("overlay_window_not_key")
+      }
     } else if !frozen_panel.panel.isVisible() {
       Some("frozen_panel_invisible")
     } else if frozen_panel.panel.level() != frozen_panel_window_level() {
@@ -926,8 +950,6 @@ mod macos {
       Some("frozen_panel_wrong_frame")
     } else if !window.isVisible() {
       Some("overlay_window_invisible")
-    } else if !window.isKeyWindow() {
-      Some("overlay_window_not_key")
     } else if window.level() != editor_overlay_window_level() {
       Some("overlay_window_wrong_level")
     } else if window.frame() != screen_frame {
@@ -991,8 +1013,8 @@ mod macos {
     use objc2_app_kit::{NSNormalWindowLevel, NSScreenSaverWindowLevel};
 
     use super::{
-      editor_overlay_window_level, frozen_panel_window_level, inactive_overlay_window_level,
-      overlay_input_target_is_ready,
+      EDITOR_WINDOW_SHARING_TYPE, editor_overlay_window_level, frozen_panel_window_level,
+      inactive_overlay_window_level, overlay_activation_is_ready, overlay_input_target_is_ready,
     };
 
     #[test]
@@ -1007,6 +1029,19 @@ mod macos {
       assert!(!overlay_input_target_is_ready(false, false));
       assert!(overlay_input_target_is_ready(false, true));
       assert!(overlay_input_target_is_ready(true, false));
+    }
+
+    #[test]
+    fn configured_overlay_allows_another_application_to_take_focus() {
+      assert!(!overlay_activation_is_ready(false, false, false));
+      assert!(!overlay_activation_is_ready(false, true, false));
+      assert!(overlay_activation_is_ready(false, true, true));
+      assert!(overlay_activation_is_ready(true, false, false));
+    }
+
+    #[test]
+    fn editor_windows_are_visible_to_external_capture_tools() {
+      assert_eq!(EDITOR_WINDOW_SHARING_TYPE, objc2_app_kit::NSWindowSharingType::ReadOnly);
     }
   }
 }

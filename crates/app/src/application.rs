@@ -79,6 +79,8 @@ const LIBRARY_SIZE: egui::Vec2 = egui::vec2(
 const BUNDLED_CJK_FONT: &[u8] = include_bytes!("../assets/NotoSansSC-Regular.otf");
 const OVERLAY_READINESS_RETRY_DELAY: Duration = Duration::from_millis(32);
 const OVERLAY_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const EDITOR_ACTIVATION_TIMEOUT_MESSAGE: &str = "截图编辑窗口激活超时，请重新打开或重新截图";
+const EDITOR_CREATION_ERROR_MESSAGE: &str = "无法创建截图编辑窗口，请重试";
 const SAVE_SUCCESS_TOAST_DURATION: Duration = Duration::from_millis(1_300);
 const SAVE_SUCCESS_TOAST_MESSAGE: &str = "保存成功！";
 const SAVE_SUCCESS_TOAST_SHADOW_OFFSET: [i8; 2] = [2, 3];
@@ -256,6 +258,13 @@ enum WindowSurface {
 enum RootCloseAction {
   HideLibrary,
   RequestQuit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayReadinessAction {
+  Ready,
+  Retry,
+  ShowEditorError(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -476,6 +485,7 @@ pub struct RsBoardApp {
   return_surface_after_editor: Option<WindowSurface>,
   capture_surfaces: CaptureSurfaceCoordinator,
   overlay_readiness_started_at: Option<Instant>,
+  editor_presentation_error: Option<String>,
   background_encoder: BackgroundEncodeScheduler,
   draft_coordinator: DraftCoordinator,
   post_save_coordinator: PostSaveCoordinator,
@@ -596,6 +606,7 @@ impl RsBoardApp {
       return_surface_after_editor: None,
       capture_surfaces,
       overlay_readiness_started_at: None,
+      editor_presentation_error: None,
       background_encoder: BackgroundEncodeScheduler::new(),
       draft_coordinator,
       post_save_coordinator,
@@ -2045,6 +2056,7 @@ impl RsBoardApp {
     preferred_display_id: Option<u32>,
     display_bounds: Option<[i32; 4]>,
   ) {
+    self.editor_presentation_error = None;
     let window_timer = self.capture_presentation_trace.map(|trace| {
       PerformanceTimer::start(
         "capture.editor_commands.enqueue",
@@ -2152,6 +2164,7 @@ impl RsBoardApp {
 
   fn hide_editor_window(&mut self, context: &egui::Context) {
     self.overlay_readiness_started_at = None;
+    self.editor_presentation_error = None;
     match self.return_surface_after_editor.take().unwrap_or(WindowSurface::Hidden) {
       WindowSurface::Library => self.configure_library_window(context, false),
       WindowSurface::Hidden => self.configure_editor_host(context),
@@ -2163,6 +2176,7 @@ impl RsBoardApp {
   fn fail_editor_presentation(&mut self, context: &egui::Context, error: impl Into<String>) {
     let was_showing_save_success = matches!(self.phase, Phase::ShowingSaveSuccess { .. });
     self.overlay_readiness_started_at = None;
+    self.editor_presentation_error = None;
     self.library_error = Some(error.into());
     self.capture_surfaces.hide_active();
     self.return_surface_after_editor = None;
@@ -2175,6 +2189,17 @@ impl RsBoardApp {
     } else {
       self.configure_library_window(context, true);
     }
+    request_root_repaint(context);
+  }
+
+  fn report_editor_presentation_error(
+    &mut self,
+    context: &egui::Context,
+    error: impl Into<String>,
+  ) {
+    self.overlay_readiness_started_at = None;
+    self.editor_presentation_error = Some(error.into());
+    context.request_repaint();
     request_root_repaint(context);
   }
 
@@ -2765,6 +2790,27 @@ impl RsBoardApp {
   }
 
   fn show_dialogs(&mut self, context: &egui::Context) {
+    if let Some(message) = self.editor_presentation_error.clone() {
+      let mut retry = false;
+      egui::Window::new("截图编辑窗口错误")
+        .id(egui::Id::new("editor-presentation-error-dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(context, |ui| {
+          ui.label(message);
+          ui.horizontal(|ui| {
+            retry = ui.button("重试").clicked();
+          });
+        });
+      if retry {
+        self.editor_presentation_error = None;
+        self.overlay_readiness_started_at = Some(Instant::now());
+        context.request_repaint();
+        request_root_repaint(context);
+      }
+    }
+
     if self.phase == Phase::ConfirmingDiscard {
       egui::Window::new("放弃修改？")
         .id(egui::Id::new("discard-document-dialog"))
@@ -3159,25 +3205,37 @@ impl RsBoardApp {
         }
 
         let viewport_context = ui.ctx().clone();
-        match self.capture_surfaces.configure_active_overlay_window() {
-          OverlayWindowReadiness::Ready => self.overlay_readiness_started_at = None,
-          OverlayWindowReadiness::Pending(reason) => {
-            if overlay_readiness_can_retry(&mut self.overlay_readiness_started_at, Instant::now()) {
+        let presentation_ready = if self.editor_presentation_error.is_some() {
+          match self.capture_surfaces.configure_active_overlay_window() {
+            OverlayWindowReadiness::Ready => self.overlay_readiness_started_at = None,
+            OverlayWindowReadiness::Pending(_) => {
               request_immediate_viewport_retry(&viewport_context, viewport_id);
-            } else {
-              eprintln!("capture overlay readiness timed out: {reason}");
-              self.fail_editor_presentation(
-                &viewport_context,
-                "截图编辑窗口激活超时，请重新打开或重新截图",
-              );
             }
-            return;
+            OverlayWindowReadiness::Failed => {}
           }
-          OverlayWindowReadiness::Failed => {
-            self.fail_editor_presentation(&viewport_context, "无法创建截图编辑窗口，请重试");
-            return;
+          false
+        } else {
+          let readiness = self.capture_surfaces.configure_active_overlay_window();
+          let can_retry = matches!(readiness, OverlayWindowReadiness::Pending(_))
+            && overlay_readiness_can_retry(&mut self.overlay_readiness_started_at, Instant::now());
+          match overlay_readiness_action(readiness, can_retry) {
+            OverlayReadinessAction::Ready => {
+              self.overlay_readiness_started_at = None;
+              true
+            }
+            OverlayReadinessAction::Retry => {
+              request_immediate_viewport_retry(&viewport_context, viewport_id);
+              return;
+            }
+            OverlayReadinessAction::ShowEditorError(message) => {
+              if let OverlayWindowReadiness::Pending(reason) = readiness {
+                eprintln!("capture overlay readiness timed out: {reason}");
+              }
+              self.report_editor_presentation_error(&viewport_context, message);
+              false
+            }
           }
-        }
+        };
         if viewport_context.input(|input| input.viewport().close_requested())
           && self.phase.has_active_session()
         {
@@ -3192,7 +3250,9 @@ impl RsBoardApp {
           self.show_editor_ui(ui, &viewport_context);
           self.show_dialogs(&viewport_context);
           self.show_toast(&viewport_context);
-          self.finish_capture_presentation_trace();
+          if presentation_ready {
+            self.finish_capture_presentation_trace();
+          }
         }
       });
     }
@@ -3617,6 +3677,22 @@ fn overlay_readiness_can_retry(started_at: &mut Option<Instant>, now: Instant) -
   now.saturating_duration_since(started_at) < OVERLAY_READINESS_TIMEOUT
 }
 
+fn overlay_readiness_action(
+  readiness: OverlayWindowReadiness,
+  can_retry: bool,
+) -> OverlayReadinessAction {
+  match readiness {
+    OverlayWindowReadiness::Ready => OverlayReadinessAction::Ready,
+    OverlayWindowReadiness::Pending(_) if can_retry => OverlayReadinessAction::Retry,
+    OverlayWindowReadiness::Pending(_) => {
+      OverlayReadinessAction::ShowEditorError(EDITOR_ACTIVATION_TIMEOUT_MESSAGE)
+    }
+    OverlayWindowReadiness::Failed => {
+      OverlayReadinessAction::ShowEditorError(EDITOR_CREATION_ERROR_MESSAGE)
+    }
+  }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn send_platform_fullscreen_command(context: &egui::Context, fullscreen: bool) {
   send_root_viewport_command(context, ViewportCommand::Fullscreen(fullscreen));
@@ -3933,6 +4009,26 @@ mod tests {
       &mut retry_started_at,
       started_at + OVERLAY_READINESS_TIMEOUT,
     ));
+  }
+
+  #[test]
+  fn overlay_readiness_failures_are_routed_to_the_editor_dialog() {
+    assert_eq!(
+      overlay_readiness_action(OverlayWindowReadiness::Ready, false),
+      OverlayReadinessAction::Ready
+    );
+    assert_eq!(
+      overlay_readiness_action(OverlayWindowReadiness::Pending("application_inactive"), true),
+      OverlayReadinessAction::Retry
+    );
+    assert_eq!(
+      overlay_readiness_action(OverlayWindowReadiness::Pending("application_inactive"), false),
+      OverlayReadinessAction::ShowEditorError(EDITOR_ACTIVATION_TIMEOUT_MESSAGE)
+    );
+    assert_eq!(
+      overlay_readiness_action(OverlayWindowReadiness::Failed, false),
+      OverlayReadinessAction::ShowEditorError(EDITOR_CREATION_ERROR_MESSAGE)
+    );
   }
 
   #[test]
