@@ -6960,6 +6960,71 @@ mod tests {
   }
 
   #[test]
+  fn rectangle_label_drag_past_seventy_percent_overhang_switches_track_consistently() {
+    let mut document = document_with_size(SizePx::new(600, 400));
+    let element = rectangle(&document, 0, PointPx::new(150.0, 160.0), PointPx::new(390.0, 300.0));
+    let element_id = element.element_id;
+    let before_element = element.clone();
+    let ElementPayload::Rectangle(payload) = &element.payload else {
+      unreachable!();
+    };
+    let initial_layout = rectangle_label_layout(payload, document.canvas_size_px).unwrap().unwrap();
+    let label_width = initial_layout.bounds_px.width();
+    let desired_center = PointPx::new(
+      payload.end_px.x_px - label_width * 0.25 + label_width / 2.0,
+      initial_layout.bounds_px.center().y_px,
+    );
+    document.elements.push(element);
+    let interaction = PointerInteraction::DragRectangleLabel {
+      element_id,
+      current: desired_center,
+      grab_offset_px: PointPx::ZERO,
+    };
+    let preview_controller = EditorController::default();
+
+    let preview = interaction_preview_set(&preview_controller, &interaction, &document);
+    let preview_element = preview.get(element_id).expect("dragged label should be previewed");
+    let ElementPayload::Rectangle(preview_payload) = &preview_element.payload else {
+      unreachable!();
+    };
+    let preview_preferred = preview_payload.preferred_label_anchor;
+    let preview_actual = preview_payload.label_anchor;
+    assert_ne!(
+      (preview_preferred.edge, preview_preferred.side),
+      (RectangleLabelEdge::Top, RectangleLabelSide::Outside)
+    );
+    assert_eq!(preview_actual, preview_preferred);
+
+    let mut controller = EditorController { interaction: Some(interaction), ..Default::default() };
+    let mut actions = Vec::new();
+    controller.finish_pointer_interaction(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one label placement batch, got {actions:?}");
+    };
+    let (command_preferred, command_actual) =
+      rectangle_label_placement_command(batch.commands(), element_id)
+        .expect("label placement command should be present");
+    assert_eq!(command_preferred, preview_preferred);
+    assert_eq!(command_actual, preview_actual);
+
+    let before_revision = document.revision;
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    assert_eq!(document.revision, before_revision + 1);
+    assert_eq!(history.undo_len(), 1);
+    let ElementPayload::Rectangle(committed_payload) =
+      &document.element(element_id).unwrap().payload
+    else {
+      unreachable!();
+    };
+    assert_eq!(committed_payload.preferred_label_anchor, preview_preferred);
+    assert_eq!(committed_payload.label_anchor, preview_actual);
+
+    assert!(history.undo(&mut document).unwrap());
+    assert_eq!(document.element(element_id), Some(&before_element));
+  }
+
+  #[test]
   fn rectangle_label_drag_at_top_right_corner_then_reflows_down_on_intrusion() {
     let mut document = document_with_size(SizePx::new(942, 332));
     let mut element =

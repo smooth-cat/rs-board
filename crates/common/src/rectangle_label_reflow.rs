@@ -6,6 +6,7 @@ use crate::{
     ElementError, ElementId, ElementPayload, RectangleLabelAnchor, RectangleLabelEdge,
     RectangleLabelLayout, RectangleLabelSide, RectanglePayload, canonical_rectangle_label_anchor,
     ordered_rectangle_label_tracks, raw_rectangle_label_layout,
+    rectangle_label_outer_track_accepts_bounds, rectangle_label_outer_track_position_limit,
   },
   geometry::{GeometryError, PointPx, RectPx, SizePx},
 };
@@ -624,6 +625,9 @@ fn candidates_for_label(
           continue;
         }
         let layout = raw_rectangle_label_layout(payload, anchor, canvas_size_px)?;
+        if !rectangle_label_outer_track_accepts_bounds(payload, anchor, layout.bounds_px) {
+          continue;
+        }
         if !canvas_size_px.bounds().contains_rect(layout.bounds_px) {
           continue;
         }
@@ -662,6 +666,14 @@ fn legal_track_intervals(
   let body = rectangle_body(payload);
   let gap = payload.label.anchor_offset_px;
   let canvas = canvas_size_px.bounds();
+  let Some(mut outer_position_limit) =
+    rectangle_label_outer_track_position_limit(payload, edge, side, width_px, height_px)
+  else {
+    return Vec::new();
+  };
+  if side == RectangleLabelSide::Outside && outer_position_limit < 1.0 {
+    outer_position_limit = outer_position_limit.next_down();
+  }
   let mut intervals = match edge {
     RectangleLabelEdge::Top | RectangleLabelEdge::Bottom => {
       let y_px = horizontal_track_y(body, edge, side, gap, height_px);
@@ -669,7 +681,9 @@ fn legal_track_intervals(
         return Vec::new();
       }
       let lo = ((canvas.min.x_px - body.min.x_px - gap) / body.width()).clamp(0.0, 1.0);
-      let hi = ((canvas.max.x_px - width_px - body.min.x_px - gap) / body.width()).clamp(0.0, 1.0);
+      let hi = ((canvas.max.x_px - width_px - body.min.x_px - gap) / body.width())
+        .clamp(0.0, 1.0)
+        .min(outer_position_limit);
       if lo <= hi { vec![(lo, hi)] } else { Vec::new() }
     }
     RectangleLabelEdge::Left | RectangleLabelEdge::Right => {
@@ -678,8 +692,9 @@ fn legal_track_intervals(
         return Vec::new();
       }
       let lo = ((canvas.min.y_px - body.min.y_px - gap) / body.height()).clamp(0.0, 1.0);
-      let hi =
-        ((canvas.max.y_px - height_px - body.min.y_px - gap) / body.height()).clamp(0.0, 1.0);
+      let hi = ((canvas.max.y_px - height_px - body.min.y_px - gap) / body.height())
+        .clamp(0.0, 1.0)
+        .min(outer_position_limit);
       if lo <= hi { vec![(lo, hi)] } else { Vec::new() }
     }
   };
@@ -1061,6 +1076,81 @@ mod tests {
       (RectangleLabelEdge::Top, RectangleLabelSide::Outside)
     );
     assert!(first.anchor.position > 0.0);
+  }
+
+  #[test]
+  fn candidates_slide_back_on_the_preferred_outer_track_before_falling_back() {
+    let canvas = SizePx::new(420, 260);
+    let mut element = rectangle(1, 0, PointPx::new(80.0, 120.0), PointPx::new(230.0, 200.0));
+    let ElementPayload::Rectangle(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 1.0);
+    payload.label_anchor = payload.preferred_label_anchor;
+    let sample =
+      raw_rectangle_label_layout(payload, payload.preferred_label_anchor, canvas).unwrap();
+    let exclusive_limit = rectangle_label_outer_track_position_limit(
+      payload,
+      RectangleLabelEdge::Top,
+      RectangleLabelSide::Outside,
+      sample.bounds_px.width(),
+      sample.bounds_px.height(),
+    )
+    .unwrap();
+
+    let candidates = candidates_for_label(canvas, payload, &[], true).unwrap();
+    let first = candidates.first().unwrap();
+
+    assert_eq!(
+      (first.anchor.edge, first.anchor.side),
+      (RectangleLabelEdge::Top, RectangleLabelSide::Outside)
+    );
+    assert!(first.anchor.position < exclusive_limit);
+    assert!(exclusive_limit - first.anchor.position < 0.001);
+    assert!(rectangle_label_outer_track_accepts_bounds(payload, first.anchor, first.bounds_px));
+  }
+
+  #[test]
+  fn candidates_fall_back_when_an_outer_track_cannot_hold_the_label() {
+    let canvas = SizePx::new(420, 260);
+    let mut element = rectangle(1, 0, PointPx::new(100.0, 100.0), PointPx::new(112.0, 220.0));
+    let ElementPayload::Rectangle(payload) = &mut element.payload else {
+      unreachable!();
+    };
+    payload.preferred_label_anchor =
+      RectangleLabelAnchor::new(RectangleLabelEdge::Top, RectangleLabelSide::Outside, 0.0);
+    payload.label_anchor = payload.preferred_label_anchor;
+    let sample =
+      raw_rectangle_label_layout(payload, payload.preferred_label_anchor, canvas).unwrap();
+
+    assert_eq!(
+      rectangle_label_outer_track_position_limit(
+        payload,
+        RectangleLabelEdge::Top,
+        RectangleLabelSide::Outside,
+        sample.bounds_px.width(),
+        sample.bounds_px.height(),
+      ),
+      None
+    );
+    let candidates = candidates_for_label(canvas, payload, &[], true).unwrap();
+    let first = candidates.first().unwrap();
+    assert_eq!(
+      (first.anchor.edge, first.anchor.side),
+      (RectangleLabelEdge::Left, RectangleLabelSide::Outside)
+    );
+
+    let inside = legal_track_intervals(
+      canvas,
+      payload,
+      RectangleLabelEdge::Top,
+      RectangleLabelSide::Inside,
+      sample.bounds_px.width(),
+      sample.bounds_px.height(),
+      &[],
+    );
+    assert_eq!(inside, vec![(0.0, 1.0)]);
   }
 
   #[test]
