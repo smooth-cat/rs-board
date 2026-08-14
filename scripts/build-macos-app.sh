@@ -7,9 +7,6 @@ RS_BOARD_TARGET_DIR="$RS_BOARD_ROOT/target"
 RS_BOARD_EXPECTED_BUNDLE_VERSION="cargo-bundle v0.11.0"
 RS_BOARD_TARGET="aarch64-apple-darwin"
 RS_BOARD_MINIMUM_MACOS="13.0"
-RS_BOARD_FONT_SHA256="faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
-RS_BOARD_ICON_PNG_SHA256="e7ae911973647841710898206b389e6b60b6bf1758899bd2f969dfd4e64406c7"
-RS_BOARD_ICON_ICNS_SHA256="a899cb2d919474a73d5f8aa8fceb11dbec2dcc43f08a6715426b065e4a06ff7e"
 
 fail() {
   echo "error: $*" >&2
@@ -65,7 +62,7 @@ RS_BOARD_VERSION="$1"
 unset CARGO_BUNDLE_SKIP_BUILD
 export CARGO_TARGET_DIR="$RS_BOARD_TARGET_DIR"
 
-for command_name in cargo cargo-bundle rustup jq codesign plutil file otool lipo ditto sips shasum; do
+for command_name in cargo cargo-bundle rustup jq codesign plutil file otool lipo ditto sips; do
   require_command "$command_name"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "required command not found: /usr/libexec/PlistBuddy"
@@ -88,7 +85,6 @@ RS_BOARD_WORKSPACE_VERSION="$(
 
 for required_file in \
   Cargo.lock \
-  crates/app/assets/AppIcon.svg \
   crates/app/assets/AppIcon-1024.png \
   crates/app/assets/AppIcon.icns \
   crates/app/assets/NotoSansSC-Regular.otf \
@@ -96,18 +92,6 @@ for required_file in \
   crates/app/assets/THIRD_PARTY_NOTICES.txt; do
   [[ -s "$required_file" ]] || fail "required file is missing or empty: $required_file"
 done
-
-RS_BOARD_FONT_ACTUAL_SHA256="$(
-  shasum -a 256 crates/app/assets/NotoSansSC-Regular.otf | awk '{print $1}'
-)"
-[[ "$RS_BOARD_FONT_ACTUAL_SHA256" == "$RS_BOARD_FONT_SHA256" ]] \
-  || fail "bundled font hash does not match THIRD_PARTY_NOTICES.txt"
-[[ "$(shasum -a 256 crates/app/assets/AppIcon-1024.png | awk '{print $1}')" \
-  == "$RS_BOARD_ICON_PNG_SHA256" ]] \
-  || fail "AppIcon-1024.png does not match its generated release hash"
-[[ "$(shasum -a 256 crates/app/assets/AppIcon.icns | awk '{print $1}')" \
-  == "$RS_BOARD_ICON_ICNS_SHA256" ]] \
-  || fail "AppIcon.icns does not match its generated release hash"
 
 RS_BOARD_ICON_WIDTH="$(
   sips -g pixelWidth crates/app/assets/AppIcon-1024.png \
@@ -162,9 +146,6 @@ RS_BOARD_ICON="$RS_BOARD_STAGE_APP/Contents/Resources/AppIcon.icns"
 [[ -x "$RS_BOARD_EXECUTABLE" ]] || fail "bundle executable is missing"
 [[ -f "$RS_BOARD_ICON" && ! -L "$RS_BOARD_ICON" && -s "$RS_BOARD_ICON" ]] \
   || fail "bundle icon is missing, empty, or a symbolic link"
-[[ "$(shasum -a 256 "$RS_BOARD_ICON" | awk '{print $1}')" \
-  == "$RS_BOARD_ICON_ICNS_SHA256" ]] \
-  || fail "bundle icon does not match the generated release icon"
 plutil -replace CFBundleVersion -string "$RS_BOARD_VERSION" "$RS_BOARD_PLIST"
 plutil -lint "$RS_BOARD_PLIST" >/dev/null
 

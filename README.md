@@ -83,12 +83,6 @@ cargo-about --version
 ./scripts/generate-third-party-notices.sh
 ```
 
-修改 `crates/app/assets/AppIcon.svg` 后，重新生成应用图标：
-
-```bash
-./scripts/generate-macos-icon.sh
-```
-
 仅修改 Rust 业务代码时，可以跳过本步骤。
 
 ### 第 3 步: 生成 DMG
