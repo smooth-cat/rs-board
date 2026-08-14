@@ -1537,7 +1537,7 @@ impl EditorController {
       fill_rgba: None,
       label: ElementLabel {
         text: Some(DEFAULT_RECTANGLE_LABEL.to_owned()),
-        max_width_px: 420.0,
+        max_width_px: 840.0,
         padding_px: 8.0,
         anchor_offset_px: 8.0,
         text_style,
