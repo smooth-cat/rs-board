@@ -15,6 +15,7 @@ arboard = { version = "3.6.1", default-features = false, features = ["image-data
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
 directories = "6.0.0"
 eframe = { version = "0.36.0", default-features = false, features = ["default_fonts", "glow"] }
+egui_material_icons = { version = "=0.8.0", default-features = false, features = ["filled", "outline"] }
 global-hotkey = "0.8.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "tiff"] }
 imageproc = { version = "0.27.0", default-features = false, features = ["text"] }

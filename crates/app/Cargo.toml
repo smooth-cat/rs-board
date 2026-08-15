@@ -11,6 +11,7 @@ arboard.workspace = true
 chrono.workspace = true
 directories.workspace = true
 eframe.workspace = true
+egui_material_icons.workspace = true
 global-hotkey.workspace = true
 image.workspace = true
 imageproc.workspace = true

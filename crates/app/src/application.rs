@@ -15,11 +15,14 @@ use common::{
   GlobalBoundsPx, PRESET_BRUSH_HARDNESSES, PRESET_FONT_SIZES_PX, PRESET_STROKE_WIDTHS_PX, SizePx,
 };
 use eframe::egui::{
-  self, Color32, TextureHandle, TextureOptions, ViewportCommand, ViewportId, WindowLevel,
+  self, Color32, CornerRadius, TextureHandle, TextureOptions, ViewportCommand, ViewportId,
+  WindowLevel,
 };
 use image::RgbaImage;
 use thiserror::Error;
 use uuid::Uuid;
+
+use egui_material_icons::icons::ICON_CLOSE;
 
 use crate::{
   background_encode::{BackgroundEncodeScheduler, BackgroundPrepareError, PreparedBackground},
@@ -2916,7 +2919,18 @@ impl RsBoardApp {
             let tool = self.settings_draft.tab_order[index];
             ui.horizontal(|ui| {
               ui.label(format!("{}. {}", index + 1, tool.label()));
-              if ui.small_button("✕").on_hover_text("从列表移除").clicked() {
+              let close_btn = ui
+                .scope(|ui| {
+                  ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+                  ui.spacing_mut().interact_size = egui::vec2(20.0, 20.0);
+                  ui.add_sized(
+                    [20.0, 20.0],
+                    egui::Button::new(ICON_CLOSE).corner_radius(CornerRadius::same(10)),
+                  )
+                })
+                .inner;
+
+              if close_btn.on_hover_text("从列表移除").clicked() {
                 remove_index = Some(index);
               }
             });
@@ -3718,6 +3732,7 @@ fn configure_egui(context: &egui::Context) {
     fonts.families.entry(family).or_default().insert(0, "rs-board-cjk".into());
   }
   context.set_fonts(fonts);
+  egui_material_icons::initialize(context);
 
   context.all_styles_mut(|style| {
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);

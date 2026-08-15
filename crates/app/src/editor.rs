@@ -14,6 +14,9 @@ use eframe::egui::{
   KeyboardShortcut, Modifiers, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
   TouchDeviceId, TouchId, TouchPhase,
 };
+use egui_material_icons::icons::{
+  ICON_FLIP_TO_BACK, ICON_FLIP_TO_FRONT, ICON_MOVE_DOWN, ICON_MOVE_UP, ICON_REDO, ICON_UNDO,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::renderer::{
@@ -1987,14 +1990,20 @@ impl EditorController {
           self.style_controls(ui, document, actions);
           ui.separator();
           if ui
-            .add_enabled(history.can_undo(), egui::Button::new("↶"))
+            .add_enabled(
+              history.can_undo(),
+              egui::Button::new(egui::RichText::new(ICON_UNDO).size(18.0)),
+            )
             .on_hover_text("撤销 (Cmd+Z)")
             .clicked()
           {
             actions.push(EditorAction::Undo);
           }
           if ui
-            .add_enabled(history.can_redo(), egui::Button::new("↷"))
+            .add_enabled(
+              history.can_redo(),
+              egui::Button::new(egui::RichText::new(ICON_REDO).size(18.0)),
+            )
             .on_hover_text("重做 (Cmd+Shift+Z)")
             .clicked()
           {
@@ -2194,28 +2203,28 @@ impl EditorController {
           if let Some(element_id) = self.selected_element_id {
             ui.separator();
             ui.horizontal(|ui| {
-              if ui.button("↑").on_hover_text("上移一层").clicked() {
+              if ui.button(ICON_MOVE_UP).on_hover_text("上移一层").clicked() {
                 actions.push(rectangle_command_action(
                   document,
                   DocumentCommand::BringForward { element_id },
                   element_id,
                 ));
               }
-              if ui.button("↓").on_hover_text("下移一层").clicked() {
+              if ui.button(ICON_MOVE_DOWN).on_hover_text("下移一层").clicked() {
                 actions.push(rectangle_command_action(
                   document,
                   DocumentCommand::SendBackward { element_id },
                   element_id,
                 ));
               }
-              if ui.button("⇈").on_hover_text("置于顶层").clicked() {
+              if ui.button(ICON_FLIP_TO_FRONT).on_hover_text("置于顶层").clicked() {
                 actions.push(rectangle_command_action(
                   document,
                   DocumentCommand::BringToFront { element_id },
                   element_id,
                 ));
               }
-              if ui.button("⇊").on_hover_text("置于底层").clicked() {
+              if ui.button(ICON_FLIP_TO_BACK).on_hover_text("置于底层").clicked() {
                 actions.push(rectangle_command_action(
                   document,
                   DocumentCommand::SendToBack { element_id },
@@ -3928,6 +3937,7 @@ mod tests {
       egui::vec2(1000.0, 500.0),
     );
 
+    initialize_test_icons(&context);
     let output = context.run_ui(input, |ui| {
       assert!(controller.show(ui, &document, &history, None).is_empty());
     });
@@ -4278,6 +4288,10 @@ mod tests {
     }
   }
 
+  fn initialize_test_icons(context: &egui::Context) {
+    egui_material_icons::initialize(context);
+  }
+
   fn run_editor_frame(
     context: &egui::Context,
     controller: &mut EditorController,
@@ -4285,6 +4299,7 @@ mod tests {
     history: &CommandHistory,
     events: Vec<Event>,
   ) -> Vec<EditorAction> {
+    initialize_test_icons(context);
     let mut actions = None;
     context
       .run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
@@ -4301,6 +4316,7 @@ mod tests {
     history: &CommandHistory,
     events: Vec<Event>,
   ) -> Vec<EditorAction> {
+    initialize_test_icons(context);
     let mut input = raw_input(events, egui::vec2(800.0, 400.0));
     controller.capture_stylus_input(&mut input);
     let mut actions = None;
@@ -4329,6 +4345,7 @@ mod tests {
     history: &CommandHistory,
     events: Vec<Event>,
   ) -> Vec<EditorAction> {
+    initialize_test_icons(context);
     let mut actions = None;
     context
       .run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
@@ -6565,6 +6582,7 @@ mod tests {
     };
     let history = CommandHistory::new();
     let context = egui::Context::default();
+    initialize_test_icons(&context);
     let output = context.run_ui(raw_input(Vec::new(), egui::vec2(800.0, 400.0)), |ui| {
       assert!(controller.show(ui, &document, &history, None).is_empty());
     });

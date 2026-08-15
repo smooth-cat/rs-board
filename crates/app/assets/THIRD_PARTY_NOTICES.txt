@@ -108,7 +108,7 @@ Cargo.lock with cargo-about 0.9.1 for the aarch64-apple-darwin target.
 
 License overview
 ----------------
-- MIT License (168)
+- MIT License (169)
 - Apache License 2.0 (14)
 - ISC License (1)
 - Mozilla Public License 2.0 (1)
@@ -158,6 +158,7 @@ Third-party crate inventory
 - egui 0.36.0 | SPDX: MIT OR Apache-2.0 | https://github.com/emilk/egui
 - egui-winit 0.36.0 | SPDX: MIT OR Apache-2.0 | https://github.com/emilk/egui/tree/main/crates/egui-winit
 - egui_glow 0.36.0 | SPDX: MIT OR Apache-2.0 | https://github.com/emilk/egui/tree/main/crates/egui_glow
+- egui_material_icons 0.8.0 | SPDX: MIT | https://github.com/lucasmerlin/hello_egui/tree/main/crates/egui_material_icons
 - either 1.17.0 | SPDX: MIT OR Apache-2.0 | https://github.com/rayon-rs/either
 - emath 0.36.0 | SPDX: MIT OR Apache-2.0 | https://github.com/emilk/egui/tree/main/crates/emath
 - epaint 0.36.0 | SPDX: MIT OR Apache-2.0 | https://github.com/emilk/egui/tree/main/crates/epaint
@@ -3789,6 +3790,7 @@ Used by:
 - egui-winit 0.36.0 | https://github.com/emilk/egui/tree/main/crates/egui-winit
 - egui 0.36.0 | https://github.com/emilk/egui
 - egui_glow 0.36.0 | https://github.com/emilk/egui/tree/main/crates/egui_glow
+- egui_material_icons 0.8.0 | https://github.com/lucasmerlin/hello_egui/tree/main/crates/egui_material_icons
 - emath 0.36.0 | https://github.com/emilk/egui/tree/main/crates/emath
 - epaint 0.36.0 | https://github.com/emilk/egui/tree/main/crates/epaint
 - libm 0.2.16 | https://github.com/rust-lang/compiler-builtins
