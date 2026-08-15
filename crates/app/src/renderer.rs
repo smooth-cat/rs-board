@@ -127,7 +127,7 @@ pub(crate) fn paint_element(
         payload.radius_px * 2.0 * transform.scale(),
       );
       let rect = Rect::from_center_size(center, size);
-      let radius = (payload.radius_px * transform.scale()).clamp(0.0, 255.0) as u8;
+      let radius = (payload.corner_radius_px() * transform.scale()).clamp(0.0, 255.0) as u8;
       painter.rect_filled(
         rect,
         egui::CornerRadius::same(radius),
@@ -901,13 +901,14 @@ fn raster_element(image: &mut RgbaImage, element: &Element, canvas_size: SizePx)
         payload.pill_width_px,
         payload.radius_px * 2.0,
       );
-      fill_rounded_rect(image, bounds, payload.radius_px, rgba(payload.fill_rgba));
+      let corner_radius = payload.corner_radius_px();
+      fill_rounded_rect(image, bounds, corner_radius, rgba(payload.fill_rgba));
       let stroke_half = payload.stroke_style.width_px / 2.0;
       if stroke_half > 0.0 {
         stroke_rounded_rect(
           image,
           bounds,
-          payload.radius_px,
+          corner_radius,
           payload.stroke_style.width_px,
           rgba(payload.stroke_style.color_rgba),
         );

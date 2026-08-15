@@ -1657,9 +1657,13 @@ impl EditorController {
       Ok(style) => style,
       Err(_) => return,
     };
-    let radius_px = (style.font_size_px * 0.72).max(14.0);
-    let digit_count = document.next_sequence_number.to_string().len() as f32;
-    let pill_width_px = (digit_count * style.font_size_px * 0.68 + 16.0).max(radius_px * 2.0);
+    let (radius_px, pill_width_px) = match SequenceMarkerPayload::geometry_for(
+      document.next_sequence_number,
+      style.font_size_px,
+    ) {
+      Ok(geometry) => geometry,
+      Err(_) => return,
+    };
     let Ok(element) = Element::new(
       ElementId::new(),
       document.elements.len() as i64,

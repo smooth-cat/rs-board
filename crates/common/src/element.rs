@@ -582,6 +582,42 @@ pub struct SequenceMarkerPayload {
 }
 
 impl SequenceMarkerPayload {
+  /// Returns the background geometry for a sequence number at the given font size.
+  ///
+  /// A single digit uses a circle. Once the number needs more than one digit,
+  /// the height still follows the font size but the corner radius is reduced so
+  /// the marker reads as a rounded rectangle instead of a stretched capsule.
+  pub fn geometry_for(number: u64, font_size_px: f32) -> Result<(f32, f32), ElementError> {
+    if number == 0 {
+      return Err(ElementError::InvalidSequenceNumber);
+    }
+    if !font_size_px.is_finite() || font_size_px <= 0.0 {
+      return Err(ElementError::InvalidSequenceGeometry);
+    }
+
+    const DIAMETER_PER_FONT_SIZE: f32 = 1.44;
+    const DIGIT_WIDTH_PER_FONT_SIZE: f32 = 0.68;
+    const HORIZONTAL_PADDING_PER_FONT_SIZE: f32 = 0.68;
+
+    let digit_count = number.to_string().len() as f32;
+    let diameter = font_size_px * DIAMETER_PER_FONT_SIZE;
+    let radius = diameter / 2.0;
+    let width = if digit_count == 1.0 {
+      diameter
+    } else {
+      font_size_px
+        * (digit_count * DIGIT_WIDTH_PER_FONT_SIZE + HORIZONTAL_PADDING_PER_FONT_SIZE)
+          .max(DIAMETER_PER_FONT_SIZE)
+    };
+
+    Ok((radius, width))
+  }
+
+  /// Returns the visible corner radius while `radius_px` remains the marker's half-height.
+  pub fn corner_radius_px(&self) -> f32 {
+    if self.number.to_string().len() == 1 { self.radius_px } else { self.radius_px * 0.5 }
+  }
+
   fn validate(&self) -> Result<(), ElementError> {
     if !self.center_px.is_finite() {
       return Err(ElementError::Geometry(GeometryError::NonFiniteCoordinate));
@@ -796,6 +832,10 @@ impl Element {
         }
         apply_stroke_change(&mut payload.stroke_style, change);
         if let Some(font_size_px) = change.font_size_px {
+          let (radius_px, pill_width_px) =
+            SequenceMarkerPayload::geometry_for(payload.number, font_size_px)?;
+          payload.radius_px = radius_px;
+          payload.pill_width_px = pill_width_px;
           payload.text_style.font_size_px = font_size_px;
           payload.text_style.line_height_px = font_size_px * 1.2;
         }
@@ -1901,6 +1941,65 @@ mod tests {
       label: label(stroke_style.color_rgba, text),
       stroke_style,
     }
+  }
+
+  #[test]
+  fn sequence_marker_geometry_scales_with_font_size_and_digit_count() {
+    let (single_radius, single_width) = SequenceMarkerPayload::geometry_for(1, 24.0).unwrap();
+    assert!((single_width - single_radius * 2.0).abs() < 0.001);
+
+    let (multi_radius, multi_width) = SequenceMarkerPayload::geometry_for(128, 24.0).unwrap();
+    assert!(multi_width > multi_radius * 2.0);
+    assert!((multi_radius - single_radius).abs() < 0.001);
+
+    let (larger_radius, larger_width) = SequenceMarkerPayload::geometry_for(128, 48.0).unwrap();
+    assert!((larger_radius / multi_radius - 2.0).abs() < 0.001);
+    assert!((larger_width / multi_width - 2.0).abs() < 0.001);
+
+    let marker = SequenceMarkerPayload {
+      center_px: PointPx::ZERO,
+      number: 128,
+      radius_px: multi_radius,
+      pill_width_px: multi_width,
+      fill_rgba: ColorRgba::RED,
+      stroke_style: StrokeStyle::mvp(ColorRgba::RED, 4.0).unwrap(),
+      text_style: TextStyle::mvp(ColorRgba::RED.contrasting_text(), 24.0).unwrap(),
+    };
+    assert!(marker.corner_radius_px() < marker.radius_px);
+  }
+
+  #[test]
+  fn sequence_marker_font_size_change_resizes_persistent_background() {
+    let canvas = SizePx::new(500, 300);
+    let fill_rgba = ColorRgba::BLUE;
+    let (radius_px, pill_width_px) = SequenceMarkerPayload::geometry_for(128, 24.0).unwrap();
+    let mut marker = Element::new(
+      ElementId::new(),
+      0,
+      ElementPayload::SequenceMarker(SequenceMarkerPayload {
+        center_px: PointPx::new(250.0, 150.0),
+        number: 128,
+        radius_px,
+        pill_width_px,
+        fill_rgba,
+        stroke_style: StrokeStyle::mvp(fill_rgba, 4.0).unwrap(),
+        text_style: TextStyle::mvp(fill_rgba.contrasting_text(), 24.0).unwrap(),
+      }),
+      canvas,
+    )
+    .unwrap();
+
+    marker
+      .set_style(&StyleChange { font_size_px: Some(64.0), ..StyleChange::default() }, canvas)
+      .unwrap();
+
+    let ElementPayload::SequenceMarker(payload) = marker.payload else {
+      unreachable!();
+    };
+    let (expected_radius, expected_width) = SequenceMarkerPayload::geometry_for(128, 64.0).unwrap();
+    assert!((payload.radius_px - expected_radius).abs() < 0.001);
+    assert!((payload.pill_width_px - expected_width).abs() < 0.001);
+    assert_eq!(payload.text_style.font_size_px, 64.0);
   }
 
   #[test]
