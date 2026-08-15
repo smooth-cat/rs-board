@@ -17,7 +17,8 @@ use eframe::egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::renderer::{
-  layout_egui_text, paint_arrow_without_label_text, paint_document, paint_element,
+  layout_egui_text_with_document_wrapping, measured_arrow_label_bounds,
+  measured_rectangle_label_bounds, paint_arrow_without_label_text, paint_document, paint_element,
   paint_raw_stroke_points, paint_rectangle_without_label_text,
 };
 
@@ -310,6 +311,7 @@ struct InlineImeState {
 struct InlineTextGeometry {
   origin_px: PointPx,
   wrap_width_px: f32,
+  editor_width_px: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1839,14 +1841,23 @@ impl EditorController {
       self.text_editing = None;
       return TextEditorCompletion::None;
     }
+    let editor_id = inline_text_editor_id();
+    let layer_id = egui::LayerId::new(egui::Order::Foreground, editor_id.with("layer"));
+    ctx.set_transform_layer(layer_id, egui::emath::TSTransform::IDENTITY);
+    ctx.move_to_top(layer_id);
+    let layer_painter = ctx.layer_painter(layer_id);
     let editing = self.text_editing.as_ref().expect("text editing checked above");
     let preview = self.text_editing_preview_element(document);
-    let Some(geometry) = inline_text_geometry_with_preview(editing, document, preview.as_ref())
-    else {
+    let Some(geometry) = inline_text_geometry_with_rendered_label_width(
+      editing,
+      document,
+      preview.as_ref(),
+      &layer_painter,
+      transform.scale(),
+    ) else {
       return TextEditorCompletion::None;
     };
     let screen_position = transform.document_to_egui(geometry.origin_px);
-    let editor_id = inline_text_editor_id();
     let mut lost_focus = false;
     let editing = self.text_editing.as_mut().expect("text editor checked above");
     let submit_after_widget =
@@ -1858,14 +1869,12 @@ impl EditorController {
       TextAlign::Center => egui::Align::Center,
       TextAlign::Right => egui::Align::Max,
     };
-    let desired_width = (geometry.wrap_width_px * transform.scale()).max(1.0);
+    let desired_width = (geometry.editor_width_px * transform.scale()).max(1.0);
+    let layout_wrap_width = (geometry.wrap_width_px * transform.scale()).max(1.0);
     let editor_rect = Rect::from_min_size(
       screen_position,
       egui::vec2(desired_width, transform.canvas_rect().height().max(1.0)),
     );
-    let layer_id = egui::LayerId::new(egui::Order::Foreground, editor_id.with("layer"));
-    ctx.set_transform_layer(layer_id, egui::emath::TSTransform::IDENTITY);
-    ctx.move_to_top(layer_id);
     let first_shape = ctx.graphics_mut(|graphics| graphics.entry(layer_id).next_idx());
     let mut ui = egui::Ui::new(
       ctx.clone(),
@@ -1875,14 +1884,16 @@ impl EditorController {
     ui.set_clip_rect(transform.canvas_rect());
     ui.set_width(desired_width);
     let layout_text_style = editing.text_style.clone();
-    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-      layout_egui_text(
+    let arrow_label = matches!(editing.target, TextTarget::ArrowLabel { .. });
+    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
+      layout_egui_text_with_document_wrapping(
         ui.painter(),
         text.as_str(),
         &layout_text_style,
-        wrap_width,
+        layout_wrap_width,
         transform.scale(),
         1.0,
+        arrow_label,
       )
     };
     let mut output = egui::TextEdit::multiline(&mut editing.buffer)
@@ -1921,9 +1932,13 @@ impl EditorController {
     if submit_after_widget {
       output.response.surrender_focus();
     }
-    if let Some(updated_geometry) =
-      inline_text_geometry_with_preview(editing, document, preview.as_ref())
-    {
+    if let Some(updated_geometry) = inline_text_geometry_with_rendered_label_width(
+      editing,
+      document,
+      preview.as_ref(),
+      &layer_painter,
+      transform.scale(),
+    ) {
       let updated_position = transform.document_to_egui(updated_geometry.origin_px);
       translate_inline_text_layer(
         ctx,
@@ -3172,6 +3187,7 @@ fn inline_text_geometry_with_preview(
     TextTarget::NewText { anchor_px } => Some(InlineTextGeometry {
       origin_px: anchor_px,
       wrap_width_px: text_width_to_canvas_edge(anchor_px, document.canvas_size_px),
+      editor_width_px: text_width_to_canvas_edge(anchor_px, document.canvas_size_px),
     }),
     TextTarget::ExistingText { element_id } => {
       let ElementPayload::Text(payload) = &target_element(document, preview, element_id)?.payload
@@ -3181,6 +3197,7 @@ fn inline_text_geometry_with_preview(
       Some(InlineTextGeometry {
         origin_px: payload.anchor_px,
         wrap_width_px: text_width_to_canvas_edge(payload.anchor_px, document.canvas_size_px),
+        editor_width_px: text_width_to_canvas_edge(payload.anchor_px, document.canvas_size_px),
       })
     }
     TextTarget::ArrowLabel { element_id } => {
@@ -3215,6 +3232,54 @@ fn inline_text_geometry_with_preview(
       ))
     }
   }
+}
+
+fn inline_text_geometry_with_rendered_label_width(
+  editing: &TextEditing,
+  document: &BoardDocument,
+  preview: Option<&Element>,
+  painter: &egui::Painter,
+  scale: f32,
+) -> Option<InlineTextGeometry> {
+  let (bounds_px, text_wrap_width_px, padding_px) = match editing.target {
+    TextTarget::RectangleLabel { element_id } => {
+      let ElementPayload::Rectangle(payload) =
+        &target_element(document, preview, element_id)?.payload
+      else {
+        return None;
+      };
+      let draft = rectangle_label_draft(payload, editing, document, element_id);
+      let layout = rectangle_label_layout(&draft, document.canvas_size_px).ok()??;
+      let bounds_px = measured_rectangle_label_bounds(
+        painter,
+        &layout,
+        draft.label.visible_text().unwrap_or_default(),
+        &draft.label.text_style,
+        draft.label.padding_px,
+        scale,
+      );
+      (bounds_px, layout.text_wrap_width_px, draft.label.padding_px)
+    }
+    TextTarget::ArrowLabel { element_id } => {
+      let ElementPayload::Arrow(payload) = &target_element(document, preview, element_id)?.payload
+      else {
+        return None;
+      };
+      let draft = arrow_label_draft(payload, editing);
+      let layout = arrow_label_layout(&draft, document.canvas_size_px).ok()??;
+      let bounds_px = measured_arrow_label_bounds(
+        painter,
+        &layout,
+        draft.label.visible_text().unwrap_or_default(),
+        &draft.label.text_style,
+        draft.label.padding_px,
+        scale,
+      );
+      (bounds_px, layout.text_wrap_width_px, draft.label.padding_px)
+    }
+    _ => return inline_text_geometry_with_preview(editing, document, preview),
+  };
+  Some(inline_label_geometry(bounds_px, text_wrap_width_px, padding_px, editing.text_style.align))
 }
 
 fn target_element<'a>(
@@ -3280,17 +3345,13 @@ fn inline_label_geometry(
   bounds_px: RectPx,
   text_wrap_width_px: f32,
   padding_px: f32,
-  align: TextAlign,
+  _align: TextAlign,
 ) -> InlineTextGeometry {
-  let alignment_width_px = (bounds_px.width() - padding_px * 2.0).max(1.0);
-  let alignment_offset_px = match align {
-    TextAlign::Left => 0.0,
-    TextAlign::Center => (alignment_width_px - text_wrap_width_px) / 2.0,
-    TextAlign::Right => alignment_width_px - text_wrap_width_px,
-  };
+  let editor_width_px = (bounds_px.width() - padding_px * 2.0).max(1.0);
   InlineTextGeometry {
-    origin_px: bounds_px.min + PointPx::new(padding_px + alignment_offset_px, padding_px),
+    origin_px: bounds_px.min + PointPx::new(padding_px, padding_px),
     wrap_width_px: text_wrap_width_px,
+    editor_width_px,
   }
 }
 
@@ -6394,13 +6455,16 @@ mod tests {
     };
     let draft = rectangle_label_draft(payload, &editing, &document, element_id);
     let layout = rectangle_label_layout(&draft, document.canvas_size_px).unwrap().unwrap();
+    let label_inner_width = (layout.bounds_px.width() - draft.label.padding_px * 2.0).max(1.0);
     assert_eq!(geometry.wrap_width_px, layout.text_wrap_width_px);
+    assert_eq!(geometry.editor_width_px, label_inner_width);
     assert_eq!(
       geometry.origin_px,
       layout.bounds_px.min + PointPx::new(draft.label.padding_px, draft.label.padding_px)
     );
     assert_eq!(layout.text_layout.line_count, 1);
     assert!(layout.text_wrap_width_px > layout.bounds_px.width() - draft.label.padding_px * 2.0);
+    assert!(geometry.wrap_width_px > geometry.editor_width_px);
 
     editing.buffer.clear();
     let empty_draft = rectangle_label_draft(payload, &editing, &document, element_id);
@@ -6410,6 +6474,10 @@ mod tests {
     assert_eq!(empty_draft.label.text.as_deref(), Some(EMPTY_LABEL_DRAFT));
     assert_eq!(empty_layout.text_layout.width_px, 1.0);
     assert_eq!(empty_geometry.wrap_width_px, empty_layout.text_wrap_width_px);
+    assert_eq!(
+      empty_geometry.editor_width_px,
+      (empty_layout.bounds_px.width() - empty_draft.label.padding_px * 2.0).max(1.0)
+    );
   }
 
   #[test]
