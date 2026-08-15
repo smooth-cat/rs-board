@@ -25,7 +25,6 @@ use crate::renderer::{
   paint_raw_stroke_points, paint_rectangle_without_label_text,
 };
 
-const DEFAULT_RECTANGLE_LABEL: &str = "标题";
 const EMPTY_LABEL_DRAFT: &str = "\u{200b}";
 const ARROW_LABEL_TOO_SHORT_TOAST: &str = "箭头过短无法插入文字";
 const COLOR_SWATCH_FONT_SIZE_PT: f32 = 20.0;
@@ -1329,13 +1328,12 @@ impl EditorController {
             self.selected_element_id = Some(element_id);
             self.text_editing = Some(TextEditing {
               target: TextTarget::RectangleLabel { element_id },
-              buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
+              buffer: String::new(),
               text_style,
               ime: InlineImeState::default(),
               request_focus: true,
-              select_all: true,
-              // The release-time reflow already chose the anchor for this new label.
-              auto_place_rectangle: false,
+              select_all: false,
+              auto_place_rectangle: true,
             });
           }
         }
@@ -1541,7 +1539,7 @@ impl EditorController {
       stroke_style,
       fill_rgba: None,
       label: ElementLabel {
-        text: Some(DEFAULT_RECTANGLE_LABEL.to_owned()),
+        text: None,
         max_width_px: 840.0,
         padding_px: 8.0,
         anchor_offset_px: 8.0,
@@ -1811,9 +1809,25 @@ impl EditorController {
           return;
         };
         let text = normalized_label_text(editing.buffer);
-        let mut commands = Vec::with_capacity(1);
+        let mut commands = Vec::with_capacity(2);
         if payload.label.text != text {
-          commands.push(DocumentCommand::UpdateElementLabel { element_id, text });
+          commands.push(DocumentCommand::UpdateElementLabel { element_id, text: text.clone() });
+        }
+        if editing.auto_place_rectangle && text.is_some() {
+          let mut draft = payload.clone();
+          draft.label.text = text;
+          draft.label.text_style = editing.text_style;
+          let obstacles = rectangle_label_obstacles(document, Some(element_id));
+          if let Ok(anchor) =
+            choose_rectangle_label_anchor(&draft, document.canvas_size_px, &obstacles)
+            && (payload.preferred_label_anchor != anchor || payload.label_anchor != anchor)
+          {
+            commands.push(DocumentCommand::SetRectangleLabelPlacement {
+              element_id,
+              preferred_anchor: anchor,
+              actual_anchor: anchor,
+            });
+          }
         }
         if !commands.is_empty()
           && let Some(batch) = rectangle_reflow_batch(document, commands, element_id, &[])
@@ -3900,6 +3914,8 @@ mod tests {
 
   use super::*;
 
+  const TEST_RECTANGLE_LABEL: &str = "标题";
+
   fn document() -> BoardDocument {
     document_with_size(SizePx::new(400, 200))
   }
@@ -4414,7 +4430,7 @@ mod tests {
         stroke_style: style.clone(),
         fill_rgba: None,
         label: ElementLabel {
-          text: Some(DEFAULT_RECTANGLE_LABEL.to_owned()),
+          text: Some(TEST_RECTANGLE_LABEL.to_owned()),
           max_width_px: 200.0,
           padding_px: 8.0,
           anchor_offset_px: 8.0,
@@ -5121,11 +5137,7 @@ mod tests {
       };
       assert_eq!(preview_payload.start_px, start, "case={case}");
       assert_eq!(preview_payload.end_px, requested, "case={case}");
-      assert_eq!(
-        preview_payload.label.text.as_deref(),
-        Some(DEFAULT_RECTANGLE_LABEL),
-        "case={case}"
-      );
+      assert!(preview_payload.label.text.is_none(), "case={case}");
       let raw = RectPx::from_points(preview_payload.start_px, preview_payload.end_px);
       assert!(raw.width() < minimum && raw.height() < minimum, "case={case}");
       preview.bounds_px.validate().unwrap();
@@ -5164,6 +5176,11 @@ mod tests {
       let ElementPayload::Rectangle(committed_payload) = &committed.payload else {
         unreachable!();
       };
+      assert!(committed_payload.label.text.is_none(), "case={case}");
+      let editing = controller.text_editing.as_ref().expect("new rectangle should edit its label");
+      assert!(editing.buffer.is_empty(), "case={case}");
+      assert!(!editing.select_all, "case={case}");
+      assert!(editing.auto_place_rectangle, "case={case}");
       let committed_body =
         RectPx::from_points(committed_payload.start_px, committed_payload.end_px);
       assert!(committed_body.width() >= minimum, "case={case}");
@@ -6506,7 +6523,7 @@ mod tests {
     let document = document();
     let editing = TextEditing {
       target: TextTarget::RectangleLabel { element_id: ElementId::new() },
-      buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
+      buffer: String::new(),
       text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
       ime: InlineImeState::default(),
       request_focus: true,
@@ -6571,7 +6588,7 @@ mod tests {
       selected_element_id: Some(element_id),
       text_editing: Some(TextEditing {
         target: TextTarget::RectangleLabel { element_id },
-        buffer: DEFAULT_RECTANGLE_LABEL.to_owned(),
+        buffer: TEST_RECTANGLE_LABEL.to_owned(),
         text_style,
         ime: InlineImeState::default(),
         request_focus: true,
@@ -7352,7 +7369,7 @@ mod tests {
   }
 
   #[test]
-  fn new_rectangle_reflowed_label_keeps_its_actual_anchor_during_inline_editing() {
+  fn new_rectangle_reflows_its_label_only_after_text_is_entered() {
     let mut document = document_with_size(SizePx::new(420, 400));
     let mut blocker = rectangle(&document, 0, PointPx::new(24.0, 40.0), PointPx::new(300.0, 160.0));
     let ElementPayload::Rectangle(payload) = &mut blocker.payload else {
@@ -7385,9 +7402,10 @@ mod tests {
       unreachable!();
     };
     let drag_actual = drag_payload.label_anchor;
+    assert!(drag_payload.label.text.is_none());
     assert_eq!(drag_actual.edge, RectangleLabelEdge::Top);
     assert_eq!(drag_actual.side, RectangleLabelSide::Outside);
-    assert!(drag_actual.position > 0.0);
+    assert_eq!(drag_actual.position, 0.0);
 
     let mut add_actions = Vec::new();
     controller.finish_pointer_interaction(&document, &mut add_actions);
@@ -7403,9 +7421,10 @@ mod tests {
       unreachable!();
     };
     assert_eq!(released_payload.label_anchor, drag_actual);
+    assert!(released_payload.label.text.is_none());
     assert_eq!(released_payload.label_anchor.edge, RectangleLabelEdge::Top);
     assert_eq!(released_payload.label_anchor.side, RectangleLabelSide::Outside);
-    assert!(released_payload.label_anchor.position > 0.0);
+    assert_eq!(released_payload.label_anchor.position, 0.0);
     assert_eq!(released_payload.preferred_label_anchor.position, 0.0);
 
     let editing = controller.text_editing.as_ref().expect("new rectangle should edit its label");
@@ -7413,9 +7432,10 @@ mod tests {
       editing.target,
       TextTarget::RectangleLabel { element_id: editing_id } if editing_id == element_id
     ));
-    assert!(!editing.auto_place_rectangle);
+    assert!(editing.buffer.is_empty());
+    assert!(editing.auto_place_rectangle);
     let released_draft = rectangle_label_draft(released_payload, editing, &document, element_id);
-    assert_eq!(released_draft.label_anchor, released_payload.label_anchor);
+    assert_ne!(released_draft.label_anchor, released_payload.label_anchor);
     let released_layout =
       rectangle_label_layout(&released_draft, document.canvas_size_px).unwrap().unwrap();
     let released_geometry =
@@ -7436,10 +7456,11 @@ mod tests {
     else {
       unreachable!();
     };
+    assert!(persisted_payload.label.text.is_none());
     assert_eq!(persisted_payload.label_anchor, released_payload.label_anchor);
     let editing = controller.text_editing.as_ref().unwrap();
     let persisted_draft = rectangle_label_draft(persisted_payload, editing, &document, element_id);
-    assert_eq!(persisted_draft.label_anchor, persisted_payload.label_anchor);
+    assert_eq!(persisted_draft.label_anchor, released_draft.label_anchor);
     let persisted_geometry = inline_text_geometry(editing, &document).unwrap();
     assert!(persisted_geometry.origin_px.distance_to(released_geometry.origin_px) < 0.01);
     assert!((persisted_geometry.wrap_width_px - released_geometry.wrap_width_px).abs() < 0.01);
@@ -7458,8 +7479,9 @@ mod tests {
         text: Some(text),
       }) if *updated_id == element_id && text == committed_text
     ));
-    let committed_actual = rectangle_label_placement_command(commit_batch.commands(), element_id)
-      .map_or(persisted_payload.label_anchor, |(_, actual)| actual);
+    let (_, committed_actual) =
+      rectangle_label_placement_command(commit_batch.commands(), element_id)
+        .expect("entering text should place the new rectangle label");
 
     history.execute_batch(&mut document, commit_batch.clone()).unwrap();
     let ElementPayload::Rectangle(committed_payload) =
