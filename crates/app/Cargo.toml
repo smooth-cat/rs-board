@@ -30,6 +30,7 @@ xcap.workspace = true
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = [
   "NSApplication",
+  "NSBitmapImageRep",
   "NSColor",
   "NSCursor",
   "NSGraphics",
@@ -75,6 +76,7 @@ objc2-foundation = { version = "0.3.2", features = [
   "NSString",
   "NSURL",
   "NSValue",
+  "NSUserDefaults",
   "objc2-core-services",
 ] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = [

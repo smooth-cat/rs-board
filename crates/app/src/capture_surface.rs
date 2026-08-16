@@ -8,7 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 use xcap::Monitor;
 
-use crate::capture::NativeCaptureImage;
+use crate::{capture::NativeCaptureImage, tool_cursor::NativeCursorImage};
 
 const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const COLD_REFRESH_WALL_CLOCK_GAP: Duration = Duration::from_secs(5);
@@ -448,6 +448,18 @@ impl CaptureSurfaceCoordinator {
       }
     }
   }
+
+  pub(crate) fn set_cursor_override(&mut self, display_id: u32, image: Option<&NativeCursorImage>) {
+    #[cfg(target_os = "macos")]
+    if let Some(overlay_window) =
+      self.surfaces.get_mut(&display_id).and_then(|surface| surface.overlay_window.as_mut())
+    {
+      macos::set_cursor_override(overlay_window, image);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (display_id, image);
+  }
 }
 
 impl Default for CaptureSurfaceCoordinator {
@@ -567,31 +579,122 @@ impl FocusRestore {
 
 #[cfg(target_os = "macos")]
 mod macos {
-  use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
+  use std::{cell::RefCell, collections::HashMap, ffi::c_uchar, slice};
+
+  use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
   use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSColor, NSNormalWindowLevel, NSPanel, NSScreen,
-    NSScreenSaverWindowLevel, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowLevel, NSWindowOrderingMode, NSWindowSharingType, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSBitmapImageRep, NSColor, NSCursor, NSDeviceRGBColorSpace,
+    NSImage, NSNormalWindowLevel, NSPanel, NSScreen, NSScreenSaverWindowLevel, NSWindow,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel, NSWindowOrderingMode,
+    NSWindowSharingType, NSWindowStyleMask,
   };
-  use objc2_foundation::{NSNumber, NSRect, NSString};
+  use objc2_foundation::{NSNumber, NSPoint, NSRect, NSSize, NSString};
   use objc2_quartz_core::{CALayer, CATransaction, kCAGravityResize};
 
   use super::{
     CaptureSurfaceError, DisplaySnapshot, OverlayWindowReadiness, capture_overlay_title,
   };
-  use crate::capture::NativeCaptureImage;
+  use crate::{capture::NativeCaptureImage, tool_cursor::NativeCursorImage};
 
   const EDITOR_WINDOW_SHARING_TYPE: NSWindowSharingType = NSWindowSharingType::ReadOnly;
+
+  thread_local! {
+    static TOOL_CURSORS: RefCell<HashMap<usize, Retained<NSCursor>>> =
+      RefCell::new(HashMap::new());
+  }
 
   pub(super) struct OverlayWindow {
     window: Retained<NSWindow>,
     title: String,
     ready: bool,
+    cursor_override_key: Option<usize>,
   }
 
   pub(super) struct FrozenImagePanel {
     panel: Retained<NSPanel>,
     layer: Retained<CALayer>,
+  }
+
+  pub(super) fn set_cursor_override(
+    overlay_window: &mut OverlayWindow,
+    image: Option<&NativeCursorImage>,
+  ) {
+    let Some(image) = image else {
+      if overlay_window.cursor_override_key.take().is_some()
+        && let Some(content_view) = overlay_window.window.contentView()
+      {
+        overlay_window.window.invalidateCursorRectsForView(&content_view);
+        overlay_window.window.resetCursorRects();
+      }
+      return;
+    };
+
+    if !overlay_window.ready
+      || !overlay_window.window.isVisible()
+      || !overlay_window.window.isKeyWindow()
+      || overlay_window.window.ignoresMouseEvents()
+    {
+      overlay_window.cursor_override_key = None;
+      return;
+    }
+
+    let key = native_cursor_key(image);
+    if let Some(cursor) = tool_cursor(image) {
+      // eframe and AppKit may rebuild the window's cursor rects without changing tools. Reapply
+      // the cached cursor after each frame so those updates cannot leave the fallback cursor set.
+      cursor.set();
+      overlay_window.cursor_override_key = Some(key);
+    }
+  }
+
+  fn tool_cursor(image: &NativeCursorImage) -> Option<Retained<NSCursor>> {
+    let key = native_cursor_key(image);
+    TOOL_CURSORS.with(|cursors| {
+      if let Some(cursor) = cursors.borrow().get(&key) {
+        return Some(cursor.clone());
+      }
+      let cursor = create_tool_cursor(image)?;
+      cursors.borrow_mut().insert(key, cursor.clone());
+      Some(cursor)
+    })
+  }
+
+  fn native_cursor_key(image: &NativeCursorImage) -> usize {
+    image.rgba.as_ptr() as usize
+  }
+
+  fn create_tool_cursor(image: &NativeCursorImage) -> Option<Retained<NSCursor>> {
+    let width = isize::try_from(image.pixel_size[0]).ok()?;
+    let height = isize::try_from(image.pixel_size[1]).ok()?;
+    let bitmap = unsafe {
+      NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+        NSBitmapImageRep::alloc(),
+        std::ptr::null_mut::<*mut c_uchar>(),
+        width,
+        height,
+        8,
+        4,
+        true,
+        false,
+        NSDeviceRGBColorSpace,
+        width.checked_mul(4)?,
+        32,
+      )?
+    };
+    let bitmap_data = bitmap.bitmapData();
+    if bitmap_data.is_null() {
+      return None;
+    }
+    let bitmap_data = unsafe { slice::from_raw_parts_mut(bitmap_data, image.rgba.len()) };
+    bitmap_data.copy_from_slice(&image.rgba);
+
+    let logical_size =
+      NSSize::new(f64::from(image.logical_size[0]), f64::from(image.logical_size[1]));
+    bitmap.setSize(logical_size);
+    let cursor_image = NSImage::initWithSize(NSImage::alloc(), logical_size);
+    cursor_image.addRepresentation(&bitmap);
+    let hotspot = NSPoint::new(f64::from(image.hotspot[0]), f64::from(image.hotspot[1]));
+    Some(NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &cursor_image, hotspot))
   }
 
   impl FrozenImagePanel {
@@ -791,6 +894,7 @@ mod macos {
     };
     acquire_overlay_window(mtm, display_id, overlay_window);
     if let Some(overlay_window) = overlay_window.as_mut() {
+      set_cursor_override(overlay_window, None);
       overlay_window.ready = false;
       overlay_window.window.setIgnoresMouseEvents(true);
       if overlay_window.window.isKeyWindow() {
@@ -986,7 +1090,7 @@ mod macos {
     *overlay_window = windows
       .into_iter()
       .find(|window| window.title().to_string() == title)
-      .map(|window| OverlayWindow { window, title, ready: false });
+      .map(|window| OverlayWindow { window, title, ready: false, cursor_override_key: None });
   }
 
   impl Drop for FrozenImagePanel {

@@ -15,4 +15,5 @@ pub mod recent;
 pub mod renderer;
 pub mod settings;
 pub mod storage;
+mod tool_cursor;
 pub mod tray;

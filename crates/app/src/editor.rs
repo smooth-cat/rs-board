@@ -11,7 +11,7 @@ use common::{
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FocusDirection, FontId, Id, ImeEvent, Key,
   KeyboardShortcut, Modifiers, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextureHandle,
-  TouchDeviceId, TouchId, TouchPhase,
+  TextureOptions, TouchDeviceId, TouchId, TouchPhase,
 };
 use egui_material_icons::icons::{
   ICON_FLIP_TO_BACK, ICON_FLIP_TO_FRONT, ICON_MOVE_DOWN, ICON_MOVE_UP, ICON_REDO, ICON_UNDO,
@@ -23,6 +23,7 @@ use crate::renderer::{
   measured_rectangle_label_bounds, measured_text_bounds, paint_arrow_without_label_text,
   paint_document, paint_element, paint_raw_stroke_points, paint_rectangle_without_label_text,
 };
+use crate::tool_cursor;
 
 const EMPTY_LABEL_DRAFT: &str = "\u{200b}";
 const ARROW_LABEL_TOO_SHORT_TOAST: &str = "箭头过短无法插入文字";
@@ -93,8 +94,8 @@ impl EditorTool {
   fn cursor(self) -> CursorIcon {
     match self {
       Self::Select => CursorIcon::Default,
-      Self::Text => CursorIcon::Text,
-      _ => CursorIcon::Crosshair,
+      Self::Stroke => CursorIcon::Crosshair,
+      _ => CursorIcon::Default,
     }
   }
 }
@@ -365,6 +366,23 @@ enum TextEditorCompletion {
   Enter,
 }
 
+#[derive(Clone)]
+struct CachedToolCursorTexture {
+  size: [u16; 2],
+  hotspot: [u16; 2],
+  texture: TextureHandle,
+}
+
+#[derive(Clone, Default)]
+struct ToolCursorTextures([Option<CachedToolCursorTexture>; 6]);
+
+impl std::fmt::Debug for ToolCursorTextures {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let loaded = self.0.iter().filter(|texture| texture.is_some()).count();
+    formatter.debug_struct("ToolCursorTextures").field("loaded", &loaded).finish()
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct EditorController {
   tool: EditorTool,
@@ -386,6 +404,8 @@ pub struct EditorController {
   pending_stroke_points: Vec<StrokePoint>,
   queued_tool_switch: Option<ToolSwitchDirection>,
   tab_order: Vec<EditorTool>,
+  cursor_textures: ToolCursorTextures,
+  native_cursor_tool: Option<EditorTool>,
 }
 
 impl Default for EditorController {
@@ -424,11 +444,17 @@ impl EditorController {
       pending_stroke_points: Vec::new(),
       queued_tool_switch: None,
       tab_order: vec![EditorTool::Rectangle, EditorTool::Arrow],
+      cursor_textures: ToolCursorTextures::default(),
+      native_cursor_tool: None,
     }
   }
 
   pub fn active_tool(&self) -> EditorTool {
     self.tool
+  }
+
+  pub(crate) fn take_native_cursor_tool(&mut self) -> Option<EditorTool> {
+    self.native_cursor_tool.take()
   }
 
   pub fn set_tab_order(&mut self, tab_order: Vec<EditorTool>) {
@@ -528,6 +554,9 @@ impl EditorController {
     background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     let ctx = root_ui.ctx().clone();
+    self.native_cursor_tool = None;
+    ctx.set_cursor_icon(CursorIcon::Default);
+    ctx.set_cursor_image(None);
     self.released_preview_elements = ElementPreviewSet::default();
     if self.selected_element_id.is_some_and(|id| document.element(id).is_none()) {
       self.selected_element_id = None;
@@ -627,6 +656,10 @@ impl EditorController {
       self.handle_keyboard(&ctx, document, &mut actions);
     }
     self.show_toolbar(&ctx, document, history, &mut actions);
+    let canvas_cursor_tool = (self.text_editing.is_none()
+      || matches!(self.tool, EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Text))
+    .then_some(self.tool);
+    self.apply_canvas_cursor(&ctx, canvas_response.as_ref(), canvas_cursor_tool);
     actions
   }
 
@@ -636,6 +669,9 @@ impl EditorController {
     document: &BoardDocument,
     background: Option<&TextureHandle>,
   ) {
+    self.native_cursor_tool = None;
+    root_ui.ctx().set_cursor_icon(CursorIcon::Default);
+    root_ui.ctx().set_cursor_image(None);
     let background_fill = if background.is_some() { Color32::BLACK } else { Color32::TRANSPARENT };
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(background_fill)).show(
       root_ui,
@@ -2562,6 +2598,80 @@ impl EditorController {
       }
     }
   }
+
+  fn apply_canvas_cursor(
+    &mut self,
+    ctx: &egui::Context,
+    response: Option<&Response>,
+    tool: Option<EditorTool>,
+  ) {
+    let active_tool = response
+      .filter(|response| ctx.rect_contains_pointer(response.layer_id, response.interact_rect))
+      .and(tool);
+    let Some(tool) = active_tool else {
+      return;
+    };
+    if tool_cursor::image_for(tool).is_none() {
+      ctx.set_cursor_icon(tool.cursor());
+      return;
+    }
+
+    if crate::platform::native_tool_cursors_supported() {
+      self.native_cursor_tool = Some(tool);
+      ctx.set_cursor_icon(tool.cursor());
+      return;
+    }
+
+    ctx.set_cursor_icon(CursorIcon::None);
+    let Some(response) = response else {
+      return;
+    };
+    let Some(position) = ctx.input(|input| input.pointer.hover_pos()) else {
+      return;
+    };
+    let fallback_native_pixels_per_point = ctx.pixels_per_point() / ctx.zoom_factor().max(0.1);
+    let native_pixels_per_point =
+      ctx.native_pixels_per_point().unwrap_or(fallback_native_pixels_per_point);
+    let native_pixels_per_point = if native_pixels_per_point.is_finite() {
+      native_pixels_per_point.clamp(0.5, 4.0)
+    } else {
+      1.0
+    };
+    let raster_scale = crate::platform::system_cursor_scale() * native_pixels_per_point;
+    let expected_size = tool_cursor::raster_size_for(tool, raster_scale)
+      .expect("custom cursor tool should have a raster size");
+    let cached = &mut self.cursor_textures.0[tool.index()];
+    if cached.as_ref().is_none_or(|cached| cached.size != expected_size) {
+      let image = tool_cursor::image_for_scale(tool, raster_scale)
+        .expect("custom cursor tool should have a raster image");
+      let size = [usize::from(image.size[0]), usize::from(image.size[1])];
+      let color_image = egui::ColorImage::from_rgba_unmultiplied(size, image.rgba.as_ref());
+      if let Some(cached) = cached {
+        cached.texture.set(color_image, TextureOptions::LINEAR);
+        cached.size = image.size;
+        cached.hotspot = image.hotspot;
+      } else {
+        let texture = ctx.load_texture(
+          format!("rs-board-tool-cursor-{}", tool.index()),
+          color_image,
+          TextureOptions::LINEAR,
+        );
+        *cached =
+          Some(CachedToolCursorTexture { size: image.size, hotspot: image.hotspot, texture });
+      }
+    }
+    let cached = cached.as_ref().expect("cursor texture was just initialized");
+    let pixels_per_point = ctx.pixels_per_point().max(f32::EPSILON);
+    let size = egui::vec2(cached.size[0] as f32, cached.size[1] as f32) / pixels_per_point;
+    let hotspot = egui::vec2(cached.hotspot[0] as f32, cached.hotspot[1] as f32) / pixels_per_point;
+    let rect = Rect::from_min_size(position - hotspot, size);
+    ctx.layer_painter(response.layer_id).image(
+      cached.texture.id(),
+      rect,
+      Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+      Color32::WHITE,
+    );
+  }
 }
 
 pub fn hit_test_document(
@@ -4028,6 +4138,7 @@ mod tests {
 
   use chrono::{TimeZone, Utc};
   use common::{CapturedDisplay, DocumentId, GlobalBoundsPx};
+  use eframe::egui::ViewportId;
   use uuid::Uuid;
 
   use super::*;
@@ -4054,6 +4165,444 @@ mod tests {
       Utc.with_ymd_and_hms(2026, 8, 6, 0, 0, 0).unwrap(),
     )
     .unwrap()
+  }
+
+  #[test]
+  fn canvas_requests_the_active_combined_cursor_with_the_correct_fallback() {
+    let document = document();
+    let history = CommandHistory::new();
+    let pointer = Pos2::new(400.0, 200.0);
+
+    for tool in EditorTool::ALL {
+      let context = egui::Context::default();
+      let mut controller = EditorController::new(tool);
+      let output = run_editor_output(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(pointer)],
+      );
+      assert!(output.platform_output.cursor_image.is_none(), "{tool:?}");
+      let native_tool = controller.take_native_cursor_tool();
+      if crate::platform::native_tool_cursors_supported() {
+        assert_eq!(output.platform_output.cursor_icon, tool.cursor(), "{tool:?}");
+        assert_eq!(native_tool, Some(tool));
+        assert!(controller.cursor_textures.0[tool.index()].is_none());
+      } else {
+        assert_eq!(output.platform_output.cursor_icon, CursorIcon::None, "{tool:?}");
+        assert_eq!(native_tool, None);
+        let cached = controller.cursor_textures.0[tool.index()].as_ref().unwrap();
+        let bounds = cursor_mesh_bounds(&output, cached.texture.id());
+        let pixels_per_point = output.pixels_per_point;
+        let expected_min = pointer
+          - egui::vec2(cached.hotspot[0] as f32, cached.hotspot[1] as f32) / pixels_per_point;
+        assert!(bounds.min.distance(expected_min) < 0.01, "{tool:?}: {bounds:?}");
+      }
+      output.drop_without_applying_deltas();
+    }
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  #[test]
+  fn retina_viewport_uses_high_resolution_cursor_textures_without_changing_logical_size() {
+    let document = document();
+    let history = CommandHistory::new();
+    let pointer = Pos2::new(400.0, 200.0);
+    let viewport_id = ViewportId::from_hash_of("cursor-retina-viewport");
+    let system_scale = crate::platform::system_cursor_scale();
+
+    for tool in [
+      EditorTool::Select,
+      EditorTool::Rectangle,
+      EditorTool::Arrow,
+      EditorTool::Text,
+      EditorTool::Stroke,
+      EditorTool::Sequence,
+    ] {
+      let standard_context = egui::Context::default();
+      let mut standard_controller = EditorController::new(tool);
+      let standard_output = run_editor_output_in_viewport_at_native_ppp(
+        &standard_context,
+        &mut standard_controller,
+        &document,
+        &history,
+        viewport_id,
+        vec![Event::PointerMoved(pointer)],
+        1.0,
+      );
+      let standard = standard_controller.cursor_textures.0[tool.index()].as_ref().unwrap();
+      assert_eq!(
+        standard.size,
+        tool_cursor::raster_size_for(tool, system_scale).unwrap(),
+        "{tool:?}"
+      );
+      let standard_bounds = cursor_mesh_bounds(&standard_output, standard.texture.id());
+
+      let retina_context = egui::Context::default();
+      let mut retina_controller = EditorController::new(tool);
+      let retina_output = run_editor_output_in_viewport_at_native_ppp(
+        &retina_context,
+        &mut retina_controller,
+        &document,
+        &history,
+        viewport_id,
+        vec![Event::PointerMoved(pointer)],
+        2.0,
+      );
+      let retina = retina_controller.cursor_textures.0[tool.index()].as_ref().unwrap();
+      assert_eq!(
+        retina.size,
+        tool_cursor::raster_size_for(tool, system_scale * 2.0).unwrap(),
+        "{tool:?}"
+      );
+      let retina_bounds = cursor_mesh_bounds(&retina_output, retina.texture.id());
+
+      let standard_physical_size = standard_bounds.size() * standard_output.pixels_per_point;
+      let retina_physical_size = retina_bounds.size() * retina_output.pixels_per_point;
+      assert!(
+        (standard_physical_size - egui::vec2(standard.size[0] as f32, standard.size[1] as f32))
+          .length()
+          < 0.01,
+        "{tool:?}: {standard_physical_size:?}"
+      );
+      assert!(
+        (retina_physical_size - egui::vec2(retina.size[0] as f32, retina.size[1] as f32)).length()
+          < 0.01,
+        "{tool:?}: {retina_physical_size:?}"
+      );
+      assert!(
+        (standard_bounds.size() - retina_bounds.size()).length() <= 1.0,
+        "{tool:?}: standard={standard_bounds:?}, retina={retina_bounds:?}"
+      );
+      assert!(
+        retina.size[0] >= standard.size[0].saturating_mul(2).saturating_sub(1),
+        "{tool:?}: standard={:?}, retina={:?}",
+        standard.size,
+        retina.size
+      );
+      standard_output.drop_without_applying_deltas();
+      retina_output.drop_without_applying_deltas();
+    }
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  #[test]
+  fn ui_zoom_is_not_treated_as_display_density_when_native_density_is_missing() {
+    let context = egui::Context::default();
+    context.set_zoom_factor(1.5);
+    context
+      .run_ui(raw_input(Vec::new(), egui::vec2(800.0, 400.0)), |_| {})
+      .drop_without_applying_deltas();
+    let document = document();
+    let history = CommandHistory::new();
+    let pointer = Pos2::new(400.0, 200.0);
+    let mut controller = EditorController::new(EditorTool::Stroke);
+    initialize_test_icons(&context);
+    let output = context
+      .run_ui(raw_input(vec![Event::PointerMoved(pointer)], egui::vec2(800.0, 400.0)), |ui| {
+        assert!(controller.show(ui, &document, &history, None).is_empty())
+      });
+
+    assert!((output.pixels_per_point - 1.5).abs() < 0.01);
+    let cached = controller.cursor_textures.0[EditorTool::Stroke.index()].as_ref().unwrap();
+    assert_eq!(
+      cached.size,
+      tool_cursor::raster_size_for(EditorTool::Stroke, crate::platform::system_cursor_scale())
+        .unwrap()
+    );
+    let bounds = cursor_mesh_bounds(&output, cached.texture.id());
+    let physical_size = bounds.size() * output.pixels_per_point;
+    assert!(
+      (physical_size - egui::vec2(cached.size[0] as f32, cached.size[1] as f32)).length() < 0.01
+    );
+    output.drop_without_applying_deltas();
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  #[test]
+  fn display_density_change_updates_the_existing_cursor_texture() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let pointer = Pos2::new(400.0, 200.0);
+    let viewport_id = ViewportId::from_hash_of("cursor-density-change-viewport");
+    let mut controller = EditorController::new(EditorTool::Rectangle);
+
+    let output = run_editor_output_in_viewport_at_native_ppp(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      viewport_id,
+      vec![Event::PointerMoved(pointer)],
+      1.0,
+    );
+    output.drop_without_applying_deltas();
+    let standard = controller.cursor_textures.0[EditorTool::Rectangle.index()].as_ref().unwrap();
+    let texture_id = standard.texture.id();
+    let standard_size = standard.size;
+
+    let output = run_editor_output_in_viewport_at_native_ppp(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      viewport_id,
+      vec![Event::PointerMoved(pointer)],
+      2.0,
+    );
+    let retina = controller.cursor_textures.0[EditorTool::Rectangle.index()].as_ref().unwrap();
+    assert_eq!(retina.texture.id(), texture_id);
+    assert!(retina.size[0] >= standard_size[0].saturating_mul(2).saturating_sub(1));
+    assert_eq!(
+      retina.size,
+      tool_cursor::raster_size_for(
+        EditorTool::Rectangle,
+        crate::platform::system_cursor_scale() * 2.0,
+      )
+      .unwrap()
+    );
+    output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn immediate_viewport_restores_the_system_cursor_over_the_toolbar() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let viewport_id = ViewportId::from_hash_of("cursor-toolbar-immediate-viewport");
+    let mut controller = EditorController::new(EditorTool::Rectangle);
+
+    let output = run_editor_output_in_viewport(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      viewport_id,
+      vec![Event::PointerMoved(Pos2::new(400.0, 200.0))],
+    );
+    assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+    assert_eq!(
+      controller.take_native_cursor_tool(),
+      crate::platform::native_tool_cursors_supported().then_some(EditorTool::Rectangle)
+    );
+    output.drop_without_applying_deltas();
+    let texture_id = controller.cursor_textures.0[EditorTool::Rectangle.index()]
+      .as_ref()
+      .map(|cached| cached.texture.id());
+
+    let toolbar_pointer = controller.toolbar_panel_rect.unwrap().center();
+    let output = run_editor_output_in_viewport(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      viewport_id,
+      vec![Event::PointerMoved(toolbar_pointer)],
+    );
+    assert_ne!(output.platform_output.cursor_icon, CursorIcon::None);
+    assert!(output.platform_output.cursor_image.is_none());
+    assert_eq!(controller.take_native_cursor_tool(), None);
+    if let Some(texture_id) = texture_id {
+      assert!(!output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id)
+      }));
+    }
+    output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn read_only_frame_restores_the_system_cursor_after_editing() {
+    let context = egui::Context::default();
+    let document = document();
+    let history = CommandHistory::new();
+    let viewport_id = ViewportId::from_hash_of("cursor-read-only-immediate-viewport");
+    let mut controller = EditorController::new(EditorTool::Stroke);
+    let pointer = Pos2::new(400.0, 200.0);
+
+    let output = run_editor_output_in_viewport(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      viewport_id,
+      vec![Event::PointerMoved(pointer)],
+    );
+    let native_tool = controller.take_native_cursor_tool();
+    let uses_native = crate::platform::native_tool_cursors_supported();
+    assert_eq!(
+      output.platform_output.cursor_icon,
+      if uses_native { CursorIcon::Crosshair } else { CursorIcon::None }
+    );
+    assert_eq!(native_tool, uses_native.then_some(EditorTool::Stroke));
+    output.drop_without_applying_deltas();
+    let texture_id = controller.cursor_textures.0[EditorTool::Stroke.index()]
+      .as_ref()
+      .map(|cached| cached.texture.id());
+
+    let mut input = raw_input(vec![Event::PointerMoved(pointer)], egui::vec2(800.0, 400.0));
+    input.viewport_id = viewport_id;
+    input.viewports.entry(viewport_id).or_default();
+    let output = context.run_ui(input, |ui| controller.show_read_only(ui, &document, None));
+    assert_eq!(output.platform_output.cursor_icon, CursorIcon::Default);
+    assert!(output.platform_output.cursor_image.is_none());
+    assert_eq!(controller.take_native_cursor_tool(), None);
+    if let Some(texture_id) = texture_id {
+      assert!(!output.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id)
+      }));
+    }
+    output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn custom_cursor_clears_over_toolbar_and_returns_over_canvas_for_every_tool() {
+    let document = document();
+    let history = CommandHistory::new();
+    let canvas_pointer = Pos2::new(400.0, 200.0);
+    let uses_native = crate::platform::native_tool_cursors_supported();
+
+    for tool in EditorTool::ALL {
+      let context = egui::Context::default();
+      let mut controller = EditorController::new(tool);
+      let output = run_editor_output(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(canvas_pointer)],
+      );
+      assert_eq!(
+        output.platform_output.cursor_icon,
+        if uses_native { tool.cursor() } else { CursorIcon::None },
+        "{tool:?}"
+      );
+      assert!(output.platform_output.cursor_image.is_none(), "{tool:?}");
+      assert_eq!(controller.take_native_cursor_tool(), uses_native.then_some(tool), "{tool:?}");
+      let texture_id =
+        controller.cursor_textures.0[tool.index()].as_ref().map(|cached| cached.texture.id());
+      assert_eq!(texture_id.is_none(), uses_native, "{tool:?}");
+      if let Some(texture_id) = texture_id {
+        assert!(
+          output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id)
+          }),
+          "{tool:?}"
+        );
+      }
+      output.drop_without_applying_deltas();
+
+      let toolbar_pointer = controller.toolbar_panel_rect.unwrap().center();
+      let output = run_editor_output(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(toolbar_pointer)],
+      );
+      assert!(output.platform_output.cursor_image.is_none(), "{tool:?}");
+      assert_eq!(controller.take_native_cursor_tool(), None, "{tool:?}");
+      if let Some(texture_id) = texture_id {
+        assert!(
+          !output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id)
+          }),
+          "{tool:?}"
+        );
+      }
+      output.drop_without_applying_deltas();
+
+      let output = run_editor_output(
+        &context,
+        &mut controller,
+        &document,
+        &history,
+        vec![Event::PointerMoved(canvas_pointer)],
+      );
+      assert!(output.platform_output.cursor_image.is_none(), "{tool:?}");
+      assert_eq!(controller.take_native_cursor_tool(), uses_native.then_some(tool), "{tool:?}");
+      if let Some(texture_id) = texture_id {
+        assert!(
+          output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id)
+          }),
+          "{tool:?}"
+        );
+      }
+      output.drop_without_applying_deltas();
+    }
+  }
+
+  #[test]
+  fn shape_tools_keep_their_cursor_while_editing_text() {
+    let history = CommandHistory::new();
+    let uses_native = crate::platform::native_tool_cursors_supported();
+
+    for tool in [EditorTool::Rectangle, EditorTool::Arrow, EditorTool::Text] {
+      let context = egui::Context::default();
+      let mut document = document();
+      let element = match tool {
+        EditorTool::Rectangle => {
+          rectangle(&document, 0, PointPx::new(80.0, 80.0), PointPx::new(220.0, 160.0))
+        }
+        EditorTool::Arrow => {
+          arrow(&document, 0, PointPx::new(80.0, 100.0), PointPx::new(300.0, 100.0))
+        }
+        EditorTool::Text => text_element(&document, PointPx::new(150.0, 80.0), "draft", 120.0),
+        _ => unreachable!(),
+      };
+      let element_id = element.element_id;
+      document.elements.push(element);
+      let mut controller = EditorController::new(tool);
+      controller.start_editing_existing(
+        &document,
+        element_id,
+        tool == EditorTool::Arrow,
+        &mut Vec::new(),
+      );
+      assert!(controller.text_editing.is_some(), "{tool:?}");
+
+      run_editor_output(&context, &mut controller, &document, &history, Vec::new())
+        .drop_without_applying_deltas();
+      let editor_pointer = context.read_response(inline_text_editor_id()).unwrap().rect.center();
+
+      for (location, pointer) in
+        [("canvas", Pos2::new(700.0, 350.0)), ("text editor", editor_pointer)]
+      {
+        let output = run_editor_output(
+          &context,
+          &mut controller,
+          &document,
+          &history,
+          vec![Event::PointerMoved(pointer)],
+        );
+        if location == "text editor" {
+          assert!(context.read_response(inline_text_editor_id()).unwrap().hovered(), "{tool:?}");
+        }
+        assert!(output.platform_output.cursor_image.is_none(), "{tool:?} {location}");
+        assert_eq!(
+          output.platform_output.cursor_icon,
+          if uses_native { tool.cursor() } else { CursorIcon::None },
+          "{tool:?} {location}"
+        );
+        assert_eq!(
+          controller.take_native_cursor_tool(),
+          uses_native.then_some(tool),
+          "{tool:?} {location}"
+        );
+        if !uses_native {
+          let texture = controller.cursor_textures.0[tool.index()].as_ref().unwrap();
+          assert!(
+            output.shapes.iter().any(|shape| {
+              matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture.texture.id())
+            }),
+            "{tool:?} {location}"
+          );
+        }
+        output.drop_without_applying_deltas();
+      }
+    }
   }
 
   #[test]
@@ -4420,6 +4969,65 @@ mod tests {
       events,
       ..Default::default()
     }
+  }
+
+  fn run_editor_output(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    events: Vec<Event>,
+  ) -> egui::FullOutput {
+    run_editor_output_in_viewport(context, controller, document, history, ViewportId::ROOT, events)
+  }
+
+  fn run_editor_output_in_viewport(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    viewport_id: ViewportId,
+    events: Vec<Event>,
+  ) -> egui::FullOutput {
+    run_editor_output_in_viewport_at_native_ppp(
+      context,
+      controller,
+      document,
+      history,
+      viewport_id,
+      events,
+      1.0,
+    )
+  }
+
+  fn run_editor_output_in_viewport_at_native_ppp(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    viewport_id: ViewportId,
+    events: Vec<Event>,
+    native_pixels_per_point: f32,
+  ) -> egui::FullOutput {
+    initialize_test_icons(context);
+    let mut input = raw_input(events, egui::vec2(800.0, 400.0));
+    input.viewport_id = viewport_id;
+    input.viewports.entry(viewport_id).or_default().native_pixels_per_point =
+      Some(native_pixels_per_point);
+    context.run_ui(input, |ui| {
+      assert!(controller.show(ui, document, history, None).is_empty());
+    })
+  }
+
+  fn cursor_mesh_bounds(output: &egui::FullOutput, texture_id: egui::TextureId) -> Rect {
+    output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id => Some(mesh.calc_bounds()),
+        _ => None,
+      })
+      .expect("painted cursor mesh is missing")
   }
 
   fn initialize_test_icons(context: &egui::Context) {

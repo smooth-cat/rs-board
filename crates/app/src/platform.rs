@@ -9,7 +9,8 @@ use thiserror::Error;
 
 #[cfg(target_os = "macos")]
 use objc2::{
-  DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, rc::Retained, runtime::AnyObject, sel,
+  AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, msg_send, rc::Retained,
+  runtime::AnyObject, sel,
 };
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
@@ -23,8 +24,49 @@ use objc2_core_services::{
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{
-  NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol, NSURL,
+  NSAppleEventDescriptor, NSAppleEventManager, NSObject, NSObjectProtocol, NSURL, NSUserDefaults,
+  ns_string,
 };
+
+const DEFAULT_SYSTEM_CURSOR_SCALE: f32 = 1.0;
+
+pub(crate) const fn native_tool_cursors_supported() -> bool {
+  cfg!(target_os = "macos")
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn valid_system_cursor_scale(value: f64) -> Option<f32> {
+  (value.is_finite() && (1.0..=4.0).contains(&value)).then_some(value as f32)
+}
+
+/// Returns the user's accessibility cursor-size multiplier when macOS exposes it.
+///
+/// AppKit has no public getter for this value. The native arrow remains authoritative; this
+/// best-effort preference only scales app-painted cursor badges and the brush.
+#[cfg(target_os = "macos")]
+pub(crate) fn system_cursor_scale() -> f32 {
+  thread_local! {
+    static ACCESSIBILITY_DEFAULTS: Option<Retained<NSUserDefaults>> =
+      NSUserDefaults::initWithSuiteName(
+        NSUserDefaults::alloc(),
+        Some(ns_string!("com.apple.universalaccess")),
+      );
+  }
+
+  ACCESSIBILITY_DEFAULTS.with(|defaults| {
+    defaults
+      .as_ref()
+      .and_then(|defaults| {
+        valid_system_cursor_scale(defaults.doubleForKey(ns_string!("mouseDriverCursorSize")))
+      })
+      .unwrap_or(DEFAULT_SYSTEM_CURSOR_SCALE)
+  })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn system_cursor_scale() -> f32 {
+  DEFAULT_SYSTEM_CURSOR_SCALE
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformEvent {
@@ -363,6 +405,16 @@ mod tests {
   use super::*;
 
   const HOTKEY_ID: u32 = 42;
+
+  #[test]
+  fn cursor_scale_rejects_missing_or_corrupt_preferences() {
+    assert_eq!(valid_system_cursor_scale(0.0), None);
+    assert_eq!(valid_system_cursor_scale(0.9), None);
+    assert_eq!(valid_system_cursor_scale(f64::NAN), None);
+    assert_eq!(valid_system_cursor_scale(f64::INFINITY), None);
+    assert_eq!(valid_system_cursor_scale(4.1), None);
+    assert_eq!(valid_system_cursor_scale(1.25), Some(1.25));
+  }
 
   #[test]
   fn maps_only_matching_pressed_event_to_capture_request() {

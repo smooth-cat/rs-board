@@ -55,6 +55,7 @@ use crate::{
     DocumentSummary, GenerationId, ImportRequest, ImportedDocument, LoadedDocument, LoadedDraft,
     LocalStore, PersistenceContext, SaveRequest, SavedDocument, StorageError, StorePaths,
   },
+  tool_cursor,
   tray::{TrayAction, TrayController},
 };
 
@@ -3213,6 +3214,10 @@ impl RsBoardApp {
       let lifecycle = viewport.lifecycle;
       let is_active = viewport.is_active();
       let viewport_id = viewport.viewport_id;
+      let display_id = viewport.display.display_id;
+      if let Some(session) = self.session.as_mut() {
+        session.editor.take_native_cursor_tool();
+      }
       context.show_viewport_immediate(viewport_id, viewport.builder, |ui, _viewport_class| {
         if !is_active {
           return;
@@ -3269,6 +3274,12 @@ impl RsBoardApp {
           }
         }
       });
+      let native_cursor = self
+        .session
+        .as_mut()
+        .and_then(|session| session.editor.take_native_cursor_tool())
+        .and_then(tool_cursor::native_image_for);
+      self.capture_surfaces.set_cursor_override(display_id, native_cursor.as_ref());
     }
   }
 
