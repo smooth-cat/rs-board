@@ -549,6 +549,30 @@ fn measured_label_text_width(
   galley.rows.iter().map(|row| row.size.x).fold(0.0, f32::max).max(1.0) / scale.max(f32::EPSILON)
 }
 
+pub(crate) fn measured_text_bounds(
+  painter: &Painter,
+  anchor_px: PointPx,
+  text: &str,
+  style: &TextStyle,
+  box_width_px: f32,
+  scale: f32,
+) -> common::RectPx {
+  let scale = scale.max(f32::EPSILON);
+  let galley =
+    layout_painted_text(painter, text, style, box_width_px * scale, scale, 1.0, wrap_text);
+  let width_px = (galley.rect.width() / scale).max(1.0);
+  let height_px = (galley.rect.height() / scale).max(1.0);
+  let min_x_px = match style.align {
+    TextAlign::Left => anchor_px.x_px,
+    TextAlign::Center => anchor_px.x_px + (box_width_px - width_px) / 2.0,
+    TextAlign::Right => anchor_px.x_px + box_width_px - width_px,
+  };
+  common::RectPx::from_min_max(
+    PointPx::new(min_x_px, anchor_px.y_px),
+    PointPx::new(min_x_px + width_px, anchor_px.y_px + height_px),
+  )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn measured_label_width(
   painter: &Painter,

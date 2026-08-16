@@ -5,9 +5,8 @@ use common::{
   RectangleLabelEdge, RectangleLabelScene, RectangleLabelSide, RectangleLabelSolution,
   RectanglePayload, SequenceMarkerPayload, SizePx, StrokePayload, StrokePoint, StrokeStyle,
   StyleChange, TextAlign, TextPayload, TextStyle, arrow_label_layout,
-  arrow_minimum_length_for_label, choose_rectangle_label_anchor, layout_text,
-  minimum_geometry_extent, rectangle_label_layout, snap_rectangle_label_layout,
-  solve_rectangle_label_reflow,
+  arrow_minimum_length_for_label, choose_rectangle_label_anchor, minimum_geometry_extent,
+  rectangle_label_layout, snap_rectangle_label_layout, solve_rectangle_label_reflow,
 };
 use eframe::egui::{
   self, Align2, Color32, CursorIcon, Event, FocusDirection, FontId, Id, ImeEvent, Key,
@@ -21,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::renderer::{
   layout_egui_text_with_document_wrapping, measured_arrow_label_bounds,
-  measured_rectangle_label_bounds, paint_arrow_without_label_text, paint_document, paint_element,
-  paint_raw_stroke_points, paint_rectangle_without_label_text,
+  measured_rectangle_label_bounds, measured_text_bounds, paint_arrow_without_label_text,
+  paint_document, paint_element, paint_raw_stroke_points, paint_rectangle_without_label_text,
 };
 
 const EMPTY_LABEL_DRAFT: &str = "\u{200b}";
@@ -577,9 +576,10 @@ impl EditorController {
     );
 
     if let Some(transform) = transform {
-      let editing_transform_pointer = canvas_response.as_ref().is_some_and(|response| {
-        self.text_editing_transform_pointer_active(response, transform, document)
-      });
+      let editing_transform_pointer =
+        canvas_response.as_ref().zip(canvas_painter.as_ref()).is_some_and(|(response, painter)| {
+          self.text_editing_transform_pointer_active(response, painter, transform, document)
+        });
       let preserve_text_focus = self.active_tool_button_clicked(&ctx) || editing_transform_pointer;
       let mut text_completion =
         self.show_text_editor(&ctx, transform, document, preserve_text_focus);
@@ -599,10 +599,17 @@ impl EditorController {
       }
       let handle_editing_transform = self.text_editing.is_some()
         && (editing_transform_pointer || self.text_editing_transform_interaction_active());
-      if let Some(response) = canvas_response.as_ref()
+      if let Some((response, painter)) = canvas_response.as_ref().zip(canvas_painter.as_ref())
         && (self.text_editing.is_none() || handle_editing_transform)
       {
-        self.handle_pointer(response, transform, document, &mut actions, handle_editing_transform);
+        self.handle_pointer(
+          response,
+          painter,
+          transform,
+          document,
+          &mut actions,
+          handle_editing_transform,
+        );
       }
       if let Some(painter) = canvas_painter {
         self.paint_document_for_editing(&painter, transform, document);
@@ -789,6 +796,7 @@ impl EditorController {
   fn handle_pointer(
     &mut self,
     response: &Response,
+    painter: &egui::Painter,
     transform: CanvasTransform,
     document: &BoardDocument,
     actions: &mut Vec<EditorAction>,
@@ -839,11 +847,13 @@ impl EditorController {
       && response.double_clicked()
       && self.tool != EditorTool::Stroke
       && let Some(position) = pointer_position
-      && let Some(element_id) = hit_test_document_for_tool(
+      && let Some(element_id) = hit_test_document_for_tool_with_painter(
         document,
         position,
         HIT_TOLERANCE_PT / transform.scale(),
         self.tool,
+        painter,
+        transform.scale(),
       )
     {
       self.selected_element_id = Some(element_id);
@@ -857,11 +867,13 @@ impl EditorController {
       && response.clicked()
       && let Some(position) = pointer_position
     {
-      let matching_element = hit_test_document_for_tool(
+      let matching_element = hit_test_document_for_tool_with_painter(
         document,
         position,
         HIT_TOLERANCE_PT / transform.scale(),
         self.tool,
+        painter,
+        transform.scale(),
       );
       if let Some(element_id) = matching_element {
         self.selected_element_id = Some(element_id);
@@ -921,7 +933,8 @@ impl EditorController {
         let selected_existing = if editing_transform_only {
           self.begin_text_editing_transform_drag(start, transform, document)
         } else {
-          self.tool != EditorTool::Stroke && self.begin_selection_drag(start, transform, document)
+          self.tool != EditorTool::Stroke
+            && self.begin_selection_drag_with_painter(start, transform, document, Some(painter))
         };
         if !selected_existing
           && !editing_transform_only
@@ -1049,6 +1062,7 @@ impl EditorController {
   fn text_editing_transform_pointer_active(
     &self,
     response: &Response,
+    painter: &egui::Painter,
     transform: CanvasTransform,
     document: &BoardDocument,
   ) -> bool {
@@ -1073,7 +1087,7 @@ impl EditorController {
       .ctx
       .read_response(inline_text_editor_id())
       .is_some_and(|editor| editor.rect.contains(press_origin));
-    self.text_editing_transform_hit(position, transform, document, inside_editor)
+    self.text_editing_transform_hit(position, painter, transform, document, inside_editor)
   }
 
   fn text_editing_transform_interaction_active(&self) -> bool {
@@ -1101,6 +1115,7 @@ impl EditorController {
   fn text_editing_transform_hit(
     &self,
     position: PointPx,
+    painter: &egui::Painter,
     transform: CanvasTransform,
     document: &BoardDocument,
     inside_editor: bool,
@@ -1135,7 +1150,7 @@ impl EditorController {
           || (!inside_editor && hit_arrow_body(payload, position, tolerance))
       }
       TextTarget::ExistingText { .. } | TextTarget::NewText { .. } => self
-        .text_editing_bounds_px(document)
+        .text_editing_bounds_px(painter, transform.scale(), document)
         .is_some_and(|bounds| hit_text_editing_frame(bounds, position, transform)),
     }
   }
@@ -1219,17 +1234,33 @@ impl EditorController {
       .or_else(|| self.released_preview_elements.get(target_id).cloned())
   }
 
-  fn text_editing_bounds_px(&self, document: &BoardDocument) -> Option<RectPx> {
+  fn text_editing_bounds_px(
+    &self,
+    painter: &egui::Painter,
+    scale: f32,
+    document: &BoardDocument,
+  ) -> Option<RectPx> {
     let editing = self.text_editing.as_ref()?;
     let preview = self.text_editing_preview_element(document);
-    text_editing_bounds_px_with_preview(editing, document, preview.as_ref())
+    text_editing_bounds_px_with_preview(editing, document, preview.as_ref(), painter, scale)
   }
 
+  #[cfg(test)]
   fn begin_selection_drag(
     &mut self,
     position: PointPx,
     transform: CanvasTransform,
     document: &BoardDocument,
+  ) -> bool {
+    self.begin_selection_drag_with_painter(position, transform, document, None)
+  }
+
+  fn begin_selection_drag_with_painter(
+    &mut self,
+    position: PointPx,
+    transform: CanvasTransform,
+    document: &BoardDocument,
+    painter: Option<&egui::Painter>,
   ) -> bool {
     if let Some(element_id) = self.selected_element_id
       && let Some(element) = document.element(element_id)
@@ -1254,12 +1285,24 @@ impl EditorController {
       }
     }
 
-    let Some(element_id) = hit_test_document_for_tool(
-      document,
-      position,
-      HIT_TOLERANCE_PT / transform.scale(),
-      self.tool,
-    ) else {
+    let element_id = if let Some(painter) = painter {
+      hit_test_document_for_tool_with_painter(
+        document,
+        position,
+        HIT_TOLERANCE_PT / transform.scale(),
+        self.tool,
+        painter,
+        transform.scale(),
+      )
+    } else {
+      hit_test_document_for_tool(
+        document,
+        position,
+        HIT_TOLERANCE_PT / transform.scale(),
+        self.tool,
+      )
+    };
+    let Some(element_id) = element_id else {
       self.selected_element_id = None;
       return false;
     };
@@ -2413,7 +2456,7 @@ impl EditorController {
   ) {
     match self.text_editing.as_ref().map(|editing| &editing.target) {
       Some(TextTarget::ExistingText { .. }) | Some(TextTarget::NewText { .. }) => {
-        if let Some(bounds) = self.text_editing_bounds_px(document) {
+        if let Some(bounds) = self.text_editing_bounds_px(painter, transform.scale(), document) {
           paint_text_editing_frame(painter, transform, bounds);
         }
       }
@@ -2491,7 +2534,24 @@ impl EditorController {
         paint_handle(painter, transform.document_to_egui(payload.start_px));
         paint_handle(painter, transform.document_to_egui(payload.end_px));
       }
-      _ => {
+      ElementPayload::Text(payload) => {
+        let bounds_px = measured_text_bounds(
+          painter,
+          payload.anchor_px,
+          &payload.text,
+          &payload.text_style,
+          payload.box_width_px,
+          transform.scale(),
+        );
+        let rect = transform.document_rect_to_egui(bounds_px).expand(3.0);
+        painter.rect_stroke(
+          rect,
+          egui::CornerRadius::ZERO,
+          Stroke::new(1.0, Color32::WHITE),
+          StrokeKind::Outside,
+        );
+      }
+      ElementPayload::Stroke(_) | ElementPayload::SequenceMarker(_) => {
         let rect = transform.document_rect_to_egui(element.bounds_px).expand(3.0);
         painter.rect_stroke(
           rect,
@@ -2521,6 +2581,57 @@ fn hit_test_document_for_tool(
   hit_test_document_where(document, position_px, tolerance_px, |element| {
     tool_selects_element(tool, element)
   })
+}
+
+fn hit_test_document_for_tool_with_painter(
+  document: &BoardDocument,
+  position_px: PointPx,
+  tolerance_px: f32,
+  tool: EditorTool,
+  painter: &egui::Painter,
+  scale: f32,
+) -> Option<ElementId> {
+  document
+    .elements
+    .iter()
+    .filter(|element| tool_selects_element(tool, element))
+    .filter(|element| {
+      hit_test_element_with_painter(
+        element,
+        position_px,
+        tolerance_px,
+        document.canvas_size_px,
+        painter,
+        scale,
+      )
+    })
+    .max_by_key(|element| element.z_index)
+    .map(|element| element.element_id)
+}
+
+fn hit_test_element_with_painter(
+  element: &Element,
+  point: PointPx,
+  tolerance: f32,
+  canvas_size: SizePx,
+  painter: &egui::Painter,
+  scale: f32,
+) -> bool {
+  if let ElementPayload::Text(payload) = &element.payload {
+    return contains(
+      measured_text_bounds(
+        painter,
+        payload.anchor_px,
+        &payload.text,
+        &payload.text_style,
+        payload.box_width_px,
+        scale,
+      )
+      .expanded(tolerance),
+      point,
+    );
+  }
+  hit_test_element(element, point, tolerance, canvas_size)
 }
 
 fn hit_test_document_where(
@@ -3332,40 +3443,47 @@ fn text_editing_bounds_px_with_preview(
   editing: &TextEditing,
   document: &BoardDocument,
   preview: Option<&Element>,
+  painter: &egui::Painter,
+  scale: f32,
 ) -> Option<RectPx> {
   match editing.target {
-    TextTarget::NewText { anchor_px } => {
-      text_draft_bounds_px(anchor_px, &editing.buffer, &editing.text_style, document.canvas_size_px)
-    }
+    TextTarget::NewText { anchor_px } => Some(text_draft_bounds_px(
+      painter,
+      anchor_px,
+      &editing.buffer,
+      &editing.text_style,
+      document.canvas_size_px,
+      scale,
+    )),
     TextTarget::ExistingText { element_id } => {
       let ElementPayload::Text(payload) = &target_element(document, preview, element_id)?.payload
       else {
         return None;
       };
-      Some(payload_text_bounds_px(payload, document.canvas_size_px))
+      Some(text_draft_bounds_px(
+        painter,
+        payload.anchor_px,
+        &editing.buffer,
+        &editing.text_style,
+        document.canvas_size_px,
+        scale,
+      ))
     }
     TextTarget::ArrowLabel { .. } | TextTarget::RectangleLabel { .. } => None,
   }
 }
 
 fn text_draft_bounds_px(
+  painter: &egui::Painter,
   anchor_px: PointPx,
   text: &str,
   text_style: &TextStyle,
   canvas_size_px: SizePx,
-) -> Option<RectPx> {
+  scale: f32,
+) -> RectPx {
   let box_width_px = text_width_to_canvas_edge(anchor_px, canvas_size_px);
   let text = if text.trim().is_empty() { EMPTY_LABEL_DRAFT } else { text };
-  let layout = layout_text(text, text_style, box_width_px).ok()?;
-  Some(RectPx::from_min_max(
-    anchor_px,
-    PointPx::new(anchor_px.x_px + layout.width_px, anchor_px.y_px + layout.height_px),
-  ))
-}
-
-fn payload_text_bounds_px(payload: &TextPayload, canvas_size_px: SizePx) -> RectPx {
-  text_draft_bounds_px(payload.anchor_px, &payload.text, &payload.text_style, canvas_size_px)
-    .unwrap_or(RectPx::from_min_max(payload.anchor_px, payload.anchor_px))
+  measured_text_bounds(painter, anchor_px, text, text_style, box_width_px, scale)
 }
 
 fn inline_label_geometry(
@@ -3906,7 +4024,7 @@ fn set_floating_control_style(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
-  use std::cell::Cell;
+  use std::{cell::Cell, cmp::Ordering};
 
   use chrono::{TimeZone, Utc};
   use common::{CapturedDisplay, DocumentId, GlobalBoundsPx};
@@ -4306,6 +4424,22 @@ mod tests {
 
   fn initialize_test_icons(context: &egui::Context) {
     egui_material_icons::initialize(context);
+  }
+
+  fn initialize_test_text_font(context: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+      "rs-board-cjk".into(),
+      std::sync::Arc::new(egui::FontData::from_owned(
+        include_bytes!("../assets/NotoSansSC-Regular.otf").to_vec(),
+      )),
+    );
+    fonts
+      .families
+      .entry(egui::FontFamily::Proportional)
+      .or_default()
+      .insert(0, "rs-board-cjk".into());
+    context.set_fonts(fonts);
   }
 
   fn run_editor_frame(
@@ -6574,6 +6708,121 @@ mod tests {
   }
 
   #[test]
+  fn text_tool_frame_tracks_ascii_glyphs_and_matches_committed_layout() {
+    let mut document = document_with_size(SizePx::new(800, 240));
+    let anchor_px = PointPx::new(40.0, 40.0);
+    let buffer =
+      concat!("123456789012345678901234567890123456\n", "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii")
+        .to_owned();
+    let mut controller = EditorController {
+      tool: EditorTool::Text,
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px },
+        buffer: buffer.clone(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    let screen_size = egui::vec2(800.0, 240.0);
+    let transform =
+      CanvasTransform::fit(document.canvas_size_px, Rect::from_min_size(Pos2::ZERO, screen_size))
+        .unwrap();
+    let context = egui::Context::default();
+    initialize_test_text_font(&context);
+
+    let editing_output = context.run_ui(raw_input(Vec::new(), screen_size), |ui| {
+      assert_eq!(
+        controller.show_text_editor(&context, transform, &document, false),
+        TextEditorCompletion::None
+      );
+      controller.paint_text_editing_controls(ui.painter(), transform, &document);
+    });
+    let editing_text = editing_output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == buffer => Some(text.clone()),
+        _ => None,
+      })
+      .expect("inline editor text should be painted");
+    let expected_frame_min = transform.document_to_egui(anchor_px) - egui::vec2(3.0, 3.0);
+    let editing_frame = editing_output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        egui::Shape::Rect(rectangle)
+          if rectangle.fill == Color32::TRANSPARENT
+            && rectangle.stroke == Stroke::new(1.0, Color32::WHITE)
+            && rectangle.rect.min.distance(expected_frame_min) < 0.1 =>
+        {
+          Some(rectangle.rect)
+        }
+        _ => None,
+      })
+      .expect("text editing frame should be painted");
+    let editing_text_width =
+      editing_text.galley.rows.iter().map(|row| row.size.x).fold(0.0, f32::max);
+    let left_padding = editing_text.pos.x - editing_frame.min.x;
+    let right_padding = editing_frame.max.x - editing_text.pos.x - editing_text_width;
+    assert!((left_padding - 3.0).abs() < 0.1);
+    assert!((right_padding - 3.0).abs() < 0.1);
+    editing_output.drop_without_applying_deltas();
+
+    let mut actions = Vec::new();
+    controller.commit_text(&document, &mut actions);
+    let [EditorAction::Command(batch)] = actions.as_slice() else {
+      panic!("expected one text add, got {actions:?}");
+    };
+    let mut history = CommandHistory::new();
+    history.execute_batch(&mut document, batch.clone()).unwrap();
+    let element_id = document.elements[0].element_id;
+    controller.selected_element_id = Some(element_id);
+
+    let committed_output = context.run_ui(raw_input(Vec::new(), screen_size), |ui| {
+      paint_document(ui.painter(), &transform, &document);
+      controller.paint_selection(ui.painter(), transform, &document);
+    });
+    let committed_text = committed_output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.job.text == buffer => Some(text),
+        _ => None,
+      })
+      .expect("committed text should be painted");
+    let committed_frame = committed_output
+      .shapes
+      .iter()
+      .find_map(|shape| match &shape.shape {
+        egui::Shape::Rect(rectangle)
+          if rectangle.fill == Color32::TRANSPARENT
+            && rectangle.stroke == Stroke::new(1.0, Color32::WHITE) =>
+        {
+          Some(rectangle.rect)
+        }
+        _ => None,
+      })
+      .expect("committed text selection frame should be painted");
+
+    assert!(editing_text.pos.distance(committed_text.pos) < 0.1);
+    assert_eq!(editing_text.galley.rows.len(), committed_text.galley.rows.len());
+    for (editing_row, committed_row) in
+      editing_text.galley.rows.iter().zip(&committed_text.galley.rows)
+    {
+      assert_eq!(editing_row.text(), committed_row.text());
+      assert!((editing_row.size.x - committed_row.size.x).abs() < 0.1);
+      assert!((editing_row.size.y - committed_row.size.y).abs() < 0.1);
+    }
+    assert!(editing_frame.min.distance(committed_frame.min) < 0.1);
+    assert!(editing_frame.max.distance(committed_frame.max) < 0.1);
+    committed_output.drop_without_applying_deltas();
+  }
+
+  #[test]
   fn active_text_edit_hides_the_element_selection_chrome() {
     let mut document = document();
     let element = rectangle(&document, 0, PointPx::new(80.0, 90.0), PointPx::new(220.0, 170.0));
@@ -7764,6 +8013,60 @@ mod tests {
       Some(stroke_id)
     );
     assert_eq!(hit_test_document_for_tool(&document, position, 2.0, EditorTool::Stroke), None);
+  }
+
+  #[test]
+  fn rendered_text_hit_testing_uses_the_same_actual_glyph_bounds_as_selection() {
+    let context = egui::Context::default();
+    initialize_test_text_font(&context);
+    context
+      .run_ui(raw_input(Vec::new(), egui::vec2(800.0, 240.0)), |ui| {
+        for (text, expected_actual_side) in [
+          ("123456789012345678901234567890123456", Ordering::Less),
+          ("WWWWWWWWWWWWWWWWWWWW", Ordering::Greater),
+        ] {
+          let mut document = document_with_size(SizePx::new(800, 240));
+          let element = text_element(&document, PointPx::new(40.0, 40.0), text, 760.0);
+          let element_id = element.element_id;
+          let ElementPayload::Text(payload) = &element.payload else {
+            unreachable!();
+          };
+          let actual_bounds = measured_text_bounds(
+            ui.painter(),
+            payload.anchor_px,
+            &payload.text,
+            &payload.text_style,
+            payload.box_width_px,
+            1.0,
+          );
+          assert_eq!(
+            actual_bounds.max.x_px.total_cmp(&element.bounds_px.max.x_px),
+            expected_actual_side
+          );
+          let disagreement = PointPx::new(
+            (actual_bounds.max.x_px + element.bounds_px.max.x_px) / 2.0,
+            actual_bounds.center().y_px,
+          );
+          document.elements.push(element);
+
+          assert_eq!(
+            hit_test_document_for_tool(&document, disagreement, 0.0, EditorTool::Text),
+            (expected_actual_side == Ordering::Less).then_some(element_id)
+          );
+          assert_eq!(
+            hit_test_document_for_tool_with_painter(
+              &document,
+              disagreement,
+              0.0,
+              EditorTool::Text,
+              ui.painter(),
+              1.0,
+            ),
+            (expected_actual_side == Ordering::Greater).then_some(element_id)
+          );
+        }
+      })
+      .drop_without_applying_deltas();
   }
 
   #[test]
