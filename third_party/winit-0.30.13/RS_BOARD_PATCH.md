@@ -27,15 +27,21 @@ existing pressure-aware touch event path.
 - While AppKit is interpreting a physical key event, ordinary keyboard characters continue to be
   ignored by `insertText:` so they are delivered through `KeyboardInput` exactly once.
 - Marked-text IME commits keep the existing `Preedit("")` plus `Commit` behavior.
-- Async system text insertion, when the view is focused and IME input is allowed, emits one
-  `Ime::Commit` and returns the IME state to `Ground`.
+- Async system text insertion, when the view is focused and IME input is allowed, clears any stale
+  marked-text preedit, emits one `Ime::Commit`, and returns the IME state to `Ground`. This keeps the
+  first following control key, such as Tab or Escape, from being consumed as part of the commit.
+- Escape is forwarded directly to the application when the IME is in `Ground` or `Disabled` with no
+  active marked-text preedit. This lets the editor close while macOS Dictation remains active, while
+  preserving Escape's normal role of cancelling an active IME composition.
 - A focused, IME-enabled view reports a zero-length selected range so AppKit can recognize the
   current insertion point as a valid system dictation target.
 - The text input client reports its actual AppKit window level (required for RS Board's elevated
   capture editor windows) and returns the corresponding zero-length range for caret positioning.
 - AppKit's `startDictation:` and `stopDictation:` text commands continue through the responder
   chain. Repeated key-down events for those commands are consumed so one hardware-key press cannot
-  restart an active Dictation capture session; all other commands retain winit's existing handling.
+  restart an active Dictation capture session. When AppKit maps Escape to `stopDictation:`, that one
+  command is instead routed to the application without stopping the active Dictation session; all
+  other commands retain winit's existing handling.
 - Empty strings, unfocused views, disabled IME input, and control characters other than CR/LF are
   ignored. CR/LF remain valid so dictation can insert real line breaks.
 - Primary-button tablet-point down, drag, and up events are exposed through winit's existing

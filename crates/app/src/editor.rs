@@ -366,6 +366,18 @@ enum TextEditorCompletion {
   Enter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineTextInputAction {
+  None,
+  Submit,
+  Cancel,
+}
+
+struct InlineTextInput {
+  action: InlineTextInputAction,
+  deferred_events: Vec<Event>,
+}
+
 #[derive(Clone)]
 struct CachedToolCursorTexture {
   size: [u16; 2],
@@ -554,6 +566,7 @@ impl EditorController {
     background: Option<&TextureHandle>,
   ) -> Vec<EditorAction> {
     let ctx = root_ui.ctx().clone();
+    let was_text_editing = self.text_editing.is_some();
     self.native_cursor_tool = None;
     ctx.set_cursor_icon(CursorIcon::Default);
     ctx.set_cursor_image(None);
@@ -660,6 +673,10 @@ impl EditorController {
       || matches!(self.tool, EditorTool::Rectangle | EditorTool::Arrow | EditorTool::Text))
     .then_some(self.tool);
     self.apply_canvas_cursor(&ctx, canvas_response.as_ref(), canvas_cursor_tool);
+    if was_text_editing && self.text_editing.is_none() {
+      // TextEdit emitted IME output earlier in this frame; clear it before the next native key.
+      ctx.output_mut(|output| output.ime = None);
+    }
     actions
   }
 
@@ -1927,20 +1944,6 @@ impl EditorController {
     if self.text_editing.is_none() {
       return TextEditorCompletion::None;
     }
-    let cancel = ctx.input_mut(|input| {
-      input
-        .events
-        .iter()
-        .position(|event| {
-          matches!(event, Event::Key { key: Key::Escape, pressed: true, modifiers, .. } if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd)
-        })
-        .map(|position| input.events.remove(position))
-        .is_some()
-    });
-    if cancel {
-      self.text_editing = None;
-      return TextEditorCompletion::None;
-    }
     let editor_id = inline_text_editor_id();
     let layer_id = egui::LayerId::new(egui::Order::Foreground, editor_id.with("layer"));
     ctx.set_transform_layer(layer_id, egui::emath::TSTransform::IDENTITY);
@@ -1958,10 +1961,21 @@ impl EditorController {
       return TextEditorCompletion::None;
     };
     let screen_position = transform.document_to_egui(geometry.origin_px);
+    let InlineTextInput { action: input_action, deferred_events } = {
+      let editing = self.text_editing.as_mut().expect("text editing checked above");
+      ctx.input_mut(|input| prepare_inline_text_input(&mut input.events, &mut editing.ime))
+    };
+    if input_action == InlineTextInputAction::Cancel {
+      ctx.input_mut(|input| input.events.extend(deferred_events));
+      self.text_editing = None;
+      return TextEditorCompletion::None;
+    }
     let mut lost_focus = false;
     let editing = self.text_editing.as_mut().expect("text editor checked above");
-    let submit_after_widget =
-      ctx.input_mut(|input| normalize_inline_text_events(&mut input.events, &mut editing.ime));
+    let submit_after_widget = input_action == InlineTextInputAction::Submit;
+    if submit_after_widget && !ctx.memory(|memory| memory.has_focus(editor_id)) {
+      ctx.memory_mut(|memory| memory.request_focus(editor_id));
+    }
     let font_id = FontId::proportional(editing.text_style.font_size_px * transform.scale());
     let text_color = color32(editing.text_style.color_rgba);
     let horizontal_align = match editing.text_style.align {
@@ -2032,6 +2046,7 @@ impl EditorController {
     if submit_after_widget {
       output.response.surrender_focus();
     }
+    ctx.input_mut(|input| input.events.extend(deferred_events));
     if let Some(updated_geometry) = inline_text_geometry_with_rendered_label_width(
       editing,
       document,
@@ -3792,6 +3807,33 @@ fn normalize_inline_text_events(events: &mut Vec<Event>, ime: &mut InlineImeStat
   submit_after_widget
 }
 
+fn prepare_inline_text_input(events: &mut Vec<Event>, ime: &mut InlineImeState) -> InlineTextInput {
+  let escape_position = events.iter().position(|event| {
+    matches!(
+      event,
+      Event::Key { key: Key::Escape, pressed: true, modifiers, .. }
+        if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd
+    )
+  });
+
+  let Some(escape_position) = escape_position else {
+    let action = if normalize_inline_text_events(events, ime) {
+      InlineTextInputAction::Submit
+    } else {
+      InlineTextInputAction::None
+    };
+    return InlineTextInput { action, deferred_events: Vec::new() };
+  };
+
+  let mut deferred_events = events.split_off(escape_position);
+  if normalize_inline_text_events(events, ime) {
+    InlineTextInput { action: InlineTextInputAction::Submit, deferred_events }
+  } else {
+    deferred_events.remove(0);
+    InlineTextInput { action: InlineTextInputAction::Cancel, deferred_events }
+  }
+}
+
 fn tool_for_key(key: Key) -> Option<EditorTool> {
   match key {
     Key::Num1 => Some(EditorTool::Select),
@@ -5057,14 +5099,25 @@ mod tests {
     history: &CommandHistory,
     events: Vec<Event>,
   ) -> Vec<EditorAction> {
+    let (actions, output) =
+      run_editor_frame_with_output(context, controller, document, history, events);
+    output.drop_without_applying_deltas();
+    actions
+  }
+
+  fn run_editor_frame_with_output(
+    context: &egui::Context,
+    controller: &mut EditorController,
+    document: &BoardDocument,
+    history: &CommandHistory,
+    events: Vec<Event>,
+  ) -> (Vec<EditorAction>, egui::FullOutput) {
     initialize_test_icons(context);
     let mut actions = None;
-    context
-      .run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
-        actions = Some(controller.show(ui, document, history, None));
-      })
-      .drop_without_applying_deltas();
-    actions.expect("editor frame ran")
+    let output = context.run_ui(raw_input(events, egui::vec2(800.0, 400.0)), |ui| {
+      actions = Some(controller.show(ui, document, history, None));
+    });
+    (actions.expect("editor frame ran"), output)
   }
 
   fn run_stylus_editor_frame(
@@ -6751,6 +6804,77 @@ mod tests {
     assert!(interacting.interaction.is_none());
   }
 
+  #[test]
+  fn consecutive_escape_presses_cancel_text_editing_then_close_the_editor() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: "draft".to_owned(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    let escape = Event::Key {
+      key: Key::Escape,
+      physical_key: Some(Key::Escape),
+      pressed: true,
+      repeat: false,
+      modifiers: Modifiers::NONE,
+    };
+
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, vec![escape.clone()],)
+        .is_empty()
+    );
+    assert!(controller.text_editing.is_none());
+    assert_eq!(
+      run_editor_frame(&context, &mut controller, &document, &history, vec![escape]),
+      vec![EditorAction::Close]
+    );
+  }
+
+  #[test]
+  fn tab_switches_tool_on_first_press_while_text_editing() {
+    let document = document();
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+    let mut controller = EditorController {
+      tool: EditorTool::Text,
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: "draft".to_owned(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    controller.set_tab_order(EditorTool::ALL.to_vec());
+
+    run_tab_editor_frame(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![tab_event(Modifiers::NONE)],
+    );
+
+    assert_eq!(controller.active_tool(), EditorTool::Stroke);
+    assert!(controller.text_editing.is_none());
+  }
+
   fn enter_event(modifiers: Modifiers) -> Event {
     Event::Key {
       key: Key::Enter,
@@ -6759,6 +6883,32 @@ mod tests {
       repeat: false,
       modifiers,
     }
+  }
+
+  fn escape_event() -> Event {
+    Event::Key {
+      key: Key::Escape,
+      physical_key: Some(Key::Escape),
+      pressed: true,
+      repeat: false,
+      modifiers: Modifiers::NONE,
+    }
+  }
+
+  #[test]
+  fn inline_text_completion_respects_input_order() {
+    let mut ime = InlineImeState::default();
+    let mut submit_then_escape = vec![enter_event(Modifiers::NONE), escape_event()];
+    let normalized = prepare_inline_text_input(&mut submit_then_escape, &mut ime);
+    assert_eq!(normalized.action, InlineTextInputAction::Submit);
+    assert!(submit_then_escape.is_empty());
+    assert_eq!(normalized.deferred_events, vec![escape_event()]);
+
+    let mut escape_then_submit = vec![escape_event(), enter_event(Modifiers::NONE)];
+    let normalized = prepare_inline_text_input(&mut escape_then_submit, &mut ime);
+    assert_eq!(normalized.action, InlineTextInputAction::Cancel);
+    assert!(escape_then_submit.is_empty());
+    assert_eq!(normalized.deferred_events, vec![enter_event(Modifiers::NONE)]);
   }
 
   #[test]
@@ -6985,6 +7135,95 @@ mod tests {
         },
       }] if text == "dictated"
     ));
+  }
+
+  #[test]
+  fn dictation_submit_then_escape_same_frame_commits_and_closes() {
+    let document = document();
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: String::new(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    let (actions, output) = run_editor_frame_with_output(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![
+        Event::Ime(ImeEvent::Commit("dictated".to_owned())),
+        enter_event(Modifiers::NONE),
+        escape_event(),
+      ],
+    );
+
+    assert!(controller.text_editing.is_none());
+    let [EditorAction::Command(batch), EditorAction::Close] = actions.as_slice() else {
+      panic!("expected text commit followed by close, got {actions:?}");
+    };
+    assert!(matches!(
+      batch.commands(),
+      [DocumentCommand::AddElement {
+        element: Element {
+          payload: ElementPayload::Text(TextPayload { text, .. }),
+          ..
+        },
+      }] if text == "dictated"
+    ));
+    assert!(output.platform_output.ime.is_none());
+    output.drop_without_applying_deltas();
+  }
+
+  #[test]
+  fn escape_closes_on_the_first_frame_after_dictation_submit() {
+    let document = document();
+    let mut controller = EditorController {
+      text_editing: Some(TextEditing {
+        target: TextTarget::NewText { anchor_px: PointPx::new(120.0, 40.0) },
+        buffer: String::new(),
+        text_style: TextStyle::mvp(ColorRgba::WHITE, 24.0).unwrap(),
+        ime: InlineImeState::default(),
+        request_focus: true,
+        select_all: false,
+        auto_place_rectangle: false,
+      }),
+      ..Default::default()
+    };
+    let history = CommandHistory::new();
+    let context = egui::Context::default();
+
+    assert!(
+      run_editor_frame(&context, &mut controller, &document, &history, Vec::new()).is_empty()
+    );
+    let (actions, output) = run_editor_frame_with_output(
+      &context,
+      &mut controller,
+      &document,
+      &history,
+      vec![Event::Ime(ImeEvent::Commit("dictated".to_owned())), enter_event(Modifiers::NONE)],
+    );
+
+    assert!(controller.text_editing.is_none());
+    assert!(matches!(actions.as_slice(), [EditorAction::Command(_)]));
+    assert!(output.platform_output.ime.is_none());
+    output.drop_without_applying_deltas();
+    assert_eq!(
+      run_editor_frame(&context, &mut controller, &document, &history, vec![escape_event()]),
+      vec![EditorAction::Close]
+    );
   }
 
   #[test]

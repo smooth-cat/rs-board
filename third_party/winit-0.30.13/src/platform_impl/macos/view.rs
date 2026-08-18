@@ -133,10 +133,10 @@ fn insert_text_commit_kind(
         return None;
     }
 
-    if has_marked_text {
-        Some(InsertTextCommitKind::MarkedText)
-    } else if !interpreting_key_events {
+    if !interpreting_key_events {
         Some(InsertTextCommitKind::Async)
+    } else if has_marked_text {
+        Some(InsertTextCommitKind::MarkedText)
     } else {
         None
     }
@@ -156,6 +156,19 @@ fn is_dictation_command(command: Sel) -> bool {
 
 fn should_forward_dictation_command(command: Sel, is_repeat: bool) -> bool {
     is_dictation_command(command) && !is_repeat
+}
+
+// kVK_Escape from Carbon/HIToolbox, reported by NSEvent::keyCode().
+const MACOS_ESCAPE_KEY_CODE: u16 = 0x35;
+
+fn should_route_dictation_escape_to_app(command: Sel, key_code: Option<u16>, is_repeat: bool) -> bool {
+    command == sel!(stopDictation:) && key_code == Some(MACOS_ESCAPE_KEY_CODE) && !is_repeat
+}
+
+fn should_bypass_ime_for_escape(key_code: u16, has_marked_text: bool, ime_state: ImeState) -> bool {
+    key_code == MACOS_ESCAPE_KEY_CODE
+        && !has_marked_text
+        && matches!(ime_state, ImeState::Ground | ImeState::Disabled)
 }
 
 struct InterpretingKeyEventsGuard<'a> {
@@ -491,9 +504,10 @@ declare_class!(
                 unsafe { &*string }.to_string()
             };
 
+            let has_marked_text = unsafe { self.hasMarkedText() };
             match insert_text_commit_kind(
                 &string,
-                unsafe { self.hasMarkedText() },
+                has_marked_text,
                 self.ivars().ime_allowed.get(),
                 self.is_first_responder(),
                 self.ivars().interpreting_key_events.get(),
@@ -504,6 +518,10 @@ declare_class!(
                     self.ivars().ime_state.set(ImeState::Committed);
                 }
                 Some(InsertTextCommitKind::Async) => {
+                    if has_marked_text {
+                        self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+                    }
                     self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                     self.ivars().ime_state.set(ImeState::Ground);
                 }
@@ -517,9 +535,17 @@ declare_class!(
         fn do_command_by_selector(&self, command: Sel) {
             trace_scope!("doCommandBySelector:");
             if is_dictation_command(command) {
-                let is_repeat = NSApplication::sharedApplication(MainThreadMarker::from(self))
-                    .currentEvent()
-                    .is_some_and(|event| unsafe { event.isARepeat() });
+                let current_event =
+                    NSApplication::sharedApplication(MainThreadMarker::from(self)).currentEvent();
+                let is_repeat =
+                    current_event.as_ref().is_some_and(|event| unsafe { event.isARepeat() });
+                let key_code = current_event.as_ref().map(|event| unsafe { event.keyCode() });
+                if should_route_dictation_escape_to_app(command, key_code, is_repeat) {
+                    // AppKit maps Escape to stopDictation: while Dictation is active. Keep the
+                    // system session running and let key_down deliver Escape to the application.
+                    self.ivars().forward_key_to_app.set(true);
+                    return;
+                }
                 if should_forward_dictation_command(command, is_repeat) {
                     // AppKit owns Dictation. Forward its actions through the responder chain while
                     // consuming key repeats so one press cannot restart an active capture session.
@@ -564,6 +590,11 @@ declare_class!(
             let old_ime_state = self.ivars().ime_state.get();
             self.ivars().forward_key_to_app.set(false);
             let event = replace_event(event, self.option_as_alt());
+            let bypass_ime_for_escape = should_bypass_ime_for_escape(
+                unsafe { event.keyCode() },
+                unsafe { self.hasMarkedText() },
+                old_ime_state,
+            );
 
             // The `interpretKeyEvents` function might call
             // `setMarkedText`, `insertText`, and `doCommandBySelector`.
@@ -571,7 +602,7 @@ declare_class!(
             // we must send the `KeyboardInput` event during IME if it triggered
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
-            if self.ivars().ime_allowed.get() {
+            if self.ivars().ime_allowed.get() && !bypass_ime_for_escape {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 {
                     let _interpreting_key_events =
@@ -1390,6 +1421,39 @@ mod tests {
     }
 
     #[test]
+    fn insert_text_treats_async_marked_text_as_system_input() {
+        assert_eq!(
+            insert_text_commit_kind("dictated", true, true, true, false),
+            Some(InsertTextCommitKind::Async)
+        );
+    }
+
+    #[test]
+    fn escape_bypasses_ime_only_without_an_active_preedit() {
+        assert!(super::should_bypass_ime_for_escape(
+            super::MACOS_ESCAPE_KEY_CODE,
+            false,
+            super::ImeState::Ground,
+        ));
+        assert!(super::should_bypass_ime_for_escape(
+            super::MACOS_ESCAPE_KEY_CODE,
+            false,
+            super::ImeState::Disabled,
+        ));
+        assert!(!super::should_bypass_ime_for_escape(
+            super::MACOS_ESCAPE_KEY_CODE,
+            true,
+            super::ImeState::Preedit,
+        ));
+        assert!(!super::should_bypass_ime_for_escape(
+            super::MACOS_ESCAPE_KEY_CODE,
+            false,
+            super::ImeState::Committed,
+        ));
+        assert!(!super::should_bypass_ime_for_escape(0x24, false, super::ImeState::Ground,));
+    }
+
+    #[test]
     fn insert_text_filters_unavailable_or_control_input() {
         for (text, ime_allowed, focused) in [
             ("", true, true),
@@ -1433,5 +1497,29 @@ mod tests {
         assert!(!super::should_forward_dictation_command(sel!(insertNewline:), false));
         assert!(!super::should_forward_dictation_command(sel!(insertTab:), false));
         assert!(!super::should_forward_dictation_command(sel!(cancelOperation:), false));
+    }
+
+    #[test]
+    fn escape_stop_dictation_command_is_routed_to_the_application() {
+        assert!(super::should_route_dictation_escape_to_app(
+            sel!(stopDictation:),
+            Some(super::MACOS_ESCAPE_KEY_CODE),
+            false,
+        ));
+        assert!(!super::should_route_dictation_escape_to_app(
+            sel!(startDictation:),
+            Some(super::MACOS_ESCAPE_KEY_CODE),
+            false,
+        ));
+        assert!(!super::should_route_dictation_escape_to_app(
+            sel!(stopDictation:),
+            Some(super::MACOS_ESCAPE_KEY_CODE),
+            true,
+        ));
+        assert!(!super::should_route_dictation_escape_to_app(
+            sel!(stopDictation:),
+            Some(0x24),
+            false,
+        ));
     }
 }
