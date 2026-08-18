@@ -2210,7 +2210,11 @@ impl RsBoardApp {
   fn poll_external_events(&mut self, context: &egui::Context) {
     let hotkey_received_at = self.hotkey.as_ref().and_then(GlobalF1Hotkey::poll_capture_requested);
     if let Some(received_at) = hotkey_received_at {
-      self.start_capture(context, CaptureTrigger { source: "hotkey", received_at });
+      if self.phase == Phase::Editing {
+        self.close_editor(context);
+      } else {
+        self.start_capture(context, CaptureTrigger { source: "hotkey", received_at });
+      }
     }
 
     let tray_action = self.tray.as_ref().and_then(TrayController::poll_action);
